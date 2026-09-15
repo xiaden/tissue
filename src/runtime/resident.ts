@@ -20,10 +20,13 @@
 //
 // Nothing here reads a credential value into a log line or durable status.
 
-import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 
+import { TISSUE_RESOLVE_AGENT, TISSUE_TRIAGE_AGENT } from "../config/types.ts";
 import type { ProviderModel } from "../config/types.ts";
 
 // ---- resident endpoint ---------------------------------------------------------
@@ -138,6 +141,47 @@ const TRIAGE_ALLOWED = new Set(["read", "grep", "glob", "list", "search"]);
 /** Resolution may edit and run local verification, but never lifecycle/GitHub. */
 const RESOLUTION_ALLOWED = new Set(["read", "edit", "write", "patch", "bash", "grep", "glob", "list", "search"]);
 
+/** The dedicated Tissue agent definition files, in role order. */
+export const TISSUE_AGENT_FILES: ReadonlyArray<{ role: "triage" | "resolution"; fileName: string; requiredAgent: string }> = [
+  { role: "triage", fileName: "tissue-triage.md", requiredAgent: TISSUE_TRIAGE_AGENT },
+  { role: "resolution", fileName: "tissue-resolve.md", requiredAgent: TISSUE_RESOLVE_AGENT },
+];
+
+/**
+ * Resolve the OpenCode GLOBAL agent directory the RESIDENT service actually
+ * discovers. Deterministic and absolute: `TISSUE_OPENCODE_AGENTS_DIR` wins,
+ * otherwise `$XDG_CONFIG_HOME/opencode/agents` or `$HOME/.config/opencode/agents`.
+ *
+ * There is deliberately NO CWD-relative default: the resident OpenCode service
+ * does not read `<Tissue>/agents`, so validating (or trusting) a path relative to
+ * the process working directory proves nothing about what the resident can use.
+ */
+export function resolveOpenCodeGlobalAgentsDir(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = (env.TISSUE_OPENCODE_AGENTS_DIR ?? "").trim();
+  if (explicit.length > 0) {
+    if (!isAbsolute(explicit)) {
+      throw new ResidentEndpointError("TISSUE_OPENCODE_AGENTS_DIR must be an absolute path");
+    }
+    return resolve(explicit);
+  }
+  const xdg = (env.XDG_CONFIG_HOME ?? "").trim();
+  if (xdg.length > 0 && isAbsolute(xdg)) return join(resolve(xdg), "opencode", "agents");
+  const home = (env.HOME ?? "").trim();
+  if (home.length > 0 && isAbsolute(home)) return join(resolve(home), ".config", "opencode", "agents");
+  throw new ResidentEndpointError(
+    "cannot resolve the OpenCode global agent directory: set TISSUE_OPENCODE_AGENTS_DIR or HOME/XDG_CONFIG_HOME",
+  );
+}
+
+/**
+ * The canonical CHECKED-IN Tissue agent definitions (`<repo>/agents`). These are
+ * source artifacts only; resolved from this module's own location so the answer
+ * never depends on the process working directory.
+ */
+export function resolveSourceAgentsDir(): string {
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "agents");
+}
+
 export interface AgentDefinitionFileStatus {
   role: "triage" | "resolution";
   file: string;
@@ -145,12 +189,19 @@ export interface AgentDefinitionFileStatus {
   mode: string | null;
   enabledTools: string[];
   disabledTools: string[];
+  /** Checked-in source file used for drift comparison (null when drift is not compared). */
+  sourceFile: string | null;
+  /** True when the deployed definition differs from the checked-in source. */
+  sourceDrift: boolean;
   errors: string[];
 }
 
 export interface AgentDefinitionStatus {
   ok: boolean;
+  /** Deployed/global directory the RESIDENT OpenCode service reads. */
   agentsDir: string;
+  /** Checked-in source directory used for drift comparison (null when not compared). */
+  sourceDir: string | null;
   agents: AgentDefinitionFileStatus[];
   errors: string[];
 }
@@ -202,9 +253,19 @@ function parseFrontmatter(text: string, relFile: string): ParsedFrontmatter {
   return { mode, tools, hasModelPin, errors };
 }
 
+/** SHA-256 of a file's bytes, or null when it cannot be read (missing/unreadable). */
+function sha256File(path: string): string | null {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 function validateAgentFile(
   role: "triage" | "resolution",
   agentsDir: string,
+  sourceDir: string | null,
   fileName: string,
 ): { status: AgentDefinitionFileStatus; errors: string[] } {
   const file = resolve(agentsDir, fileName);
@@ -216,6 +277,8 @@ function validateAgentFile(
     mode: null,
     enabledTools: [],
     disabledTools: [],
+    sourceFile: null,
+    sourceDrift: false,
     errors: [],
   };
   if (!base.present) {
@@ -255,25 +318,134 @@ function validateAgentFile(
   if (enabled.length === 0) {
     base.errors.push(`${relative}: at least one allowlisted ${role} tool must be explicitly enabled`);
   }
+
+  // Deterministic source/deployed comparison: an old or hand-edited deployed
+  // definition must not silently survive a source update. Model pins are not part
+  // of this contract (model selection is config/T8 (f), and a pinned model in the
+  // deployed file is already rejected above).
+  if (sourceDir !== null) {
+    const sourceFile = resolve(sourceDir, fileName);
+    base.sourceFile = sourceFile;
+    const deployedHash = sha256File(file);
+    const sourceHash = sha256File(sourceFile);
+    if (sourceHash === null) {
+      base.errors.push(`${sourceFile}: checked-in source definition is missing or unreadable`);
+    } else if (deployedHash !== sourceHash) {
+      base.sourceDrift = true;
+      base.errors.push(
+        `${relative}: deployed definition has drifted from the checked-in source (${sourceFile}); re-run 'tissue install-agents --force'`,
+      );
+    }
+  }
   return { status: base, errors: base.errors };
 }
 
 /**
- * Validate the host-global dedicated Tissue triage/resolution definitions.
- * Triage must be restrictive (read/inspect only); resolution may edit and run
- * local verification but must never expose a GitHub lifecycle tool/effect. No
- * concrete model/identity is validated or selected here (T8 (f) is open).
+ * Validate the deployed/global dedicated Tissue triage/resolution definitions the
+ * RESIDENT OpenCode service will actually use. Triage must be restrictive
+ * (read/inspect only); resolution may edit and run local verification but must
+ * never expose a GitHub lifecycle tool/effect. No concrete model/identity is
+ * validated or selected here (T8 (f) is open).
+ *
+ * `agentsDir` defaults to the resolved OpenCode global agent directory — never a
+ * CWD-relative path. Supplying `sourceDir` additionally fails validation when the
+ * deployed definition has drifted from the checked-in source.
  */
-export function validateTissueAgentDefinitions(opts: { agentsDir?: string } = {}): AgentDefinitionStatus {
-  const agentsDir = resolve(opts.agentsDir ?? process.env.TISSUE_AGENTS_DIR ?? "agents");
-  if (!isAbsolute(agentsDir)) throw new Error("agentsDir must resolve to an absolute path");
-  const triage = validateAgentFile("triage", agentsDir, "tissue-triage.md");
-  const resolution = validateAgentFile("resolution", agentsDir, "tissue-resolve.md");
+export interface AgentValidationOptions {
+  /** Deployed/global agent dir the resident service reads. Defaults to the resolved OpenCode global dir. */
+  agentsDir?: string;
+  /** Checked-in source dir; when provided, source/deployed drift fails validation. */
+  sourceDir?: string;
+}
+
+export function validateTissueAgentDefinitions(opts: AgentValidationOptions = {}): AgentDefinitionStatus {
+  const agentsDir = opts.agentsDir !== undefined ? resolve(opts.agentsDir) : resolveOpenCodeGlobalAgentsDir();
+  const sourceDir = opts.sourceDir !== undefined ? resolve(opts.sourceDir) : null;
+  const triage = validateAgentFile("triage", agentsDir, sourceDir, "tissue-triage.md");
+  const resolution = validateAgentFile("resolution", agentsDir, sourceDir, "tissue-resolve.md");
   const errors = [...triage.errors, ...resolution.errors];
   return {
     ok: errors.length === 0,
     agentsDir,
+    sourceDir,
     agents: [triage.status, resolution.status],
     errors,
   };
+}
+
+// ---- agent deployment ----------------------------------------------------------
+
+export interface AgentInstallEntry {
+  role: "triage" | "resolution";
+  file: string;
+  action: "installed" | "unchanged" | "exists-divergent";
+}
+
+export interface AgentInstallStatus {
+  ok: boolean;
+  sourceDir: string;
+  targetDir: string;
+  results: AgentInstallEntry[];
+  errors: string[];
+}
+
+/**
+ * Deploy the checked-in dedicated Tissue agent definitions into the OpenCode
+ * GLOBAL agent directory the resident service reads, creating the directory when
+ * needed.
+ *
+ * Filesystem-only by construction: it never touches OpenCode's SQLite database and
+ * never starts, restarts, or reaps a serve. A divergent existing file is refused
+ * unless `force` is set, so an operator's local edit is never silently destroyed;
+ * an identical file is a no-op (idempotent).
+ */
+export function installAgentDefinitions(
+  opts: { sourceDir?: string; targetDir?: string; force?: boolean } = {},
+): AgentInstallStatus {
+  const sourceDir = opts.sourceDir !== undefined ? resolve(opts.sourceDir) : resolveSourceAgentsDir();
+  const targetDir = opts.targetDir !== undefined ? resolve(opts.targetDir) : resolveOpenCodeGlobalAgentsDir();
+  const results: AgentInstallEntry[] = [];
+  const errors: string[] = [];
+
+  // Never deploy definitions that do not pass the role boundary validation.
+  const sourceStatus = validateTissueAgentDefinitions({ agentsDir: sourceDir });
+  if (!sourceStatus.ok) {
+    return {
+      ok: false,
+      sourceDir,
+      targetDir,
+      results,
+      errors: [`checked-in source definitions are invalid: ${sourceStatus.errors.join("; ")}`],
+    };
+  }
+
+  try {
+    mkdirSync(targetDir, { recursive: true, mode: 0o755 });
+  } catch (err) {
+    return { ok: false, sourceDir, targetDir, results, errors: [`cannot create ${targetDir} (${(err as Error).message})`] };
+  }
+
+  for (const { role, fileName } of TISSUE_AGENT_FILES) {
+    const from = resolve(sourceDir, fileName);
+    const to = resolve(targetDir, fileName);
+    if (existsSync(to)) {
+      if (readFileSync(to).equals(readFileSync(from))) {
+        results.push({ role, file: to, action: "unchanged" });
+        continue;
+      }
+      if (!opts.force) {
+        results.push({ role, file: to, action: "exists-divergent" });
+        errors.push(`${to}: differs from ${from}; re-run with --force to overwrite`);
+        continue;
+      }
+    }
+    try {
+      writeFileSync(to, readFileSync(from), { mode: statSync(from).mode & 0o777 });
+      results.push({ role, file: to, action: "installed" });
+    } catch (err) {
+      errors.push(`${to}: cannot write (${(err as Error).message})`);
+    }
+  }
+
+  return { ok: errors.length === 0, sourceDir, targetDir, results, errors };
 }

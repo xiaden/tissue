@@ -39,6 +39,7 @@ import {
   type TriageSuggestion,
   type ResolutionResult,
 } from "../controller/session-driver.ts";
+import { TISSUE_TRIAGE_AGENT } from "../config/types.ts";
 import { validateEnvelope, type TriageEnvelope } from "../domain/envelopes.ts";
 import type {
   RealSessionRef,
@@ -174,7 +175,7 @@ export class OpenCodeDriver {
   constructor(opts: OpenCodeDriverOptions) {
     this.http = opts.http;
     this.db = opts.db;
-    this.triageAgent = opts.triageAgent ?? "tissue-triage";
+    this.triageAgent = opts.triageAgent ?? TISSUE_TRIAGE_AGENT;
     this.triageModel = opts.triageModel;
   }
 

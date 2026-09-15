@@ -12,7 +12,8 @@ The CLI is a thin adapter over shared domain operations; there is no second busi
 | `tissue enqueue owner/repo#number` | Explicit baseline admission only |
 | `tissue pause/resume/unpause <target>` | Durable triage/work control |
 | `tissue cleanup <wi>` | Human-only FAILED_HOLD cleanup |
-| `tissue doctor` / `tissue smoke` | Environment and bounded smoke checks |
+| `tissue install-agents [--force]` | Deploy the dedicated Tissue agents into the OpenCode global agent dir (idempotent; refuses a divergent file without `--force`) |
+| `tissue doctor` / `tissue smoke` | Environment and bounded smoke checks; `doctor` exits non-zero when the deployed agents are missing, invalid, or drifted |
 
 `status` reports a redacted `repositoryReadiness` list (`id`, `enabled`, `configManaged`, persisted `capability`, `ready`, `checkedAt`, `reasons`) and a credential-free `opencode` block (`configured`, redacted `endpoint`, `authConfigured`, `capability: "not_probed"`). The `gh` fields remain unprobed (`gh.binary: "/usr/bin/gh"`, `gh.authenticated: null`, `gh.version: null`, `gh.capability: "not_probed"`); the authenticated capability audit is performed by `tissue reconcile` and persisted, not by `status`. It does not provide repository protection, inbox-detail, or PR-detail inspection. Use `inspect` for that durable repository/WorkItem detail. JSON output is structured, redacted, and safe to retain. Each JSONL record has timestamp, level, operation ID (`op`), event, and event-specific fields. Operational records should carry repository ID, WorkItem ID, real OpenCode session ID, phase, attempt, latency, result, and redaction status where applicable. Secret-like keys and credential-shaped values are masked before writing.
 

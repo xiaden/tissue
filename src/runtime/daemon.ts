@@ -21,6 +21,7 @@
 // OpenCode; completion is grounded in RG-3/RG-4/RG-6 transcript observation
 // (HTTP 204 / idle alone is never delivery).
 
+import { TISSUE_RESOLVE_AGENT, TISSUE_TRIAGE_AGENT } from "../config/types.ts";
 import type { TissueConfig, RepositoryConfig, ProviderModel } from "../config/types.ts";
 import type { JsonLogger } from "../logging/jsonl.ts";
 import { runWrite } from "../db/open.ts";
@@ -393,7 +394,8 @@ export function defaultNormalLoopIo(
       const repoRow = getRepositoryById(db, repoId);
       const triage = config.agents.triage;
       const summary = await runTriageRepo(db, repoId, runtime.triageDriver, at, {
-        ...(triage?.agent !== undefined ? { agent: triage.agent } : {}),
+        // Mandatory dedicated identity: never the resident OpenCode default agent.
+        agent: triage?.agent ?? TISSUE_TRIAGE_AGENT,
         ...(triage?.model !== undefined ? { model: parseProviderModelOrThrow(triage.model) } : {}),
         ...(repoRow
           ? {
@@ -423,7 +425,7 @@ export function defaultNormalLoopIo(
         repoConfigFromRow(repoRow),
         runtime.resolutionDriver,
         {
-          ...(resolution?.agent !== undefined ? { agent: resolution.agent } : {}),
+          agent: resolution?.agent ?? TISSUE_RESOLVE_AGENT,
           ...(resolution?.model !== undefined ? { model: parseProviderModelOrThrow(resolution.model) } : {}),
         },
       );
@@ -433,7 +435,8 @@ export function defaultNormalLoopIo(
       const result = await relayOldestInbox(db, workItemId, runtime.resolutionDriver, {
         now: at,
         logger,
-        ...(resolution?.agent !== undefined ? { agent: resolution.agent } : {}),
+        // Same-session inbox deliveries reuse the dedicated resolution identity.
+        agent: resolution?.agent ?? TISSUE_RESOLVE_AGENT,
         ...(resolution?.model !== undefined ? { model: parseProviderModelOrThrow(resolution.model) } : {}),
       });
       return { status: result.status };

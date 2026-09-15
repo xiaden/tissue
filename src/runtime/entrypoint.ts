@@ -37,10 +37,12 @@ import { runReconcilePass, type ReconcileReport } from "../controller/reconcile.
 import {
   parseProviderModel,
   redactResidentEndpoint,
+  resolveSourceAgentsDir,
   validateResidentOpenCodeEndpoint,
   validateTissueAgentDefinitions,
   type AgentDefinitionStatus,
 } from "./resident.ts";
+import { TISSUE_TRIAGE_AGENT } from "../config/types.ts";
 import type { TissueConfig, ProviderModel } from "../config/types.ts";
 import type { TissueDb } from "../db/open.ts";
 
@@ -133,7 +135,12 @@ function resolveRoleModel(setting: { model?: string } | undefined): ProviderMode
 export async function createProductionAssembly(opts: ProductionAssemblyOptions): Promise<ProductionAssembly> {
   // Order matters: validate the resident endpoint BEFORE any credential exists.
   const endpoint = validateResidentOpenCodeEndpoint(opts.endpoint);
-  const agentDefinitions = validateTissueAgentDefinitions({ ...(opts.agentsDir ? { agentsDir: opts.agentsDir } : {}) });
+  const agentDefinitions = validateTissueAgentDefinitions({
+    // Always compare against the checked-in source so a stale deployed definition
+    // cannot silently survive a source update.
+    sourceDir: resolveSourceAgentsDir(),
+    ...(opts.agentsDir ? { agentsDir: opts.agentsDir } : {}),
+  });
   if (!agentDefinitions.ok) {
     throw new Error(`invalid host-global Tissue agent definitions: ${agentDefinitions.errors.join("; ")}`);
   }
@@ -148,12 +155,14 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
   const gh = opts.gh ?? new GhClient();
 
   const triage = opts.config.agents.triage;
-  const triageAgent = triage?.agent;
+  // The dedicated identity is mandatory: an omitted config agent resolves to the
+  // Tissue triage agent, never the resident OpenCode default agent.
+  const triageAgent = triage?.agent ?? TISSUE_TRIAGE_AGENT;
   const triageModel = resolveRoleModel(triage);
   const driver = new OpenCodeDriver({
     http,
     db: opts.db,
-    ...(triageAgent !== undefined ? { triageAgent } : {}),
+    triageAgent,
     ...(triageModel !== undefined ? { triageModel } : {}),
   });
 

@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { COMMANDS, lookupCommand } from "../../src/cli.ts";
+import { installAgentDefinitions } from "../../src/runtime/resident.ts";
 import { startPessimisticServer } from "../helpers/pessimistic-opencode-server.ts";
 
 const execFileP = promisify(execFile);
@@ -41,6 +42,7 @@ const EXPECTED_COMMANDS = [
   "resume",
   "unpause",
   "cleanup",
+  "install-agents",
   "doctor",
   "smoke",
 ];
@@ -54,8 +56,24 @@ function configPath(): string {
   return join(cfgDir, "tissue.yml");
 }
 
+let agentsDir: string | undefined;
+/**
+ * A real deployment of the checked-in dedicated Tissue agents. Production
+ * validates the DEPLOYED definitions in the OpenCode global agent dir, so a test
+ * that runs the real assembly must point it at a deployed directory.
+ */
+function deployedAgentsDir(): string {
+  if (!agentsDir) {
+    agentsDir = mkdtempSync(join(tmpdir(), "tissue-cli-agents-"));
+    const status = installAgentDefinitions({ targetDir: agentsDir });
+    assert.equal(status.ok, true, status.errors.join("; "));
+  }
+  return agentsDir;
+}
+
 after(() => {
   if (cfgDir) rmSync(cfgDir, { recursive: true, force: true });
+  if (agentsDir) rmSync(agentsDir, { recursive: true, force: true });
 });
 
 interface CliResult {
@@ -106,7 +124,7 @@ test("unknown command is rejected with exit 2", async () => {
 test("reconcile-family shares a single business path (no second path)", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "tissue-state-"));
   const server = await startPessimisticServer();
-  const env = { TISSUE_CONFIG: configPath(), TISSUE_STATE_DIR: stateDir, TISSUE_OPENCODE_URL: server.baseUrl() };
+  const env = { TISSUE_CONFIG: configPath(), TISSUE_STATE_DIR: stateDir, TISSUE_OPENCODE_URL: server.baseUrl(), TISSUE_OPENCODE_AGENTS_DIR: deployedAgentsDir() };
   const sequences: string[] = [];
   try {
 for (const cmd of ["reconcile", "tick"]) {
@@ -176,11 +194,45 @@ test("status prints a real config summary and fails cleanly without config", asy
   assert.match(missing.stdout, /CONFIG_ERROR|error/);
 });
 
+test("install-agents deploys the dedicated agents idempotently", async () => {
+  const target = mkdtempSync(join(tmpdir(), "tissue-cli-install-"));
+  try {
+    const first = await runCli(["install-agents"], { TISSUE_OPENCODE_AGENTS_DIR: target });
+    assert.equal(first.code, 0, first.stdout);
+    const report = JSON.parse(first.stdout) as { ok: boolean; targetDir: string; results: Array<{ action: string }> };
+    assert.equal(report.ok, true);
+    assert.equal(report.targetDir, target);
+    assert.deepEqual(report.results.map((r) => r.action), ["installed", "installed"]);
+
+    // Idempotent: an identical deployment is a no-op, never a rewrite.
+    const again = await runCli(["install-agents"], { TISSUE_OPENCODE_AGENTS_DIR: target });
+    assert.equal(again.code, 0, again.stdout);
+    assert.deepEqual(
+      (JSON.parse(again.stdout) as { results: Array<{ action: string }> }).results.map((r) => r.action),
+      ["unchanged", "unchanged"],
+    );
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
 test("doctor runs environment self-checks", async () => {
-  const r = await runCli(["doctor"], { TISSUE_CONFIG: configPath() });
-  assert.equal(r.code, 0);
-  const report = JSON.parse(r.stdout.split("\n").find((line) => line.startsWith("{")) ?? "{}") as { database: { wal: boolean } };
+  const r = await runCli(["doctor"], { TISSUE_CONFIG: configPath(), TISSUE_OPENCODE_AGENTS_DIR: deployedAgentsDir() });
+  assert.equal(r.code, 0, r.stdout);
+  const report = JSON.parse(r.stdout.split("\n").find((line) => line.startsWith("{")) ?? "{}") as { ok: boolean; database: { wal: boolean }; agents: { ok: boolean; agentsDir: string } };
   assert.equal(report.database.wal, true);
+  assert.equal(report.ok, true);
+  assert.equal(report.agents.ok, true);
+  assert.equal(report.agents.agentsDir, deployedAgentsDir());
+});
+
+test("doctor fails closed when the deployed agents are missing", async () => {
+  const missing = join(tmpdir(), `tissue-cli-agents-missing-${process.pid}-${Date.now()}`);
+  const r = await runCli(["doctor"], { TISSUE_CONFIG: configPath(), TISSUE_OPENCODE_AGENTS_DIR: missing });
+  assert.equal(r.code, 1, "doctor must not report health without the deployed agents");
+  const report = JSON.parse(r.stdout.split("\n").find((line) => line.startsWith("{")) ?? "{}") as { ok: boolean; agents: { ok: boolean } };
+  assert.equal(report.ok, false);
+  assert.equal(report.agents.ok, false);
 });
 
 test("smoke aliases the self-check", async () => {

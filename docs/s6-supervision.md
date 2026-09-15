@@ -8,6 +8,19 @@ Install only from a reviewed checkout. The service directory is `deploy/s6-rc/ti
 
 The service uses `/usr/bin/env node /workspace/Tissue/src/runtime/entrypoint.ts daemon`, passes the protected environment through, does not fork, and binds no public surface. Verify the configured checkout, `/usr/bin/gh`, authentication, repository capability, and directory permissions before enabling it.
 
+## Agent deployment
+
+The resident OpenCode service does **not** discover `<Tissue>/agents`. OpenCode resolves reusable Markdown agents from its GLOBAL agent directory, and Tissue resolution sessions are rooted in monitored-repository worktrees, so the Tissue checkout is not a reliable discovery location for them. The checked-in `agents/tissue-triage.md` and `agents/tissue-resolve.md` are therefore SOURCE artifacts, and the deployed copies the resident actually uses must be installed into the global directory:
+
+```sh
+node /workspace/Tissue/src/cli.ts install-agents          # idempotent
+node /workspace/Tissue/src/cli.ts install-agents --force  # overwrite a divergent local edit
+```
+
+`install-agents` resolves the deployment target deterministically — `TISSUE_OPENCODE_AGENTS_DIR` when set, otherwise `$XDG_CONFIG_HOME/opencode/agents` or `$HOME/.config/opencode/agents` — creates it if needed, preserves file permissions, refuses to overwrite a divergent existing file without `--force`, never touches OpenCode's SQLite database, and never restarts the resident service. The service definition sets `TISSUE_OPENCODE_AGENTS_DIR` explicitly (default `/home/opencode/.config/opencode/agents`) so agent resolution never depends on the service working directory; a protected-environment value takes precedence.
+
+Startup and `tissue doctor` fail closed when either deployed definition is missing, invalid, violates the role tool profile, or has drifted from the checked-in source (deterministic SHA-256 content comparison). Working directory is irrelevant to all of it.
+
 ## Stop and status
 
 Use the fixed service name and the host's s6 tools:
@@ -22,7 +35,7 @@ These commands operate on the supervisor only; they do not delete Tissue state o
 
 ## Recovery
 
-Recovery is a level-triggered reconciliation, not blind restart. After a crash or host reboot, inspect `s6-svstat`, run `tissue doctor` (local database/config/state summary only), then run one `tissue reconcile` before enabling normal service operation. P0–P6 reconciliation verifies the Tissue WAL/database, repository capabilities, resident-endpoint reachability, the real session census (without any serve lifecycle), worktrees, PRs, leases, effects, drift, and terminal-unattached inbox housekeeping. It resumes only legal durable states.
+Recovery is a level-triggered reconciliation, not blind restart. After a crash or host reboot, inspect `s6-svstat`, run `tissue doctor` (local database/config/state summary, including deployed-agent validation), then run one `tissue reconcile` before enabling normal service operation. P0–P6 reconciliation verifies the Tissue WAL/database, repository capabilities, resident-endpoint reachability, the real session census (without any serve lifecycle), worktrees, PRs, leases, effects, drift, and terminal-unattached inbox housekeeping. It resumes only legal durable states.
 
 A PID/start-time mismatch is never killed. A wedged session becomes `FAILED_HOLD` with retained evidence; use `tissue inspect <wi>` and the human-approved `tissue cleanup <wi>` path. Never remove a real session or edit OpenCode's database. Logs are telemetry, not sessions, and export is not core retention.
 

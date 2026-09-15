@@ -29,6 +29,8 @@ import {
   DEFAULT_MAX_CONCURRENT_PER_REPO,
   DEFAULT_POLL_INTERVAL_SECONDS,
   DEFAULT_RETENTION_DAYS,
+  TISSUE_RESOLVE_AGENT,
+  TISSUE_TRIAGE_AGENT,
 } from "./types.ts";
 
 export class ConfigError extends Error {
@@ -149,12 +151,26 @@ function validateBaseline(value: string, path: string): string {
   return value;
 }
 
-function parseModelSetting(node: unknown, path: string): ModelSetting | undefined {
-  if (node === undefined || node === null) return undefined;
+/**
+ * Parse one role's agent/model setting. The agent identity is mandatory and
+ * dedicated: an omitted `agent` defaults to `requiredAgent`, and an explicit
+ * value that differs is rejected so enabled production work can never silently
+ * fall back to the resident OpenCode default agent. `model` stays optional (T8 (f)).
+ */
+function parseModelSetting(node: unknown, path: string, requiredAgent: string): ModelSetting {
+  if (node === undefined || node === null) return { agent: requiredAgent };
   const obj = expectObject(node, path);
   assertKnownKeys(obj, new Set(["agent", "model"]), path);
-  const out: ModelSetting = {};
-  if (obj.agent !== undefined) out.agent = expectString(obj.agent, `${path}.agent`);
+  const out: ModelSetting = { agent: requiredAgent };
+  if (obj.agent !== undefined) {
+    const agent = expectString(obj.agent, `${path}.agent`);
+    if (agent !== requiredAgent) {
+      throw new ConfigError(
+        `${path}.agent: must be '${requiredAgent}' — enabled production work never falls back to a resident default agent`,
+      );
+    }
+    out.agent = agent;
+  }
   if (obj.model !== undefined) out.model = expectString(obj.model, `${path}.model`);
   return out;
 }
@@ -285,14 +301,12 @@ export function parseConfig(yamlText: string, source = "<yaml>"): TissueConfig {
     throw new ConfigError(`${source}.retentionDays: must be >= 1`);
   }
 
-  let triage: ModelSetting | undefined;
-  let resolution: ModelSetting | undefined;
+  const agentsNode = root.agents === undefined ? {} : expectObject(root.agents, `${source}.agents`);
   if (root.agents !== undefined) {
-    const agents = expectObject(root.agents, `${source}.agents`);
-    assertKnownKeys(agents, new Set(["triage", "resolution"]), `${source}.agents`);
-    triage = parseModelSetting(agents.triage, `${source}.agents.triage`);
-    resolution = parseModelSetting(agents.resolution, `${source}.agents.resolution`);
+    assertKnownKeys(agentsNode, new Set(["triage", "resolution"]), `${source}.agents`);
   }
+  const triage = parseModelSetting(agentsNode.triage, `${source}.agents.triage`, TISSUE_TRIAGE_AGENT);
+  const resolution = parseModelSetting(agentsNode.resolution, `${source}.agents.resolution`, TISSUE_RESOLVE_AGENT);
 
   const reposRaw = root.repos === undefined ? [] : root.repos;
   if (!Array.isArray(reposRaw)) throw new ConfigError(`${source}.repos: expected a list`);
@@ -302,7 +316,7 @@ export function parseConfig(yamlText: string, source = "<yaml>"): TissueConfig {
     pollIntervalSeconds,
     maxConcurrentGlobal,
     retentionDays,
-    agents: { ...(triage ? { triage } : {}), ...(resolution ? { resolution } : {}) },
+    agents: { triage, resolution },
     repos,
   };
 }

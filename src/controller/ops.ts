@@ -24,7 +24,7 @@ import { recordTransition } from "../domain/transitions.ts";
 import { enqueueIssue } from "./enqueue.ts";
 import { unpauseTriage } from "./triage.ts";
 import { cleanupWorktree, type WorktreeIdentity } from "./worktrees.ts";
-import { redactResidentEndpoint, validateTissueAgentDefinitions } from "../runtime/resident.ts";
+import { redactResidentEndpoint, resolveSourceAgentsDir, validateTissueAgentDefinitions } from "../runtime/resident.ts";
 import type { TissueConfig } from "../config/types.ts";
 import type { JsonLogger } from "../logging/jsonl.ts";
 
@@ -211,7 +211,11 @@ export async function cleanupOperation(ctx: OpsContext, workItemId: string): Pro
 }
 
 export function doctorOperation(ctx: OpsContext): Record<string, unknown> {
+  // Fail closed: validate the DEPLOYED definitions the resident service reads, and
+  // compare them against the checked-in source so a stale deployment is reported.
+  const agents = validateTissueAgentDefinitions({ sourceDir: resolveSourceAgentsDir() });
   return withDb(ctx, (db) => ({
+    ok: agents.ok,
     database: { path: db.path, wal: true },
     repositories: ctx.config.repos.map((r) => {
       const id = `${r.owner}/${r.name}`;
@@ -225,7 +229,7 @@ export function doctorOperation(ctx: OpsContext): Record<string, unknown> {
       };
     }),
     stateDir: ctx.stateDir,
-    agents: validateTissueAgentDefinitions(),
+    agents,
     opencode: opencodeStatus(),
   }));
 }

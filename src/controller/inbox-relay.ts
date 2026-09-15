@@ -23,6 +23,7 @@
 
 import { randomUUID } from "node:crypto";
 
+import { TISSUE_RESOLVE_AGENT } from "../config/types.ts";
 import type { TissueDb } from "../db/open.ts";
 import { runWrite } from "../db/open.ts";
 import {
@@ -223,7 +224,9 @@ export async function relayOldestInbox(
     await driver.promptAsync(session.id, {
       text: buildBundleText(pending, nonce),
       nonce,
-      ...(opts.agent !== undefined ? { agent: opts.agent } : {}),
+      // The dedicated resolution identity is mandatory: an omitted relay option
+      // means tissue-resolve, never the resident OpenCode default agent.
+      agent: opts.agent ?? TISSUE_RESOLVE_AGENT,
       ...(opts.model !== undefined ? { model: opts.model } : {}),
     });
   } catch (err) {

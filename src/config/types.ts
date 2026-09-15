@@ -10,15 +10,28 @@ export const DEFAULT_POLL_INTERVAL_SECONDS = 300;
 export const DEFAULT_RETENTION_DAYS = 90;
 export const DEFAULT_BASE_BRANCH = "main";
 
+/**
+ * Dedicated host-global Tissue agent identities (R11/R12). Enabled production
+ * work always addresses these EXACT agents: omitting `agents.*.agent` defaults
+ * to them, and a divergent explicit value is rejected. Omission therefore never
+ * means "use whatever agent the resident OpenCode default happens to be".
+ * Model/provider selection stays T8 (f) NEEDS_DECISION and remains optional.
+ */
+export const TISSUE_TRIAGE_AGENT = "tissue-triage";
+export const TISSUE_RESOLVE_AGENT = "tissue-resolve";
+
 /** OpenCode's native prompt-addressable model identity (`provider/model`). */
 export interface ProviderModel {
   providerID: string;
   modelID: string;
 }
 
-/** An agent/model setting for one role. The concrete split is T8 (f), NEEDS_DECISION. */
+/**
+ * An agent/model setting for one role. The agent identity is FIXED per role
+ * (tissue-triage / tissue-resolve); only the model split is T8 (f) NEEDS_DECISION.
+ */
 export interface ModelSetting {
-  /** OpenCode agent name (e.g. tissue-triage / tissue-resolve). Not canonicalized here. */
+  /** Dedicated Tissue agent identity; defaults to the role's required agent. */
   agent?: string;
   /** Provider/model id, usually `provider/model`; transmitted only when configured. */
   model?: string;

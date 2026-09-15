@@ -19,6 +19,7 @@ import { join } from "node:path";
 
 import type { RepositoryConfig, TissueConfig } from "../../src/config/types.ts";
 import { createProductionAssembly } from "../../src/runtime/entrypoint.ts";
+import { installAgentDefinitions } from "../../src/runtime/resident.ts";
 import { runNormalLoopPass } from "../../src/runtime/daemon.ts";
 import {
   getActiveResolutionSession,
@@ -45,6 +46,17 @@ const ISSUE_CREATED = "2026-06-01T00:00:00.000Z";
 const T0 = Date.parse("2026-07-01T00:00:00.000Z");
 const BRANCH = `tissue/wi_${WORK_ITEM_ID}`;
 const MODEL = "anthropic/claude-3-5-sonnet";
+
+/**
+ * Deploy the checked-in dedicated Tissue agents into `dir` (inside the test state
+ * root). Production validates THAT deployment, never `<Tissue>/agents`, and the
+ * directory is removed with the rest of the state root.
+ */
+function deployAgents(dir: string): string {
+  const status = installAgentDefinitions({ targetDir: dir });
+  assert.equal(status.ok, true, status.errors.join("; "));
+  return dir;
+}
 
 function updateScenario(path: string, update: (scenario: FakeGhScenario) => void): void {
   const scenario = JSON.parse(readFileSync(path, "utf8")) as FakeGhScenario;
@@ -129,6 +141,7 @@ test("production assembly starts from config + empty DB and completes the lifecy
       stateDir: stateRoot,
       endpoint: server.baseUrl(),
       credentials: { username: "tissue", password: "s3cret" },
+      agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
       gh: new GhClient({ binary: fake.binary }),
       now: () => new Date(clock),
     });

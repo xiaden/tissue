@@ -14,6 +14,7 @@ import { openTissueDb, closeDb } from "./db/open.ts";
 import { GhClient } from "./integrations/gh-client.ts";
 import { createProductionAssembly } from "./runtime/entrypoint.ts";
 import { runDaemon, SseWakeHint } from "./runtime/daemon.ts";
+import { installAgentDefinitions } from "./runtime/resident.ts";
 import {
   OperationError,
   statusOperation,
@@ -43,6 +44,7 @@ export const COMMANDS = [
   "resume",
   "unpause",
   "cleanup",
+  "install-agents",
   "doctor",
   "smoke",
 ] as const;
@@ -95,7 +97,25 @@ const hResume: Handler = async (ctx, args) => { if (!args[0]) throw new Operatio
 const hUnpause: Handler = async (ctx, args) => { if (!args[0]) throw new OperationError("INVALID_ARGUMENT", "unpause expects a target", 2); printJson(ctx, unpauseOperation(opsContext(ctx), args[0])); return 0; };
 const hCleanup: Handler = async (ctx, args) => { if (!args[0]) throw new OperationError("INVALID_ARGUMENT", "cleanup expects a work item id", 2); printJson(ctx, await cleanupOperation(opsContext(ctx), args[0])); return 0; };
 
-const hDoctor: Handler = async (ctx, _args) => { printJson(ctx, doctorOperation(opsContext(ctx))); return 0; };
+const hDoctor: Handler = async (ctx, _args) => {
+  const report = doctorOperation(opsContext(ctx));
+  printJson(ctx, report);
+  // Fail closed: an invalid/missing/drifted deployed agent definition is a
+  // doctor failure, not an advisory note.
+  return report.ok === true ? 0 : 1;
+};
+
+/**
+ * Deploy the checked-in dedicated Tissue agent definitions into the OpenCode
+ * global agent directory the resident service reads. Idempotent; refuses to
+ * overwrite a divergent file without --force. Never touches the OpenCode database
+ * and never restarts the resident service.
+ */
+const hInstallAgents: Handler = async (ctx, args) => {
+  const result = installAgentDefinitions({ force: args.includes("--force") });
+  printJson(ctx, result);
+  return result.ok ? 0 : 1;
+};
 const hSmoke: Handler = async (ctx, _args) => { printJson(ctx, smokeOperation(opsContext(ctx))); return 0; };
 
 /** One-line, human/ops-readable reconcile summary: `reconcile P0:ok P1:fail ...`. */
@@ -181,6 +201,7 @@ const TABLE: CommandEntry[] = [
   { name: "resume", usage: "resume <owner/repo|work-item-id>", summary: "resume paused repo/work", run: hResume },
   { name: "unpause", usage: "unpause <owner/repo|work-item-id>", summary: "reset a paused repo/work", run: hUnpause },
   { name: "cleanup", usage: "cleanup <work-item-id>", summary: "release a failed-hold work item", run: hCleanup },
+  { name: "install-agents", usage: "install-agents [--force]", summary: "deploy Tissue agents to the OpenCode global dir", run: hInstallAgents },
   { name: "doctor", usage: "doctor", summary: "run environment self-checks", run: hDoctor },
   { name: "smoke", usage: "smoke", summary: "run a smoke self-check", run: hSmoke },
 ];

@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 
 import { createProductionAssembly } from "../../src/runtime/entrypoint.ts";
 import {
+  installAgentDefinitions,
   parseProviderModel,
   validateResidentOpenCodeEndpoint,
   validateTissueAgentDefinitions,
@@ -48,7 +49,11 @@ function makeAgentsDir(triage: string, resolve: string): string {
 test("resident endpoint validation rejects public/unsafe hosts before any credential is attached", async () => {
   const server = await startPessimisticServer({ username: "tissue", password: "s3cret" });
   const stateDir = mkdtempSync(join(tmpdir(), "tissue-resident-"));
-  const agentsDir = makeAgentsDir(agentFile("tissue-triage", { read: true }), agentFile("tissue-resolve", { read: true, edit: true, bash: true }));
+  const agentsDir = mkdtempSync(join(tmpdir(), "tissue-agents-"));
+  // Production validates the DEPLOYED definitions against the checked-in source,
+  // so this test deploys the real sources into a fresh global-shaped directory.
+  const installed = installAgentDefinitions({ targetDir: agentsDir });
+  assert.equal(installed.ok, true, installed.errors.join("; "));
   const db = openTissueDb(join(stateDir, "tissue.db"));
   const logger = new JsonLogger(new CapturingSink().writeable(), "info", "p3-resident");
   try {

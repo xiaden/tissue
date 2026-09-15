@@ -29,6 +29,7 @@ import { join } from "node:path";
 
 import type { RepositoryConfig, TissueConfig } from "../../src/config/types.ts";
 import { createProductionAssembly } from "../../src/runtime/entrypoint.ts";
+import { installAgentDefinitions } from "../../src/runtime/resident.ts";
 import { runNormalLoopPass } from "../../src/runtime/daemon.ts";
 import {
   getActiveResolutionSession,
@@ -61,6 +62,17 @@ const BASELINE = "2026-01-01T00:00:00.000Z";
 const ISSUE_CREATED = "2026-06-01T00:00:00.000Z";
 const T0 = Date.parse("2026-07-01T00:00:00.000Z");
 const MODEL = "anthropic/claude-3-5-sonnet";
+
+/**
+ * Deploy the checked-in dedicated Tissue agents into `dir` (inside the test state
+ * root). Production validates THAT deployment, never `<Tissue>/agents`, and the
+ * directory is removed with the rest of the state root.
+ */
+function deployAgents(dir: string): string {
+  const status = installAgentDefinitions({ targetDir: dir });
+  assert.equal(status.ok, true, status.errors.join("; "));
+  return dir;
+}
 
 function updateScenario(path: string, update: (scenario: FakeGhScenario) => void): void {
   const scenario = JSON.parse(readFileSync(path, "utf8")) as FakeGhScenario;
@@ -160,6 +172,7 @@ test("same-repository E2E: config + empty DB, same session, false autoMerge no-m
       stateDir: stateRoot,
       endpoint: server.baseUrl(),
       credentials: { username: "tissue", password: "s3cret" },
+      agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
       gh: new GhClient({ binary: fake.binary }),
       now: () => new Date(clock),
     });
@@ -289,7 +302,15 @@ test("same-repository E2E: config + empty DB, same session, false autoMerge no-m
         commentDelivery = listInboxByWorkItem(tissue.db, WORK_ITEM_ID).filter((row) => row.kind === "pr_comment");
       }
       assert.ok(commentDelivery.every((row) => row.state === "DELIVERING"), "second event delivered to the same session, not a new session");
-     assert.equal(getActiveResolutionSession(tissue.db, WORK_ITEM_ID)?.id, resolution!.id, "same resolution session reused");
+      assert.equal(getActiveResolutionSession(tissue.db, WORK_ITEM_ID)?.id, resolution!.id, "same resolution session reused");
+      // The later, same-session delivery also carries the dedicated identity: an
+      // omitted relay/config agent never becomes the resident default agent.
+      const resentUser = server.getRec(resolution!.id)?.messages.filter((m) => m.info.role === "user").at(-1);
+      assert.equal(
+        (resentUser?.info as { agent?: string } | undefined)?.agent,
+        "tissue-resolve",
+        "later same-session inbox delivery uses the dedicated resolution agent",
+      );
     server.flushAsync(resolution!.id, {
       text: JSON.stringify({ kind: "resolution", envelope_id: "env-e2e-2", work_item_id: WORK_ITEM_ID, outcome: "completed", reason: "lint fixed" }),
     });
@@ -431,6 +452,7 @@ test("target/fork E2E: target coaxk/subarr, writable xiaden/subarr via pushRemot
       stateDir: stateRoot,
       endpoint: server.baseUrl(),
       credentials: { username: "tissue", password: "s3cret" },
+      agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
       gh,
       now: () => new Date(clock),
     });

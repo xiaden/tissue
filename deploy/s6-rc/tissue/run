@@ -12,10 +12,16 @@
 # supplied by the protected supervisor environment. They are inherited and
 # passed through to the Node process. No secret is embedded in this file.
 #
+# TISSUE_OPENCODE_AGENTS_DIR is the ABSOLUTE OpenCode GLOBAL agent directory the
+# resident service discovers (the deployed tissue-triage.md / tissue-resolve.md
+# live here). It is set explicitly so agent resolution never depends on the
+# service working directory. Deploy with `tissue install-agents`.
+#
 # Durable state and config default to the checkout paths when the protected
 # supervisor environment does not provide them.
 importas -D /workspace/Tissue/.tissue TISSUE_STATE_DIR TISSUE_STATE_DIR
 importas -D /workspace/Tissue/tissue.yml TISSUE_CONFIG TISSUE_CONFIG
+importas -D /home/opencode/.config/opencode/agents TISSUE_OPENCODE_AGENTS_DIR TISSUE_OPENCODE_AGENTS_DIR
 
 redirfd -rnb 0 /dev/null
 

@@ -47,7 +47,11 @@ test("parses a fully-specified valid config with expected structure", () => {
   assert.equal(cfg.maxConcurrentGlobal, 2);
   assert.equal(cfg.retentionDays, 30);
   assert.equal(cfg.agents.triage?.agent, "tissue-triage");
-  assert.equal(cfg.agents.resolution, undefined);
+  // The dedicated resolution identity is defaulted (not omitted): enabled
+  // production work never falls back to the resident OpenCode default agent.
+  assert.equal(cfg.agents.resolution?.agent, "tissue-resolve");
+  assert.equal(cfg.agents.triage?.model, undefined);
+  assert.equal(cfg.agents.resolution?.model, undefined);
   assert.equal(cfg.repos.length, 1);
   const r = cfg.repos[0]!;
   assert.equal(r.owner, "acme");
@@ -101,6 +105,30 @@ test("loadConfig reads a YAML file from disk and rejects a missing file", () => 
     rmSync(dir, { recursive: true, force: true });
   }
   assert.throws(() => loadConfig(join(dir, "nope.yml")), ConfigError);
+});
+
+test("defaults both dedicated Tissue agent identities and rejects a divergent agent", () => {
+  // Omission means the dedicated Tissue agent, never the resident default.
+  const omitted = parseConfig("repos: []\n", "agents-omitted.yml");
+  assert.equal(omitted.agents.triage?.agent, "tissue-triage");
+  assert.equal(omitted.agents.resolution?.agent, "tissue-resolve");
+  assert.equal(omitted.agents.triage?.model, undefined, "model stays an optional T8 (f) choice");
+  assert.equal(omitted.agents.resolution?.model, undefined);
+
+  // An explicitly divergent agent identity is refused outright.
+  assert.throws(
+    () => parseConfig("agents:\n  triage:\n    agent: nyx\nrepos: []\n", "agents-divergent.yml"),
+    (e: unknown) => e instanceof ConfigError && /never falls back/.test(e.message),
+  );
+  assert.throws(
+    () => parseConfig("agents:\n  resolution:\n    agent: build\nrepos: []\n", "agents-divergent2.yml"),
+    (e: unknown) => e instanceof ConfigError && /tissue-resolve/.test(e.message),
+  );
+
+  // Explicitly naming the required identity is accepted.
+  const explicit = parseConfig("agents:\n  triage:\n    agent: tissue-triage\n    model: anthropic/claude-3-5-sonnet\nrepos: []\n", "agents-explicit.yml");
+  assert.equal(explicit.agents.triage?.agent, "tissue-triage");
+  assert.equal(explicit.agents.triage?.model, "anthropic/claude-3-5-sonnet");
 });
 
 test("rejects a top-level policy-DSL key", () => {
