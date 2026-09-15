@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build / tooling outputs
+dist/
+coverage/
+*.tsbuildinfo
+
+# Tissue runtime durable state and telemetry logs (never committed).
+# OpenCode/controller state, SQLite DB, WAL files, and logs are excluded.
+.tissue/
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~

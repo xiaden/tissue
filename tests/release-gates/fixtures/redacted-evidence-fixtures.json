@@ -1,0 +1,79 @@
+{
+  "schema": "tissue.release-gates.fixture.v1",
+  "releasePromotable": false,
+  "records": [
+    {
+      "gate": "RG-1",
+      "classification": "accepted_current",
+      "status": "PASS",
+      "current": true,
+      "owner": "fixture release owner",
+      "collectedAt": "2026-09-11T00:00:00.000Z",
+      "versions": { "opencode": "1.18.18", "sdk": "1.17.18", "gh": "/usr/bin/gh 2.98.0" },
+      "topology": { "tissueDb": ".tissue/tissue.db", "openCodeDb": "redacted-opencode.db", "residentS6": true, "ambientWriters": ["redacted-TUI"], "lowActivityWindow": true },
+      "thresholds": { "maxSilentDeaths": 0, "maxLockWaitMs": 1000 },
+      "redaction": { "secretsExcluded": true, "sessionIdsRedacted": true }
+    },
+    {
+      "gate": "RG-2",
+      "classification": "deterministic_only",
+      "status": "DETERMINISTIC_ONLY",
+      "current": true,
+      "owner": "fixture release owner",
+      "collectedAt": "2026-09-11T00:00:00.000Z",
+      "versions": { "opencode": "isolated fixture", "sdk": "not applicable", "gh": "not applicable" },
+      "topology": { "tissueDb": "fixture", "openCodeDb": "fixture", "residentS6": false, "ambientWriters": [], "lowActivityWindow": true },
+      "thresholds": { "startupLockFailures": 0 },
+      "redaction": { "secretsExcluded": true, "sessionIdsRedacted": true }
+    },
+    {
+      "gate": "RG-3",
+      "classification": "historical_non_current",
+      "status": "BLOCKED",
+      "current": false,
+      "historical": true,
+      "owner": "fixture release owner",
+      "collectedAt": "2026-09-10T00:00:00.000Z",
+      "versions": { "opencode": "1.18.18", "sdk": "1.17.18", "gh": "not applicable" },
+      "topology": { "tissueDb": "fixture", "openCodeDb": "historical", "residentS6": true, "ambientWriters": [], "lowActivityWindow": false },
+      "thresholds": { "busyPrompt": "observed" },
+      "redaction": { "secretsExcluded": true, "sessionIdsRedacted": true }
+    },
+    {
+      "gate": "RG-4",
+      "classification": "insufficient",
+      "status": "INSUFFICIENT",
+      "current": true,
+      "owner": "fixture release owner",
+      "collectedAt": "2026-09-11T00:00:00.000Z",
+      "versions": { "opencode": "1.18.18", "sdk": "1.17.18", "gh": "not applicable" },
+      "topology": { "tissueDb": "fixture", "openCodeDb": "fixture", "residentS6": true, "ambientWriters": [], "lowActivityWindow": true },
+      "thresholds": { "completion": "missing compaction proof" },
+      "redaction": { "secretsExcluded": true, "sessionIdsRedacted": true }
+    },
+    {
+      "gate": "RG-5",
+      "classification": "deterministic_only",
+      "status": "BLOCKED",
+      "current": true,
+      "owner": "fixture release owner",
+      "collectedAt": "2026-09-11T00:00:00.000Z",
+      "versions": { "opencode": "not exercised", "sdk": "not applicable", "gh": "not applicable" },
+      "topology": { "tissueDb": "fixture", "openCodeDb": "fixture", "residentS6": false, "ambientWriters": [], "lowActivityWindow": true },
+      "thresholds": { "silentDeaths": 0, "pollingBackstop": true },
+      "redaction": { "secretsExcluded": true, "sessionIdsRedacted": true }
+    },
+    {
+      "gate": "RG-6",
+      "classification": "blocked",
+      "status": "BLOCKED",
+      "current": true,
+      "owner": "fixture release owner",
+      "collectedAt": "2026-09-11T00:00:00.000Z",
+      "versions": { "opencode": "1.18.18", "sdk": "unknown", "gh": "not applicable" },
+      "topology": { "tissueDb": "fixture", "openCodeDb": "fixture", "residentS6": true, "ambientWriters": [], "lowActivityWindow": true },
+      "thresholds": { "messagesApi": "not tested" },
+      "redaction": { "secretsExcluded": true, "sessionIdsRedacted": true }
+    }
+  ]
+}

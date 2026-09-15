@@ -1,0 +1,25 @@
+{
+  "name": "tissue",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tissue (Triaged Issue Execution) — autonomous GitHub maintenance controller foundation. Node 26 native TypeScript, no build step.",
+  "type": "module",
+  "engines": {
+    "node": ">=26.0.0"
+  },
+  "scripts": {
+    "start": "node src/runtime/entrypoint.ts",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "lint": "node scripts/lint.ts",
+    "ci": "npm run typecheck && npm run lint && npm test"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "yaml": "2.9.0"
+  }
+}

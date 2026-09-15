@@ -1,0 +1,30 @@
+# Tissue operational runbook
+
+## Startup, reconcile, and authentication
+
+1. Confirm the s6 service state with `s6-svstat` and do not restart a resident service merely to probe it.
+2. Run `tissue doctor`; it reports the local Tissue database path/WAL setting, state directory, host-global agent-definition validation, the credential-free resident-endpoint status, and each configured repository's persisted readiness (`configManaged`, `capability`, `ready`, `reasons`). It does not itself perform the authenticated `gh`/checkout/base-branch/Issues/protection audit.
+3. Run `tissue reconcile` once. Review the P0–P6 report and ERROR JSONL before enabling polling; reconciliation is the path that performs repository/capability checks when configured.
+4. Use `tissue status` for capacity, leases, sessions, inbox, PR/protection state, FAILED_HOLD, last reconcile, housekeeping, and WAL observability.
+
+The authenticated `gh`, checkout/remotes, base branch, Issues, and protection capability audit is performed by `tissue reconcile` (its P3 phase) and persisted as each repository's `capability_state`, which `doctor` and `status` surface. Dispatch is refused while a repository is not `ready`. Authentication failures are surfaced and retried only under the typed integration policy. They are not converted to healthy or silently bypassed.
+
+## SQLite/WAL and shared-store hygiene
+
+Tissue owns only its separate `tissue.db`, opened with foreign keys, WAL, FULL synchronous, timeout, migrations, and short `BEGIN IMMEDIATE` writes. Never open, vacuum, delete, or migrate the OpenCode database. Status reports WAL path and size/growth; a growing WAL is an observability signal, not permission to delete it while the process is active. Shared OpenCode-store contention and ambient writers are RG-1 evidence questions, not claims inferred from local smoke.
+
+## Inbox, idle, and OpenCode behavior
+
+The durable inbox is globally ordered by `inbox.id`. Relay occurs only when the existing real session is observed idle, no delivery is in flight, and no controller turn is active. Human use is allowed; pending controller events wait for post-human idle. Busy/retry are non-idle. HTTP 204 and idle alone are not completion. Completion requires the nonce-bearing user message and a parent-linked assistant turn, excluding summary/compaction. Duplicate envelopes are audited no-ops. `noReply` has its own bounded observation window.
+
+SSE is a wake hint only. Heartbeat timeout, jittered reconnect, status resynchronization, and polling are correctness backstops. A wedge or missing qualifying turn is inspected and may become `FAILED_HOLD`; do not issue concurrent prompts or create a replacement session.
+
+## Worktrees, PR races, and cleanup
+
+Before push/PR, verify expected worktree, controller branch, HEAD, WorkItem, protection, checks, reviews, and mergeability. Adopt externally merged/closed reality; never force-push or bypass protection. A `FAILED_HOLD` preserves branch/worktree/session/PR evidence until an explicit human `tissue cleanup <wi>`. Terminal leftover artifacts on completed/rejected/failed history trigger cleanup retry and human inspection; they do not rewrite history as FAILED_HOLD. Post-merge cleanup removes disposable worktree and local branch, while retaining all durable history and the real session.
+
+## Human approval and release evidence
+
+The per-repository Issues/protection capability audit described by T8(j) is not complete merely because `doctor` succeeds; T8(j) remains `NEEDS_DECISION`, and release acceptance remains blocked.
+
+Required review or approval is `WAITING`; resume the same session after approval. Late gate failure follows the precommitted tightening ladder (single shared serve, then serialized prompt slots) before any architecture reconsideration. Deterministic fixtures, fake sessions, historical records, 204/idle behavior, and opt-in skips never satisfy a real gate. Current inventory and blocker files are non-promotional; `releasePromotable=false`.

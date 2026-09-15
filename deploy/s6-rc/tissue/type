@@ -1,0 +1,4 @@
+# s6-rc service type for the Tissue A' supervised reconcile controller.
+# Longrun: s6-svscan starts it once and keeps it alive; it must not fork/daemonize.
+# A' is the only implementation shell (D' is documented only and never co-built).
+longrun

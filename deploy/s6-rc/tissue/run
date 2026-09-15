@@ -1,0 +1,23 @@
+#!/usr/bin/execlineb -P
+# Tissue A' supervised entrypoint for the production resident daemon.
+#
+# A'-only: this connects to the ALREADY-RUNNING resident OpenCode service and
+# never starts, supervises, restarts, or reaps an OpenCode serve. No D'
+# machinery (no child-session launcher, no per-turn ledger, no process-group
+# reaping) is present.
+#
+# Noninteractive environment: TISSUE_OPENCODE_URL must be a loopback/private
+# resident endpoint (for example http://127.0.0.1:4096); the optional
+# OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD credentials must be
+# supplied by the protected supervisor environment. They are inherited and
+# passed through to the Node process. No secret is embedded in this file.
+#
+# Durable state and config default to the checkout paths when the protected
+# supervisor environment does not provide them.
+importas -D /workspace/Tissue/.tissue TISSUE_STATE_DIR TISSUE_STATE_DIR
+importas -D /workspace/Tissue/tissue.yml TISSUE_CONFIG TISSUE_CONFIG
+
+redirfd -rnb 0 /dev/null
+
+# Production entrypoint: consumes daemon mode and remains resident under s6.
+exec /usr/bin/env node /workspace/Tissue/src/runtime/entrypoint.ts daemon
