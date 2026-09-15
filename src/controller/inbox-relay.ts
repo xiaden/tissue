@@ -20,6 +20,11 @@
 // The relay never issues a second prompt while a DELIVERING row exists, so it
 // never relies on an OpenCode "busy" rejection (G4): a prompt accepted while
 // busy is reconciled by the same bounded observation window.
+//
+// The idle gate escalates rather than stalls on a genuinely absent session: an
+// explicit `missing` status (HTTP 404) puts the WorkItem in FAILED_HOLD with the
+// PENDING bundle and its evidence preserved, while a transient `busy`/`retry`
+// holds the bundle as busy_hold. A transport failure is never read as `missing`.
 
 import { randomUUID } from "node:crypto";
 
@@ -205,8 +210,14 @@ export async function relayOldestInbox(
   const pending = listPendingInboxByWorkItem(db, workItemId);
   if (pending.length === 0) return { status: "no_pending", workItemId, inboxIds: [] };
 
-  const idle = await observeIdleAcrossSamples(driver, session.id, opts);
-  if (!idle) return { status: "busy_hold", workItemId, inboxIds: [], sessionId: session.id };
+  const observation = await observeIdleAcrossSamples(driver, session.id, opts);
+  if (observation === "missing") {
+    // The session is explicitly gone (HTTP 404). Never hold `busy_hold` forever
+    // for a nonexistent session: escalate the WorkItem and leave the bundle
+    // PENDING (no nonce, no prompt) so the evidence survives.
+    return holdWorkItem(db, workItemId, session.id, pending.map((row) => row.id), "session_missing", now, logger);
+  }
+  if (observation === "busy") return { status: "busy_hold", workItemId, inboxIds: [], sessionId: session.id };
 
   const nonce = (opts.nonce ?? makeNonce)();
   const ids = pending.map((r) => r.id);
@@ -244,17 +255,29 @@ export async function relayOldestInbox(
   return { status: "observing", workItemId, inboxIds: ids, nonce, sessionId: session.id, reason: match.reason };
 }
 
-/** Observe idle across K samples separated by >= Q (G3); any non-idle -> false. */
-async function observeIdleAcrossSamples(driver: RelayDriver, sessionId: string, opts: RelayOptions): Promise<boolean> {
+/**
+ * Observe idle across K samples separated by >= Q (G3). Returns `missing`
+ * immediately when the driver reports the session absent (no further samples),
+ * `busy` on any other non-idle status, and `idle` only after all K samples are
+ * idle. A thrown `getSessionStatus` is a transport failure, NOT evidence the
+ * session is gone: it propagates unchanged and is never coerced to `missing`.
+ */
+async function observeIdleAcrossSamples(
+  driver: RelayDriver,
+  sessionId: string,
+  opts: RelayOptions,
+): Promise<"idle" | "busy" | "missing"> {
   const k = Math.max(1, opts.kIdleSamples ?? K_IDLE_SAMPLES);
   const gap = opts.idleGapMs ?? Q_IDLE_GAP_MS;
   const sleep = opts.sleep ?? defaultSleep;
   for (let i = 0; i < k; i++) {
     if (i > 0 && gap > 0) await sleep(gap);
+    // Do not catch: a transport error must reach the caller unchanged.
     const status = await driver.getSessionStatus(sessionId);
-    if (status !== "idle") return false;
+    if (status === "missing") return "missing";
+    if (status !== "idle") return "busy";
   }
-  return true;
+  return "idle";
 }
 
 async function applyResolutionResult(
