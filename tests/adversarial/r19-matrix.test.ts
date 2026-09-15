@@ -223,3 +223,58 @@ test("R19 pessimistic OpenCode busy/missing session states never become completi
     await server.close();
   }
 });
+
+test("R19 deleted resolution session: census is missing, reconcile holds FAILED_HOLD, session preserved", async () => {
+  // The census is computed with the REAL driver over the pessimistic server, then
+  // fed through the real reconcile pass: a genuinely missing real session must be
+  // interpreted into explicit durable recovery, never a fabricated completion or
+  // a fabricated replacement session.
+  const server = await startPessimisticServer();
+  const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
+  const t = createTestDb();
+  const driver = new OpenCodeDriver({ http, db: t.db });
+  try {
+    const repo = seedRepository(t.db);
+    const wi = insertWorkItem(t.db, { id: "wi-census-loss", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    const ref = await driver.createRealSession("resolution", "/lost", {
+      repoId: repo.id,
+      directory: "/lost",
+      kind: "resolution",
+      workItemId: wi.id,
+    });
+    server.deleteSession(ref.sessionId);
+
+    const census = await classifySessionCensus(t.db, (id) => driver.getSessionStatus(id), new Date());
+    assert.equal(
+      census.find((entry) => entry.sessionId === ref.sessionId)?.classification,
+      "missing",
+      "a deleted real session classifies missing, never a fabricated completion",
+    );
+
+    const deps: ReconcileDeps = {
+      now: () => new Date(), openDb: () => t.db, closeDb: () => {},
+      verifyRepos: async () => [], censusSessions: async () => census,
+      reconcileArtifacts: async () => ({ expiredLeases: 0, effects: 0, cleaned: [], retained: [] }),
+      scanDrift: async () => [],
+      housekeep: async () => ({ checked: 0, terminalMarked: 0, pruned: 0, issueIds: [], at: new Date().toISOString(), counters: { terminalMarked: 0, pruned: 0, lastAt: null }, lastAction: null }),
+      resumeNormalLoop: async () => ({ recovered: [], claimed: null }),
+    };
+    const report = await runReconcilePass({ config: CONFIG, logger: new JsonLogger(new CapturingSink().writeable()), db: t.db, deps });
+    assert.equal(report.phases.find((phase) => phase.phase === "P2")?.ok, true);
+
+    assert.equal(
+      getWorkItem(t.db, wi.id)?.state,
+      "FAILED_HOLD",
+      "the lost resolution session never leaves the WorkItem indefinitely dispatchable",
+    );
+    // The real session mapping is preserved; no fabricated replacement session.
+    assert.equal(t.db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM opencode_sessions")?.c, 1);
+    assert.equal(
+      t.db.sql.get<{ state: string }>("SELECT state FROM opencode_sessions WHERE id = ?", ref.sessionId)?.state,
+      "ACTIVE",
+    );
+  } finally {
+    t.cleanup();
+    await server.close();
+  }
+});
