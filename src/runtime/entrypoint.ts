@@ -104,6 +104,12 @@ export interface ProductionAssembly {
   transport: OpenCodeHttp;
   normalLoop: NormalLoopIo;
   reconcile: () => Promise<ReconcileReport>;
+  /**
+   * Fail-closed resident-dependency probe over the same authenticated transport
+   * the daemon already uses. Returns false (never throws) when the resident
+   * service is unreachable; credentials are never logged.
+   */
+  checkResidentHealth(): Promise<boolean>;
   /** Credential-free endpoint label (scheme://host:port) for status/logs. */
   endpoint: string;
   agentDefinitions: AgentDefinitionStatus;
@@ -185,6 +191,15 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
       driver,
       gh,
     }),
+    checkResidentHealth: async () => {
+      try {
+        await http.sessionStatus();
+        return true;
+      } catch {
+        // Unreachable resident service is unhealthy; never surface credentials.
+        return false;
+      }
+    },
   };
 }
 
@@ -220,6 +235,7 @@ export async function runProductionDaemon(): Promise<void> {
       logger,
       db,
       reconcile: assembly.reconcile,
+      checkResidentHealth: assembly.checkResidentHealth,
       normalLoop: assembly.normalLoop,
       wakeHint,
       sleep: defaultSleep,

@@ -91,6 +91,16 @@ export interface ReconcileReport {
   startedAt: string;
   finishedAt: string;
   phases: PhaseReport[];
+  /**
+   * Fail-closed resident-dependency health carried across the reconcile -> daemon
+   * seam (Daemon Seam Dependency-Health Policy). It is true only when the P2
+   * census resolved — the resident OpenCode service answered — and false whenever
+   * P0 or P2 failed, so an unknown dependency never reads as healthy. A resolved
+   * census that reports per-session `missing`/`wedged`/`incomplete` entries still
+   * reads true: those are observed per-WorkItem outcomes, not service
+   * unavailability. `runDaemon` seeds the normal loop's health from this field.
+   */
+  residentOpenCodeAvailable: boolean;
 }
 
 export type SessionClassification = "idle" | "busy" | "retry" | "missing" | "incomplete" | "wedged";
@@ -152,6 +162,12 @@ const ALL_PHASES: ReconcilePhaseId[] = ["P0", "P1", "P2", "P3", "P4", "P5", "P6"
  * P6 is gated on resident dependency health: when the P2 census could not be taken
  * the gate withholds prompt-dependent resume in full, but only after P1/P3/P4/P5
  * (all OpenCode-independent) have run, so safe local reconciliation is never lost.
+ *
+ * The same health is exposed additively on the returned report as
+ * `residentOpenCodeAvailable` so it can cross the reconcile -> daemon seam: the
+ * `runDaemon` loop seeds its gate from it and re-probes every iteration. It is
+ * false whenever P0 or P2 failed (fail closed) and true only when the P2 census
+ * resolved.
  */
 export async function runReconcilePass(ctx: ReconcileContext): Promise<ReconcileReport> {
   const deps = ctx.deps ?? defaultReconcileDeps(ctx);
@@ -220,7 +236,12 @@ export async function runReconcilePass(ctx: ReconcileContext): Promise<Reconcile
     }
   }
 
-  const report: ReconcileReport = { startedAt, finishedAt: new Date().toISOString(), phases };
+  const report: ReconcileReport = {
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    residentOpenCodeAvailable: openCodeAvailable,
+    phases,
+  };
   ctx.logger.info("reconcile.report", {
     phases: phases.map((p) => ({ phase: p.phase, ok: p.ok, skipped: p.skipped })),
     failed: phases.filter((p) => !p.ok && !p.skipped).map((p) => p.phase),

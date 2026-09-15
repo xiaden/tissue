@@ -788,6 +788,8 @@ test("reconcile: resident OpenCode unavailability fails P2, still runs P3-P5, an
     });
 
     assert.equal(report.phases.find((p) => p.phase === "P2")?.ok, false, "the census cannot be taken");
+    // Default deps + a throwing census driver: the report derives fail-closed health.
+    assert.equal(report.residentOpenCodeAvailable, false);
     assert.equal(report.phases.find((p) => p.phase === "P3")?.ok, true, "safe non-OpenCode reconciliation still runs");
     assert.equal(report.phases.find((p) => p.phase === "P4")?.ok, true);
     assert.equal(report.phases.find((p) => p.phase === "P5")?.ok, true);
@@ -838,6 +840,8 @@ test("reconcile: derives resident dependency health from the P2 census and passe
     });
     assert.equal(failing.phases.find((p) => p.phase === "P2")?.ok, false);
     assert.deepEqual(healthSeen, [{ openCodeAvailable: false }]);
+    // The report itself carries the fail-closed health across the daemon seam.
+    assert.equal(failing.residentOpenCodeAvailable, false, "unobservable dependency never reads as healthy");
 
     // A resolved census — even one full of per-session missing/wedged entries —
     // proves the service answered, so P6 receives true.
@@ -857,10 +861,44 @@ test("reconcile: derives resident dependency health from the P2 census and passe
       }),
     });
     assert.equal(resolved.phases.find((p) => p.phase === "P2")?.ok, true);
+    assert.equal(
+      resolved.residentOpenCodeAvailable,
+      true,
+      "a resolved census with per-session missing still proves the service answered",
+    );
     assert.deepEqual(healthSeen, [
       { openCodeAvailable: false },
       { openCodeAvailable: true },
     ]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: a P0 failure leaves residentOpenCodeAvailable false and skips P1-P6 (fail closed)", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: {
+        ...stubDeps(db, () => {}),
+        openDb: () => {
+          throw new Error("db open failed");
+        },
+      },
+    });
+
+    assert.equal(report.phases.find((p) => p.phase === "P0")?.ok, false, "P0 records the open failure");
+    for (const phase of ["P1", "P2", "P3", "P4", "P5", "P6"] as const) {
+      assert.equal(
+        report.phases.find((p) => p.phase === phase)?.skipped,
+        true,
+        `${phase} is skipped when P0 never produced a database`,
+      );
+    }
+    assert.equal(report.residentOpenCodeAvailable, false, "P0 failure derives fail-closed health");
   } finally {
     cleanup();
   }
