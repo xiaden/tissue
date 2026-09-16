@@ -59,6 +59,12 @@ export class PessimisticOpenCodeServer {
   promptWhileBusy: "http_409" | "accept_no_reply" = "accept_no_reply";
   /** When set, sync prompts return this HTTP error instead of a turn (never assume success). */
   syncPromptErrorCode: number | null = null;
+  /**
+   * When set, the GLOBAL GET /session/status route fails with this code while
+   * per-session lookups keep working. Models a service-level/route failure, which
+   * must never be read as per-session loss.
+   */
+  globalStatusErrorCode: number | null = null;
   /** Count of requests rejected for missing/incorrect credentials (auth evidence). */
   authRejections = 0;
   /** Total HTTP requests observed (validates ordering: e.g. zero before endpoint validation). */
@@ -237,6 +243,11 @@ export class PessimisticOpenCodeServer {
 
       // GET /session/status
       if (url.pathname === "/session/status" && method === "GET") {
+        if (this.globalStatusErrorCode !== null) {
+          // Injected service-level failure on the GLOBAL status route: a dependency
+          // failure, never evidence about one individual session.
+          return this.json(res, this.globalStatusErrorCode, { error: "status_unavailable" });
+        }
         const map: Record<string, OcSessionStatus> = {};
         for (const r of this.sessions.values()) {
           if (r.deleted || r.status.type === "idle") continue; // idle not reported (mirrors real)

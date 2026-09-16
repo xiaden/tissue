@@ -399,6 +399,8 @@ function stubDeps(db: TissueDb, onFault: (b: ReconcileBoundary) => void): Reconc
     openDb: () => db,
     closeDb: () => {},
     verifyRepos: async () => [],
+    // Reconcile stub: the explicit resident probe is exercisable per test.
+    probeResident: async () => {},
     censusSessions: async () => [],
     reconcileArtifacts: async () => ({ expiredLeases: 0, effects: 0, cleaned: [], retained: [] }),
     scanDrift: async () => [],
@@ -438,7 +440,7 @@ test("reconcile: runs the ordered idempotent P0-P6 sweep and hits all five fault
       ["P0", "P1", "P2", "P3", "P4", "P5", "P6"],
     );
     assert.ok(report.phases.every((p) => p.ok));
-    assert.deepEqual(faults, ["cleanup", "drift_fail", "ingest", "reparent", "prompt_before_completion"]);
+    assert.deepEqual(faults, ["recovery", "cleanup", "drift_fail", "ingest", "reparent", "prompt_before_completion"]);
   } finally {
     cleanup();
   }

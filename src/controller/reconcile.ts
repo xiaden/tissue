@@ -77,7 +77,7 @@ export interface ReconcileContext {
 
 export type ReconcilePhaseId = "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6";
 
-export type ReconcileBoundary = "ingest" | "prompt_before_completion" | "reparent" | "drift_fail" | "cleanup";
+export type ReconcileBoundary = "ingest" | "prompt_before_completion" | "reparent" | "drift_fail" | "cleanup" | "recovery";
 
 export interface PhaseReport {
   phase: ReconcilePhaseId;
@@ -93,12 +93,13 @@ export interface ReconcileReport {
   phases: PhaseReport[];
   /**
    * Fail-closed resident-dependency health carried across the reconcile -> daemon
-   * seam (Daemon Seam Dependency-Health Policy). It is true only when the P2
-   * census resolved — the resident OpenCode service answered — and false whenever
-   * P0 or P2 failed, so an unknown dependency never reads as healthy. A resolved
-   * census that reports per-session `missing`/`wedged`/`incomplete` entries still
-   * reads true: those are observed per-WorkItem outcomes, not service
-   * unavailability. `runDaemon` seeds the normal loop's health from this field.
+   * seam (Daemon Seam Dependency-Health Policy). It is true only when P2 completed
+   * authoritatively — the explicit resident health probe answered, the census was
+   * taken, and the recovery policy applied — and false whenever P0 or P2 failed, so
+   * an unknown or broken dependency never reads as healthy. A completed census that
+   * reports per-session `missing`/`wedged`/`incomplete` entries still reads true:
+   * those are observed per-WorkItem outcomes, not service unavailability.
+   * `runDaemon` seeds the normal loop's health from this field.
    */
   residentOpenCodeAvailable: boolean;
 }
@@ -115,14 +116,16 @@ export interface SessionCensusEntry {
 }
 
 /**
- * Resident-dependency health derived from the P2 census (Dependency-Health
- * Policy). `openCodeAvailable` is true only when `deps.censusSessions` resolved —
- * the resident OpenCode service answered — and false when P2 threw, i.e. the
- * service was unobservable. A partially or fully classified census that lists
- * per-session `missing`/`wedged`/`incomplete` sessions still counts as available:
- * those are per-WorkItem outcomes the census successfully observed, not service
- * unavailability, and must not gate resume. The flag gates P6 prompt-dependent
- * resume only; it never suppresses local reconciliation.
+ * Resident-dependency health derived from P2 (Dependency-Health Policy).
+ * `openCodeAvailable` is true only when P2 completed: the explicit resident health
+ * probe (independent of durable session count) answered, the census was taken, and
+ * `applySessionCensusRecovery` applied. It is false when any of those failed, i.e.
+ * the service was unobservable or the authoritative P2 work did not complete, so an
+ * empty census or a partially-applied pass can never establish health. A completed
+ * census that lists per-session `missing`/`wedged`/`incomplete` sessions still
+ * counts as available: those are per-WorkItem outcomes the census successfully
+ * observed, not service unavailability. The flag gates P6 prompt-dependent resume
+ * only; it never suppresses local reconciliation.
  */
 export interface SessionDependencyHealth {
   openCodeAvailable: boolean;
@@ -133,6 +136,13 @@ export interface ReconcileDeps {
   openDb(): TissueDb;
   closeDb(db: TissueDb): void;
   verifyRepos(db: TissueDb, config: TissueConfig): Promise<Array<{ repoId: string; ok: boolean; capability?: RepoCapability; error?: string }>>;
+  /**
+   * Explicit resident OpenCode health probe (P2), independent of the number of
+   * durable sessions: it contacts the service and REJECTS when it is unreachable.
+   * An empty session census must never establish health on its own, so this runs
+   * before the census and fails the phase closed.
+   */
+  probeResident(): Promise<void>;
   censusSessions(db: TissueDb): Promise<SessionCensusEntry[]>;
   reconcileArtifacts(db: TissueDb): Promise<{ expiredLeases: number; effects: number; cleaned: string[]; retained: string[] }>;
   scanDrift(db: TissueDb): Promise<Array<{ workItemId: string; result: DriftResult }>>;
@@ -204,10 +214,19 @@ export async function runReconcilePass(ctx: ReconcileContext): Promise<Reconcile
       const open = db;
       await record("P1", () => deps.verifyRepos(open, ctx.config));
       await record("P2", async () => {
+        // 1. Explicit resident-health probe, independent of the durable session
+        //    count: an empty census must never read as "the service answered".
+        await deps.probeResident();
+        // 2. Real census over the durable session mappings.
         const census = await deps.censusSessions(open);
-        // The census resolving is the only proof the resident service answered.
-        openCodeAvailable = true;
+        // 3. Apply the recovery policy (authoritative, not diagnostic).
+        await deps.injectFault?.("recovery");
         const recovery = applySessionCensusRecovery(open, census, ctx.logger);
+        // Health is published only after ALL of P2 succeeded. If the probe, the
+        // census, or the recovery throws, P2 is recorded failed and the dependency
+        // stays unsafe to resume, so P6 never receives a healthy signal from a
+        // broken P2 (fail closed).
+        openCodeAvailable = true;
         return { census, recovery };
       });
       await record("P3", async () => {
@@ -543,6 +562,21 @@ function defaultReconcileDeps(ctx: ReconcileContext): ReconcileDeps {
       return out;
     },
     // Production never owns an OpenCode process; there is no serve-lifecycle slot.
+    //
+    // P2 health is probed explicitly and independently of the durable session
+    // count: `listSessions` contacts the resident service whether or not any
+    // session rows exist, and rejects when the service is unreachable. A driver
+    // that cannot probe fails closed rather than letting an empty census look
+    // healthy.
+    probeResident: async () => {
+      const candidate = driver as { listSessions?: (directory?: string) => Promise<unknown> };
+      if (typeof candidate.listSessions !== "function") {
+        throw new Error(
+          "no resident OpenCode health probe is available on the configured session driver; refusing to assume the dependency is healthy",
+        );
+      }
+      await candidate.listSessions();
+    },
     censusSessions: async (db) => classifySessionCensus(db, (id) => driver.getSessionStatus(id), new Date()),
     reconcileArtifacts: async (db) => {
       const now = new Date();

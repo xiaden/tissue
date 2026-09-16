@@ -72,13 +72,13 @@ test("R19 every reconcile fault boundary is isolated and later recovery remains 
     const faults: ReconcileBoundary[] = [];
     const deps: ReconcileDeps = {
       now: () => new Date("2026-09-10T00:00:00.000Z"), openDb: () => t.db, closeDb: () => {},
-      verifyRepos: async () => [], censusSessions: async () => [],
+      verifyRepos: async () => [], probeResident: async () => {}, censusSessions: async () => [],
       reconcileArtifacts: async () => ({ expiredLeases: 0, effects: 0, cleaned: [], retained: [] }),
       scanDrift: async () => [], housekeep: async () => ({ checked: 0, terminalMarked: 0, pruned: 0, issueIds: [], at: new Date().toISOString(), counters: { terminalMarked: 0, pruned: 0, lastAt: null }, lastAction: null }),
       resumeNormalLoop: async () => ({ recovered: [], claimed: null }), injectFault: (boundary) => { faults.push(boundary); },
     };
     const report = await runReconcilePass({ config: CONFIG, logger: new JsonLogger(new CapturingSink().writeable()), db: t.db, deps });
-    assert.deepEqual(faults, ["cleanup", "drift_fail", "ingest", "reparent", "prompt_before_completion"]);
+    assert.deepEqual(faults, ["recovery", "cleanup", "drift_fail", "ingest", "reparent", "prompt_before_completion"]);
     assert.deepEqual(report.phases.map((phase) => phase.phase), ["P0", "P1", "P2", "P3", "P4", "P5", "P6"]);
     assert.ok(report.phases.every((phase) => phase.ok));
   } finally { t.cleanup(); }
@@ -253,7 +253,7 @@ test("R19 deleted resolution session: census is missing, reconcile holds FAILED_
 
     const deps: ReconcileDeps = {
       now: () => new Date(), openDb: () => t.db, closeDb: () => {},
-      verifyRepos: async () => [], censusSessions: async () => census,
+      verifyRepos: async () => [], probeResident: async () => {}, censusSessions: async () => census,
       reconcileArtifacts: async () => ({ expiredLeases: 0, effects: 0, cleaned: [], retained: [] }),
       scanDrift: async () => [],
       housekeep: async () => ({ checked: 0, terminalMarked: 0, pruned: 0, issueIds: [], at: new Date().toISOString(), counters: { terminalMarked: 0, pruned: 0, lastAt: null }, lastAction: null }),
