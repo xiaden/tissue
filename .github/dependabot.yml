@@ -1,0 +1,28 @@
+# Keep dependencies and SHA-pinned Actions current.
+#
+# The workflow Actions are pinned to immutable commit SHAs, so `github-actions`
+# updates are how those pins receive security fixes.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"

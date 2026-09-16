@@ -33,8 +33,7 @@ import { runWrite } from "../../src/db/open.ts";
 import { relayOldestInbox } from "../../src/controller/inbox-relay.ts";
 import { startPessimisticServer, type PessimisticOpenCodeServer } from "../helpers/pessimistic-opencode-server.ts";
 import { createTestDb, seedIssue, seedRepository } from "../helpers/db.ts";
-
-const DIR = "/workspace/nomarr";
+import { createTempRepo } from "../helpers/git.ts";
 
 interface Harness {
   db: ReturnType<typeof createTestDb>["db"];
@@ -49,6 +48,10 @@ interface Harness {
 async function harness(): Promise<Harness> {
   const t = createTestDb();
   const server = await startPessimisticServer();
+  // A real local checkout: relay delivery resolves the active worktree's HEAD
+  // sha, so the worktree path must be a real git repository — never a
+  // host-specific path that only exists on one machine.
+  const checkout = await createTempRepo();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
   const driver = new OpenCodeDriver({ http, db: t.db });
   const repo = seedRepository(t.db);
@@ -64,13 +67,13 @@ async function harness(): Promise<Harness> {
   insertWorktree(t.db, {
     id: `wt-${workItem.id}`,
     work_item_id: workItem.id,
-    path: DIR,
+    path: checkout.clone,
     branch: "tissue/wi_abc",
     state: "ACTIVE",
   });
-  const ref = await driver.createRealSession("resolution", DIR, {
+  const ref = await driver.createRealSession("resolution", checkout.clone, {
     repoId: repo.id,
-    directory: DIR,
+    directory: checkout.clone,
     kind: "resolution",
     workItemId: workItem.id,
   });
@@ -84,6 +87,7 @@ async function harness(): Promise<Harness> {
     cleanup: async () => {
       await server.close();
       t.cleanup();
+      checkout.cleanup();
     },
   };
 }

@@ -23,6 +23,7 @@ import { createTempRepo } from "../helpers/git.ts";
 import { defaultNomarrMeta, readEffectLog, writeFakeGh } from "../helpers/fake-gh.ts";
 import { openTissueDb, closeDb, TissueDbError } from "../../src/db/open.ts";
 import { parseConfig } from "../../src/config/load.ts";
+import { ARTIFACT_SKIP } from "../helpers/artifacts.ts";
 
 const hostile = "$(id); `touch /tmp/pwned`; &&\u0000 control\nreview [ghp_ABCDEFGHIJKLMNOP]";
 
@@ -117,7 +118,7 @@ test("separate Tissue DB has restrictive state permissions and refuses OpenCode 
   assert.throws(() => openTissueDb(join(process.env.HOME ?? "/root", ".local/share/opencode", "blocked.db")), TissueDbError);
 });
 
-test("T8(b), T8(c), and T8(j) remain explicit unresolved decisions with truthful cleanup evidence", () => {
+test("T8(b), T8(c), and T8(j) remain explicit unresolved decisions with truthful cleanup evidence", { skip: ARTIFACT_SKIP }, () => {
   const artifact = readFileSync("artifacts/designs/process/tissue-t8-phase3-security.md", "utf8");
   for (const row of ["T8 (b)", "T8 (c)", "T8 (j)"]) {
     const start = artifact.indexOf(`## ${row}`);

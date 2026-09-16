@@ -16,6 +16,7 @@ import { OpenCodeDriver, type PromptEnvelope } from "../../src/integrations/open
 import type { OpenCodeHttp } from "../../src/integrations/opencode-http.ts";
 import { lookupCommand, type CliContext } from "../../src/cli.ts";
 import { OperationError } from "../../src/controller/ops.ts";
+import { ARTIFACT_SKIP } from "../helpers/artifacts.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 
@@ -101,7 +102,7 @@ test("agent instruction files are semantic-only and grant no lifecycle tools", (
   }
 });
 
-test("D' remains documented-only and is never co-built", () => {
+test("D' remains documented-only and is never co-built", { skip: ARTIFACT_SKIP }, () => {
   const design = readFileSync(join(ROOT, "artifacts/designs/pending/DD-tissue-design.md"), "utf8");
   assert.match(design, /D[′']/);
   assert.match(design, /documented[- ]only|retained alternative|never co-built/i);

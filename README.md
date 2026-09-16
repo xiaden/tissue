@@ -17,6 +17,10 @@ npm test
 
 Configuration is intentionally small YAML: repository owner/name/path, polling and capacity defaults, retention, and optional agent model settings. Secrets, policy DSL, credential-bearing URLs, and unsafe identifiers are rejected. See [onboarding and configuration](docs/onboarding-and-config.md).
 
+## Continuous integration
+
+The deterministic gate (`npm run typecheck`, `npm run lint`, `npm test`) runs in CI on pushes and pull requests to `main` (`.github/workflows/ci.yml`). `main` is protected: it requires a pull request and a passing `verify` check, and blocks force pushes and deletions. CodeQL code scanning runs on `main` and on a weekly schedule. See [infrastructure audit](docs/infrastructure-audit.md).
+
 ## CLI and supervision
 
 ```sh
