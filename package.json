@@ -16,10 +16,10 @@
   },
   "license": "UNLICENSED",
   "devDependencies": {
-    "@types/node": "^26.5.0",
+    "@types/node": "^26.5.1",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "yaml": "2.9.0"
+    "yaml": "2.9.1"
   }
 }
