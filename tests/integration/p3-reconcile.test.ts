@@ -5,6 +5,18 @@
 // pass with its five fault-injection boundaries. All external reality is
 // injected (scanner / removeWorktree / reconcile deps); no real remote, gh, or
 // OpenCode state is ever touched.
+//
+// TASK-tissue-G Phase 1 spec-first coverage (authoritative P2 session-loss
+// recovery per classification and the P6 resident-dependency gate):
+//   - a `resolution` census entry classified `missing`/`wedged` holds its
+//     RUNNING/WAITING WorkItem to FAILED_HOLD (event `wedge`, lease cleared,
+//     session row preserved) and `incomplete` retains the session mapping;
+//   - a `triage` entry classified `missing`/`wedged` releases the repository's
+//     `triage_session_id` without mutating the triage pump;
+//   - a failed P2 census (resident OpenCode unavailable) still runs the
+//     OpenCode-independent P3/P4/P5 phases while P6 prompt-dependent resume is
+//     gated (`detail.gated === true`, `reconcile.p6_gated`), leaving the pump
+//     state untouched.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -37,12 +49,15 @@ import {
   runReconcilePass,
   type ReconcileBoundary,
   type ReconcileDeps,
+  type SessionCensusEntry,
 } from "../../src/controller/reconcile.ts";
 import { enqueueIssue } from "../../src/controller/enqueue.ts";
 import { worktreeBranchFor, type CleanupResult, type WorktreeIdentity } from "../../src/controller/worktrees.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
 import { ScriptedTriageDriver } from "../helpers/session-driver.ts";
+import type { SessionDriver } from "../../src/controller/session-driver.ts";
+import { GhClient } from "../../src/integrations/gh-client.ts";
 
 function fakeScanner(observed: ObservedArtifacts): DriftScanner {
   return { scan: async () => observed };
@@ -384,6 +399,8 @@ function stubDeps(db: TissueDb, onFault: (b: ReconcileBoundary) => void): Reconc
     openDb: () => db,
     closeDb: () => {},
     verifyRepos: async () => [],
+    // Reconcile stub: the explicit resident probe is exercisable per test.
+    probeResident: async () => {},
     censusSessions: async () => [],
     reconcileArtifacts: async () => ({ expiredLeases: 0, effects: 0, cleaned: [], retained: [] }),
     scanDrift: async () => [],
@@ -391,6 +408,19 @@ function stubDeps(db: TissueDb, onFault: (b: ReconcileBoundary) => void): Reconc
     resumeNormalLoop: async () => ({ recovered: [], claimed: null }),
     injectFault: (boundary) => onFault(boundary),
   };
+}
+
+/**
+ * Census-providing reconcile deps for the authoritative P2 session-loss specs.
+ * Reuses every inert dependency from `stubDeps` and only substitutes the census,
+ * so no gh/OpenCode call is made outside the supplied classifications.
+ */
+function censusDeps(
+  db: TissueDb,
+  census: SessionCensusEntry[],
+  overrides: Partial<ReconcileDeps> = {},
+): ReconcileDeps {
+  return { ...stubDeps(db, () => {}), censusSessions: async () => census, ...overrides };
 }
 
 test("reconcile: runs the ordered idempotent P0-P6 sweep and hits all five fault boundaries", async () => {
@@ -410,7 +440,7 @@ test("reconcile: runs the ordered idempotent P0-P6 sweep and hits all five fault
       ["P0", "P1", "P2", "P3", "P4", "P5", "P6"],
     );
     assert.ok(report.phases.every((p) => p.ok));
-    assert.deepEqual(faults, ["cleanup", "drift_fail", "ingest", "reparent", "prompt_before_completion"]);
+    assert.deepEqual(faults, ["recovery", "cleanup", "drift_fail", "ingest", "reparent", "prompt_before_completion"]);
   } finally {
     cleanup();
   }
@@ -531,6 +561,532 @@ test("reconcile: session census keeps a fresh busy/retry session in its raw stat
     const byId = new Map(census.map((c) => [c.sessionId, c.classification]));
     assert.equal(byId.get("ses_busy"), "busy");
     assert.equal(byId.get("ses_retry"), "retry");
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TASK-tissue-G P1-S2..S6  authoritative P2 session-loss recovery + P6 gate
+// ---------------------------------------------------------------------------
+
+test("reconcile: a missing resolution session moves its RUNNING WorkItem to FAILED_HOLD (lease cleared, session preserved)", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const wi = "wi-xiaden-nomarr-missing";
+    insertWorkItem(db, { id: wi, repo_id: REPO_ID, state: "RUNNING", base_branch: "main" });
+    insertSession(db, {
+      id: "ses_missing_res",
+      kind: "resolution",
+      repo_id: REPO_ID,
+      work_item_id: wi,
+      directory: "/w",
+      state: "ACTIVE",
+    });
+    db.sql.run(
+      "UPDATE work_items SET lease_token = 'lease-x', lease_until = ? WHERE id = ?",
+      "2030-01-01T00:00:00.000Z",
+      wi,
+    );
+
+    const census: SessionCensusEntry[] = [
+      { sessionId: "ses_missing_res", kind: "resolution", repoId: REPO_ID, workItemId: wi, classification: "missing" },
+    ];
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+
+    assert.equal(report.phases.find((p) => p.phase === "P2")?.ok, true);
+    const held = getWorkItem(db, wi);
+    assert.equal(held?.state, "FAILED_HOLD");
+    assert.equal(held?.lease_token, null, "the hold clears the lease");
+    assert.equal(held?.lease_until, null);
+
+    const wedge = listTransitions(db, "work_item", wi).find((t) => t.to_state === "FAILED_HOLD");
+    assert.ok(wedge, "a durable work_item transition into FAILED_HOLD is written");
+    assert.equal(wedge?.from_state, "RUNNING");
+    assert.equal(wedge?.event, "wedge");
+    const reason = JSON.parse(wedge?.reason_json ?? "{}") as { reason?: string; session_id?: string };
+    assert.equal(reason.reason, "session_missing");
+    assert.equal(reason.session_id, "ses_missing_res");
+
+    // The durable session row is preserved exactly; no replacement session is invented.
+    assert.equal(db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM opencode_sessions")?.c, 1);
+    assert.equal(
+      db.sql.get<{ state: string }>("SELECT state FROM opencode_sessions WHERE id = 'ses_missing_res'")?.state,
+      "ACTIVE",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: a wedged resolution session holds its WAITING WorkItem with reason session_wedged", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const wi = "wi-xiaden-nomarr-wedged";
+    insertWorkItem(db, { id: wi, repo_id: REPO_ID, state: "WAITING", base_branch: "main" });
+    insertSession(db, {
+      id: "ses_wedged_res",
+      kind: "resolution",
+      repo_id: REPO_ID,
+      work_item_id: wi,
+      directory: "/w",
+      state: "ACTIVE",
+    });
+    // Age the session beyond W_WEDGE (240s) so the real census classifies it wedged.
+    db.sql.run("UPDATE opencode_sessions SET updated_at = ? WHERE id = 'ses_wedged_res'", "2020-01-01T00:00:00.000Z");
+
+    const census = await classifySessionCensus(db, async () => "retry", new Date());
+    assert.equal(census.find((c) => c.sessionId === "ses_wedged_res")?.classification, "wedged");
+
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+    assert.equal(report.phases.find((p) => p.phase === "P2")?.ok, true);
+    assert.equal(getWorkItem(db, wi)?.state, "FAILED_HOLD");
+    const wedge = listTransitions(db, "work_item", wi).find((t) => t.to_state === "FAILED_HOLD");
+    assert.equal(wedge?.from_state, "WAITING");
+    assert.equal(wedge?.event, "wedge");
+    assert.equal((JSON.parse(wedge?.reason_json ?? "{}") as { reason?: string }).reason, "session_wedged");
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: an incomplete resolution session retains its mapping and leaves the terminal WorkItem unchanged", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const wi = "wi-xiaden-nomarr-done";
+    insertWorkItem(db, { id: wi, repo_id: REPO_ID, state: "COMPLETED", base_branch: "main" });
+    insertSession(db, {
+      id: "ses_incomplete_res",
+      kind: "resolution",
+      repo_id: REPO_ID,
+      work_item_id: wi,
+      directory: "/d",
+      state: "ACTIVE",
+    });
+
+    const census = await classifySessionCensus(db, async () => "idle", new Date());
+    assert.equal(census.find((c) => c.sessionId === "ses_incomplete_res")?.classification, "incomplete");
+
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+    assert.equal(report.phases.find((p) => p.phase === "P2")?.ok, true);
+
+    // The terminal WorkItem is never relabelled.
+    assert.equal(getWorkItem(db, wi)?.state, "COMPLETED");
+    // The session mapping is retained as history (R20), never replaced.
+    assert.equal(
+      db.sql.get<{ state: string }>("SELECT state FROM opencode_sessions WHERE id = 'ses_incomplete_res'")?.state,
+      "RETAINED",
+    );
+    const retained = listTransitions(db, "session", "ses_incomplete_res");
+    assert.equal(retained.length, 1);
+    assert.equal(retained[0]?.from_state, "ACTIVE");
+    assert.equal(retained[0]?.to_state, "RETAINED");
+    assert.equal(retained[0]?.event, "session_retained");
+    assert.equal(
+      db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM opencode_sessions WHERE id = 'ses_incomplete_res'")?.c,
+      1,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: missing and wedged triage sessions release the repository mapping without touching the pump", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    seedRepository(db, { owner: "xiaden", name: "reb", id: "repo-reb" });
+    insertSession(db, { id: "ses_triage_missing", kind: "triage", repo_id: REPO_ID, directory: "/m", state: "ACTIVE" });
+    insertSession(db, { id: "ses_triage_wedged", kind: "triage", repo_id: "repo-reb", directory: "/w", state: "ACTIVE" });
+    db.sql.run("UPDATE opencode_sessions SET updated_at = ? WHERE id = 'ses_triage_wedged'", "2020-01-01T00:00:00.000Z");
+    updateTriageState(db, REPO_ID, { state: "PROMPTING", sessionId: "ses_triage_missing" });
+    updateTriageState(db, "repo-reb", { state: "PROMPTING", sessionId: "ses_triage_wedged" });
+
+    const census: SessionCensusEntry[] = [
+      { sessionId: "ses_triage_missing", kind: "triage", repoId: REPO_ID, workItemId: null, classification: "missing" },
+      { sessionId: "ses_triage_wedged", kind: "triage", repoId: "repo-reb", workItemId: null, classification: "wedged" },
+    ];
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+    assert.equal(report.phases.find((p) => p.phase === "P2")?.ok, true);
+
+    for (const repoId of [REPO_ID, "repo-reb"]) {
+      assert.equal(getRepositoryById(db, repoId)?.triage_session_id, null, `${repoId} mapping released`);
+      assert.equal(getRepositoryById(db, repoId)?.triage_state, "PROMPTING", `${repoId} pump state untouched`);
+      const transitions = listTransitions(db, "triage", repoId);
+      const released = transitions.find((t) => t.event === "triage_session_released");
+      assert.ok(released, `${repoId} records a triage_session_released evidence row`);
+      assert.equal(released?.from_state, "PROMPTING");
+      assert.equal(released?.to_state, "PROMPTING");
+      assert.ok(transitions.every((t) => t.event !== "triage_backoff"));
+    }
+    // Session rows are preserved, never deleted.
+    assert.equal(db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM opencode_sessions")?.c, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: resident OpenCode unavailability fails P2, still runs P3-P5, and gates P6 prompt-dependent resume", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    // Manual (config_managed = 0) enabled repo: config.repos = [] must not disable it.
+    seedRepository(db, { id: REPO_ID });
+    updateTriageState(db, REPO_ID, { state: "PROMPTING" });
+    // A durable session row exists so the census actually probes the resident dependency.
+    insertSession(db, {
+      id: "ses_triage_probe",
+      kind: "triage",
+      repo_id: REPO_ID,
+      directory: "/repo",
+      state: "ACTIVE",
+    });
+
+    let ensureCalls = 0;
+    let promptCalls = 0;
+    const driver: SessionDriver = {
+      ensureSession: async () => {
+        ensureCalls += 1;
+        return { sessionId: "ses_never_created", directory: "/repo" };
+      },
+      getSessionStatus: async () => {
+        throw new Error("resident OpenCode unavailable (transport failure)");
+      },
+      promptTriage: async () => {
+        promptCalls += 1;
+        return { issueId: "issue-never", disposition: "READY" };
+      },
+    };
+
+    const sink = new CapturingSink();
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(sink.writeable(), "info"),
+      db,
+      driver,
+      gh: new GhClient({ binary: "/usr/bin/gh" }),
+    });
+
+    assert.equal(report.phases.find((p) => p.phase === "P2")?.ok, false, "the census cannot be taken");
+    // Default deps + a throwing census driver: the report derives fail-closed health.
+    assert.equal(report.residentOpenCodeAvailable, false);
+    assert.equal(report.phases.find((p) => p.phase === "P3")?.ok, true, "safe non-OpenCode reconciliation still runs");
+    assert.equal(report.phases.find((p) => p.phase === "P4")?.ok, true);
+    assert.equal(report.phases.find((p) => p.phase === "P5")?.ok, true);
+
+    const p6 = report.phases.find((p) => p.phase === "P6");
+    assert.equal(p6?.ok, true, "a deliberate gate is not a phase failure");
+    const detail = p6?.detail as { recovered: string[]; claimed: string | null; gated?: boolean };
+    assert.equal(detail.gated, true);
+    assert.deepEqual(detail.recovered, []);
+    assert.equal(detail.claimed, null);
+
+    assert.equal(getRepositoryById(db, REPO_ID)?.triage_state, "PROMPTING");
+    assert.ok(listTransitions(db, "triage", REPO_ID).every((t) => t.event !== "triage_backoff"));
+    assert.equal(ensureCalls, 0, "no prompt-dependent session ensure while the dependency is unobservable");
+    assert.equal(promptCalls, 0, "no prompt-dependent triage while the dependency is unobservable");
+    assert.ok(
+      sink.records().some((r) => r.event === "reconcile.p6_gated" && r.lvl === "warn"),
+      "the gate is recorded as a warn",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TASK-tissue-G P3-S6  resident dependency-health seam crossing
+// ---------------------------------------------------------------------------
+
+test("reconcile: derives resident dependency health from the P2 census and passes it to P6 on both branches", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const healthSeen: Array<{ openCodeAvailable: boolean }> = [];
+
+    // P2 census throws (resident dependency unobservable) -> P6 receives false.
+    const failing = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: censusDeps(db, [], {
+        censusSessions: async () => {
+          throw new Error("resident OpenCode unavailable (transport failure)");
+        },
+        resumeNormalLoop: async (_db, health) => {
+          healthSeen.push(health);
+          return { recovered: [], claimed: null };
+        },
+      }),
+    });
+    assert.equal(failing.phases.find((p) => p.phase === "P2")?.ok, false);
+    assert.deepEqual(healthSeen, [{ openCodeAvailable: false }]);
+    // The report itself carries the fail-closed health across the daemon seam.
+    assert.equal(failing.residentOpenCodeAvailable, false, "unobservable dependency never reads as healthy");
+
+    // A resolved census — even one full of per-session missing/wedged entries —
+    // proves the service answered, so P6 receives true.
+    seedRepository(db, { id: REPO_ID });
+    const census: SessionCensusEntry[] = [
+      { sessionId: "ses_probe", kind: "triage", repoId: REPO_ID, workItemId: null, classification: "missing" },
+    ];
+    const resolved = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: censusDeps(db, census, {
+        resumeNormalLoop: async (_db, health) => {
+          healthSeen.push(health);
+          return { recovered: [], claimed: null };
+        },
+      }),
+    });
+    assert.equal(resolved.phases.find((p) => p.phase === "P2")?.ok, true);
+    assert.equal(
+      resolved.residentOpenCodeAvailable,
+      true,
+      "a resolved census with per-session missing still proves the service answered",
+    );
+    assert.deepEqual(healthSeen, [
+      { openCodeAvailable: false },
+      { openCodeAvailable: true },
+    ]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: a P0 failure leaves residentOpenCodeAvailable false and skips P1-P6 (fail closed)", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: {
+        ...stubDeps(db, () => {}),
+        openDb: () => {
+          throw new Error("db open failed");
+        },
+      },
+    });
+
+    assert.equal(report.phases.find((p) => p.phase === "P0")?.ok, false, "P0 records the open failure");
+    for (const phase of ["P1", "P2", "P3", "P4", "P5", "P6"] as const) {
+      assert.equal(
+        report.phases.find((p) => p.phase === phase)?.skipped,
+        true,
+        `${phase} is skipped when P0 never produced a database`,
+      );
+    }
+    assert.equal(report.residentOpenCodeAvailable, false, "P0 failure derives fail-closed health");
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TASK-tissue-G QA round 1  untested session-census recovery branches
+// ---------------------------------------------------------------------------
+
+test("reconcile: an already-FAILED_HOLD owner absorbs a lost resolution session without re-entering", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const wi = "wi-xiaden-nomarr-held";
+    insertWorkItem(db, { id: wi, repo_id: REPO_ID, state: "FAILED_HOLD", base_branch: "main" });
+    insertSession(db, {
+      id: "ses_held_res",
+      kind: "resolution",
+      repo_id: REPO_ID,
+      work_item_id: wi,
+      directory: "/h",
+      state: "ACTIVE",
+    });
+
+    const census: SessionCensusEntry[] = [
+      { sessionId: "ses_held_res", kind: "resolution", repoId: REPO_ID, workItemId: wi, classification: "missing" },
+    ];
+    const sink = new CapturingSink();
+    const first = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(sink.writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+    assert.equal(first.phases.find((p) => p.phase === "P2")?.ok, true);
+
+    // The held WorkItem stays held and is never re-entered via a wedge edge.
+    assert.equal(getWorkItem(db, wi)?.state, "FAILED_HOLD");
+    let transitions = listTransitions(db, "work_item", wi);
+    assert.equal(transitions.filter((t) => t.event === "wedge").length, 0, "no re-entry wedge");
+    assert.equal(transitions.filter((t) => t.to_state === "FAILED_HOLD").length, 1);
+    const absorbed = transitions.filter((t) => t.event === "session_loss_absorbed");
+    assert.equal(absorbed.length, 1);
+    assert.equal(absorbed[0]?.from_state, "FAILED_HOLD");
+    assert.equal(absorbed[0]?.to_state, "FAILED_HOLD");
+
+    // A second pass over the same census changes no entity state; the
+    // per-pass absorb evidence accumulates (documented evidence-only idempotency).
+    const second = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(sink.writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+    assert.equal(second.phases.find((p) => p.phase === "P2")?.ok, true);
+    assert.equal(getWorkItem(db, wi)?.state, "FAILED_HOLD");
+    transitions = listTransitions(db, "work_item", wi);
+    assert.equal(transitions.filter((t) => t.event === "wedge").length, 0);
+    assert.equal(transitions.filter((t) => t.event === "session_loss_absorbed").length, 2);
+
+    // Supplementary: the recovery warn names the absorb action and no human gate.
+    const warn = sink
+      .records()
+      .find((r) => r.event === "reconcile.session_recovered" && r.action === "work_item_failed_hold_absorbed");
+    assert.ok(warn);
+    assert.equal(warn?.human_inspect, false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: a lost resolution session for a non-holdable owner records evidence only and flags human inspect", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const wi = "wi-xiaden-nomarr-paused";
+    insertWorkItem(db, { id: wi, repo_id: REPO_ID, state: "PAUSED_WORK", base_branch: "main" });
+    insertSession(db, {
+      id: "ses_paused_res",
+      kind: "resolution",
+      repo_id: REPO_ID,
+      work_item_id: wi,
+      directory: "/p",
+      state: "ACTIVE",
+    });
+
+    const census: SessionCensusEntry[] = [
+      { sessionId: "ses_paused_res", kind: "resolution", repoId: REPO_ID, workItemId: wi, classification: "wedged" },
+    ];
+    const sink = new CapturingSink();
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(sink.writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+    assert.equal(report.phases.find((p) => p.phase === "P2")?.ok, true);
+
+    // No state change and no hold: the owner is not in a holdable state.
+    assert.equal(getWorkItem(db, wi)?.state, "PAUSED_WORK");
+    const transitions = listTransitions(db, "work_item", wi);
+    assert.equal(transitions.filter((t) => t.to_state === "FAILED_HOLD").length, 0);
+    assert.equal(transitions.filter((t) => t.event === "wedge").length, 0);
+    const observed = transitions.filter((t) => t.event === "session_loss_observed");
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0]?.from_state, "PAUSED_WORK");
+    assert.equal(observed[0]?.to_state, "PAUSED_WORK");
+
+    const warn = sink.records().find((r) => r.event === "reconcile.session_recovered");
+    assert.equal(warn?.action, "work_item_failed_hold_observed");
+    assert.equal(warn?.human_inspect, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: a lost resolution session with no owner is anchored on the session with no state change", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    insertSession(db, {
+      id: "ses_orphan_res",
+      kind: "resolution",
+      repo_id: REPO_ID,
+      directory: "/o",
+      state: "ACTIVE",
+    });
+
+    const census: SessionCensusEntry[] = [
+      { sessionId: "ses_orphan_res", kind: "resolution", repoId: REPO_ID, workItemId: null, classification: "missing" },
+    ];
+    const sink = new CapturingSink();
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(sink.writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+    assert.equal(report.phases.find((p) => p.phase === "P2")?.ok, true);
+
+    // No WorkItem is invented for an unsolved owner mapping.
+    assert.equal(db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM work_items")?.c, 0);
+    // The evidence row is anchored on the session, self-looping at its state.
+    const observed = listTransitions(db, "session", "ses_orphan_res").filter(
+      (t) => t.event === "session_loss_observed",
+    );
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0]?.from_state, "ACTIVE");
+    assert.equal(observed[0]?.to_state, "ACTIVE");
+
+    const warn = sink.records().find((r) => r.event === "reconcile.session_recovered");
+    assert.equal(warn?.action, "work_item_failed_hold_observed");
+    assert.equal(warn?.human_inspect, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("reconcile: a stale triage census entry never releases a newer live session mapping", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    // The repository's current live triage session.
+    updateTriageState(db, REPO_ID, { state: "PROMPTING", sessionId: "ses_triage_live" });
+    // A census entry for an older, different session id that is now gone.
+    const census: SessionCensusEntry[] = [
+      { sessionId: "ses_triage_stale", kind: "triage", repoId: REPO_ID, workItemId: null, classification: "missing" },
+    ];
+    const report = await runReconcilePass({
+      config: MINIMAL_CONFIG,
+      logger: new JsonLogger(new CapturingSink().writeable(), "info"),
+      db,
+      deps: censusDeps(db, census),
+    });
+    const p2 = report.phases.find((p) => p.phase === "P2");
+    assert.equal(p2?.ok, true);
+
+    // The live mapping survives; the stale entry is a no-op.
+    assert.equal(getRepositoryById(db, REPO_ID)?.triage_session_id, "ses_triage_live");
+    assert.equal(getRepositoryById(db, REPO_ID)?.triage_state, "PROMPTING");
+    assert.equal(
+      listTransitions(db, "triage", REPO_ID).filter((t) => t.event === "triage_session_released").length,
+      0,
+    );
+    const detail = p2?.detail as { recovery: Array<{ sessionId: string; action: string }> };
+    assert.equal(detail.recovery.find((r) => r.sessionId === "ses_triage_stale")?.action, "no_action");
   } finally {
     cleanup();
   }

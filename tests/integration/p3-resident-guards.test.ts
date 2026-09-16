@@ -180,3 +180,36 @@ test("statusOperation exposes a credential-free opencode endpoint when TISSUE_OP
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+
+test("ProductionAssembly.checkResidentHealth fails closed over the authenticated resident endpoint", async () => {
+  const server = await startPessimisticServer({ username: "tissue", password: "s3cret" });
+  const stateDir = mkdtempSync(join(tmpdir(), "tissue-resident-health-"));
+  const agentsDir = mkdtempSync(join(tmpdir(), "tissue-agents-"));
+  const installed = installAgentDefinitions({ targetDir: agentsDir });
+  assert.equal(installed.ok, true, installed.errors.join("; "));
+  const db = openTissueDb(join(stateDir, "tissue.db"));
+  const logs = new CapturingSink();
+  const logger = new JsonLogger(logs.writeable(), "info", "p3-resident");
+  try {
+    const assembly = await createProductionAssembly({
+      config: CONFIG, logger, db, stateDir, endpoint: server.baseUrl(), agentsDir,
+      credentials: { username: "tissue", password: "s3cret" },
+    });
+
+    // The endpoint answers: the probe is healthy.
+    assert.equal(await assembly.checkResidentHealth(), true);
+
+    // The endpoint stops answering: the probe fails closed without throwing.
+    await server.close();
+    assert.equal(await assembly.checkResidentHealth(), false);
+
+    // Credentials never reach the log stream.
+    const serialized = JSON.stringify(logs.records());
+    assert.equal(serialized.includes("s3cret"), false, "the probe must not log the resident password");
+  } finally {
+    closeDb(db);
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(agentsDir, { recursive: true, force: true });
+  }
+});

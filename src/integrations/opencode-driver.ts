@@ -267,15 +267,16 @@ export class OpenCodeDriver {
    * absent entry does NOT mean the session is gone: fall back to GET /session/
    * {id} to distinguish an existing-but-idle session from a genuinely missing
    * (deleted) one (OQ3/U-2 evidence).
+   *
+   * A 404 from the GLOBAL GET /session/status request is a dependency/route
+   * failure, never evidence about one session: it is rethrown so the caller treats
+   * it as resident unavailability. Only a confirmed 404 from the individual
+   * GET /session/{id} lookup below maps to `missing`.
    */
   async getSessionStatus(sessionId: string): Promise<SessionStatus> {
-    let statuses: Record<string, { type: string }>;
-    try {
-      statuses = await this.http.sessionStatus();
-    } catch (err) {
-      if (err instanceof OpenCodeHttpError && err.status === 404) return "missing";
-      throw err;
-    }
+    // Deliberately NOT caught: a failing service-level status read (including 404)
+    // is a transport/dependency failure, not a per-session classification.
+    const statuses: Record<string, { type: string }> = await this.http.sessionStatus();
     const raw = statuses[sessionId];
     if (raw) {
       if (raw.type === "busy") return "busy";
