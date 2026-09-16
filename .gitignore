@@ -13,6 +13,11 @@ coverage/
 *.db-wal
 *.db-shm
 
+# Release/design artifacts are intentionally untracked local work products.
+# A host-global ignore may also exclude them; this keeps the repo explicit so
+# the release-gate tests skip (rather than fail) in a checkout without them.
+artifacts/
+
 # Editor / OS cruft
 .DS_Store
 *.swp

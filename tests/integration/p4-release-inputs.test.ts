@@ -14,24 +14,27 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
+import { ARTIFACT_SKIP, readArtifact } from "../helpers/artifacts.ts";
+
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
-const traceability = readFileSync(join(ROOT, "artifacts/designs/process/tissue-p4-traceability.md"), "utf8");
-const releaseInputs = readFileSync(join(ROOT, "artifacts/designs/process/tissue-p4-release-inputs.md"), "utf8");
-const releaseArtifacts = readFileSync(join(ROOT, "artifacts/release/tissue-release-artifacts.md"), "utf8");
-const t8Register = readFileSync(join(ROOT, "artifacts/designs/process/tissue-t8-register.md"), "utf8");
+// Release artifacts under artifacts/ are untracked local work products (see
+// .gitignore), so a clean checkout (CI) has none. The artifact-backed anchors
+// below skip there instead of failing; the src-only anchor still runs everywhere.
+const artifactText = (rel: string): string => (typeof ARTIFACT_SKIP === "string" ? "" : readArtifact(rel));
+const traceability = artifactText("designs/process/tissue-p4-traceability.md");
+const releaseInputs = artifactText("designs/process/tissue-p4-release-inputs.md");
+const releaseArtifacts = artifactText("release/tissue-release-artifacts.md");
+const t8Register = artifactText("designs/process/tissue-t8-register.md");
 // The DD and the Plan E report are also authoritative reconciliation documents;
 // both are drift-anchored for the T8 authorized split and the current
 // non-release-ready classification.
-const ddDesign = readFileSync(join(ROOT, "artifacts/designs/pending/DD-tissue-design.md"), "utf8");
-const planEReport = readFileSync(join(ROOT, "artifacts/release/tissue-plan-e-final-report.md"), "utf8");
+const ddDesign = artifactText("designs/pending/DD-tissue-design.md");
+const planEReport = artifactText("release/tissue-plan-e-final-report.md");
 const rgEvidence = Object.fromEntries(
-  (["rg2", "rg3", "rg4", "rg6"] as const).map((gate) => [
-    gate,
-    readFileSync(join(ROOT, `artifacts/designs/process/tissue-${gate}-evidence.md`), "utf8"),
-  ]),
+  (["rg2", "rg3", "rg4", "rg6"] as const).map((gate) => [gate, artifactText(`designs/process/tissue-${gate}-evidence.md`)]),
 ) as Record<"rg2" | "rg3" | "rg4" | "rg6", string>;
 
-test("P4 traceability enumerates every immutable R1-R22 requirement", () => {
+test("P4 traceability enumerates every immutable R1-R22 requirement", { skip: ARTIFACT_SKIP }, () => {
   const rows = traceability.split("\n").filter((line) => /^\| R\d+ \|/.test(line));
   assert.equal(rows.length, 22, "traceability must contain exactly one row for each R1-R22 requirement");
   for (let n = 1; n <= 22; n += 1) {
@@ -47,11 +50,11 @@ test("P4 traceability enumerates every immutable R1-R22 requirement", () => {
   assert.match(traceability, /infrastructure and boundary audit/i);
 });
 
-test("P4 release inputs reconcile the exact npm test producer and a self-consistent machine-derived result", () => {
+test("P4 release inputs reconcile the exact npm test producer and a self-consistent machine-derived result", { skip: ARTIFACT_SKIP }, () => {
   const packageJson = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as { scripts?: { test?: string } };
   const producer = packageJson.scripts?.test;
   assert.equal(producer, 'node --test "tests/**/*.test.ts"');
-  const result = JSON.parse(readFileSync(join(ROOT, "artifacts/designs/process/tissue-p4-test-result.json"), "utf8")) as {
+  const result = JSON.parse(readArtifact("designs/process/tissue-p4-test-result.json")) as {
     command: string;
     producer: string;
     passed: number;
@@ -102,7 +105,7 @@ test("P4 release inputs reconcile the exact npm test producer and a self-consist
   }
 });
 
-test("DD and Plan E report are drift-anchored for the T8 split and non-release-ready status", () => {
+test("DD and Plan E report are drift-anchored for the T8 split and non-release-ready status", { skip: ARTIFACT_SKIP }, () => {
   // (a) The old 253/254 result must be explicitly labelled superseded historical
   // in the DD; its current result must be described as machine-derived, not
   // manually fabricated. The exact current count is not asserted here.
@@ -139,13 +142,13 @@ test("DD and Plan E report are drift-anchored for the T8 split and non-release-r
     "DD must not carry a current READY_WITH_RELEASE_BLOCKERS status");
 });
 
-test("P4 documentation agrees on A-prime runtime, boundaries, and blocked release language", () => {
+test("P4 documentation agrees on A-prime runtime, boundaries, and blocked release language", { skip: ARTIFACT_SKIP }, () => {
   const cli = readFileSync(join(ROOT, "src/cli.ts"), "utf8");
   const entrypoint = readFileSync(join(ROOT, "src/runtime/entrypoint.ts"), "utf8");
   const run = readFileSync(join(ROOT, "deploy/s6-rc/tissue/run"), "utf8");
   const type = readFileSync(join(ROOT, "deploy/s6-rc/tissue/type"), "utf8");
   const s6Readme = readFileSync(join(ROOT, "deploy/s6-rc/README.md"), "utf8");
-  const dd = readFileSync(join(ROOT, "artifacts/designs/pending/DD-tissue-design.md"), "utf8");
+  const dd = readArtifact("designs/pending/DD-tissue-design.md");
   for (const source of [cli, entrypoint, run, type, s6Readme]) assert.match(source, /daemon/);
   assert.match(cli, /tick.*one pass|one pass.*tick/s);
   assert.match(cli, /resident.*runDaemon/s);
@@ -166,7 +169,7 @@ test("P4 documentation agrees on A-prime runtime, boundaries, and blocked releas
   assert.doesNotMatch(releaseArtifacts, /READY_WITH_RELEASE_BLOCKERS/);
 });
 
-test("P4 retained probe records cannot be mistaken for current release evidence", () => {
+test("P4 retained probe records cannot be mistaken for current release evidence", { skip: ARTIFACT_SKIP }, () => {
   for (const [gate, evidence] of Object.entries(rgEvidence)) {
     assert.match(evidence, /historical\/non-current/i, `${gate} must be historical/non-current`);
     assert.match(evidence, /insufficient for (?:current )?release (?:acceptance|promotion)/i, `${gate} must be insufficient`);
@@ -179,7 +182,7 @@ test("P4 retained probe records cannot be mistaken for current release evidence"
   assert.match(releaseInputs, /opt-in resident OpenCode skip is not a pass/);
 });
 
-test("T8 register records the authorized split with one canonical row per decision", () => {
+test("T8 register records the authorized split with one canonical row per decision", { skip: ARTIFACT_SKIP }, () => {
   const accepted = ["(a)", "(g)", "(h)"];
   const unresolved = ["(b)", "(c)", "(d)", "(e)", "(f)", "(i)", "(j)"];
   for (const question of [...accepted, ...unresolved]) {

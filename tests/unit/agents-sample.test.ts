@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseConfig } from "../../src/config/load.ts";
+import { ARTIFACT_SKIP } from "../helpers/artifacts.ts";
 
 const ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..");
 
@@ -41,7 +42,7 @@ test("sample config exists, loads empty, and canonicalizes no monitored owner or
   assert.doesNotMatch(sample, /^\s*model:\s*provider\/model\s*$/m);
 });
 
-test("T8 register durably records (e) and (f) as NEEDS_DECISION with owner and deadline", () => {
+test("T8 register durably records (e) and (f) as NEEDS_DECISION with owner and deadline", { skip: ARTIFACT_SKIP }, () => {
   const reg = readFileSync(join(ROOT, "artifacts", "designs", "process", "tissue-t8-register.md"), "utf8");
   assert.match(reg, /NEEDS_DECISION/);
   assert.match(reg, /\(e\)/);

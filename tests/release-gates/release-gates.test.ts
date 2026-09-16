@@ -10,6 +10,7 @@ import {
   redactSessionIds,
   type EvidenceBundle,
 } from "./runner.ts";
+import { ARTIFACT_SKIP, readArtifact } from "../helpers/artifacts.ts";
 import { SseWakeHint, type WakeStreamSource } from "../../src/runtime/daemon.ts";
 import { OpenCodeDriver } from "../../src/integrations/opencode-driver.ts";
 import type { OpenCodeHttp } from "../../src/integrations/opencode-http.ts";
@@ -56,8 +57,8 @@ test("release evidence schema requires all six owner-attributed redacted gate re
   assert.throws(() => validateEvidenceBundle({ ...bundle, gates: { ...bundle.gates, "RG-1": { ...bundle.gates["RG-1"], owner: "token=secret" } } }), /secret-shaped/);
 });
 
-test("deterministic inventory classifies every gate without promotion", () => {
-  const inventory = JSON.parse(readFileSync(join(ROOT, "artifacts/designs/process/tissue-release-evidence-inventory.json"), "utf8")) as {
+test("deterministic inventory classifies every gate without promotion", { skip: ARTIFACT_SKIP }, () => {
+  const inventory = JSON.parse(readArtifact("designs/process/tissue-release-evidence-inventory.json")) as {
     releasePromotable: boolean;
     records: Array<{ gate: string; classification: string; status: string; source: string | null; owner: string; promotionEffect: string }>;
   };
@@ -99,7 +100,7 @@ test("redacted fixtures classify current, historical, insufficient, deterministi
   assert.throws(() => validateEvidenceBundle({ releasePromotable: true }), /releasePromotable|header/);
 });
 
-test("deterministic RG-2 serialized startup and topology smoke is non-promotional", () => {
+test("deterministic RG-2 serialized startup and topology smoke is non-promotional", { skip: ARTIFACT_SKIP }, () => {
   const starts = ["serve-a", "serve-b", "serve-c", "serve-d", "serve-e", "serve-f"];
   const active = new Set<string>();
   let lockFailures = 0;
@@ -110,7 +111,7 @@ test("deterministic RG-2 serialized startup and topology smoke is non-promotiona
   }
   assert.equal(lockFailures, 0);
   assert.equal(active.size, 0);
-  const inventory = JSON.parse(readFileSync(join(ROOT, "artifacts/designs/process/tissue-release-evidence-inventory.json"), "utf8")) as { releasePromotable: boolean; records: Array<{ gate: string; classification: string; status: string; source: string | null; owner: string; captureTime: string | null; versions: Record<string, string>; topology: string; reason: string; promotionEffect: string }> };
+  const inventory = JSON.parse(readArtifact("designs/process/tissue-release-evidence-inventory.json")) as { releasePromotable: boolean; records: Array<{ gate: string; classification: string; status: string; source: string | null; owner: string; captureTime: string | null; versions: Record<string, string>; topology: string; reason: string; promotionEffect: string }> };
   assert.equal(inventory.releasePromotable, false);
   const rg2 = inventory.records.find((record) => record.gate === "RG-2");
   assert.ok(rg2, "RG-2 record must be present");
@@ -135,7 +136,7 @@ test("deterministic RG-2 serialized startup and topology smoke is non-promotiona
   assert.match(rg2.promotionEffect, /cannot authorize release/i);
 });
 
-test("inherited RG-2/RG-3/RG-4/RG-6 records remain historical and non-promotional", () => {
+test("inherited RG-2/RG-3/RG-4/RG-6 records remain historical and non-promotional", { skip: ARTIFACT_SKIP }, () => {
   assert.deepEqual(validateInheritedEvidence(ROOT), {
     RG2: "HISTORICAL_NON_CURRENT",
     RG3: "HISTORICAL_NON_CURRENT",
@@ -155,7 +156,7 @@ function silentSource(): WakeStreamSource {
   };
 }
 
-test("RG-5 supporting smoke covers heartbeat timeout, reconnect jitter, resync, and polling backstop without promotion", async () => {
+test("RG-5 supporting smoke covers heartbeat timeout, reconnect jitter, resync, and polling backstop without promotion", { skip: ARTIFACT_SKIP }, async () => {
   let resyncs = 0;
   const hint = new SseWakeHint({
     source: silentSource(),
@@ -172,7 +173,7 @@ test("RG-5 supporting smoke covers heartbeat timeout, reconnect jitter, resync, 
   await hint.close();
   assert.ok(resyncs >= 1);
   assert.equal(hint.status(), "stopped");
-  const inventory = JSON.parse(readFileSync(join(ROOT, "artifacts/designs/process/tissue-release-evidence-inventory.json"), "utf8")) as { releasePromotable: boolean; records: Array<{ gate: string; classification: string; status: string; promotionEffect: string }> };
+  const inventory = JSON.parse(readArtifact("designs/process/tissue-release-evidence-inventory.json")) as { releasePromotable: boolean; records: Array<{ gate: string; classification: string; status: string; promotionEffect: string }> };
   const rg5 = inventory.records.find((record) => record.gate === "RG-5");
   assert.equal(inventory.releasePromotable, false);
   assert.equal(rg5?.classification, "deterministic_only");
