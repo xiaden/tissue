@@ -2,7 +2,17 @@
 #
 # Production topology: one supervised Tissue daemon connected to the already-running
 # resident OpenCode service via TISSUE_OPENCODE_URL. Tissue never starts or manages
-# an OpenCode serve. All disposable worktrees default under TISSUE_STATE_DIR.
+# an OpenCode serve. Disposable worktrees use the shared TISSUE_WORKTREE_ROOT
+# environment scalar when set, or fall back to TISSUE_STATE_DIR/worktrees.
+#
+# The managed-session registry is a separate storage domain holding one empty ses_*
+# ownership marker per Tissue-managed session, mounted Tissue RW / OpenCode RO. Configure
+# it with the TISSUE_SESSION_REGISTRY_DIR environment scalar: an absolute, host-persisted
+# path, default /tissue-session-registry. A relative value is rejected and a /run tmpfs
+# override is refused. There is intentionally no YAML key. TISSUE_SESSION_REGISTRY_MOUNTINFO
+# is a test/ops override for the mount-table path doctor/status read (default
+# /proc/self/mountinfo) — production must not set it; doctor/status reports
+# overridden: true when it is.
 #
 # Copy to tissue.yml and replace placeholders only after recording onboarding/model
 # choices in artifacts/designs/process/tissue-t8-register.md.
@@ -34,8 +44,10 @@ retentionDays: 90
 #     pushRemote: fork
 #     remote: https://github.com/coaxk/subarr.git
 #     localDir: /workspace/subarr
-#     # Worktrees always live under ${TISSUE_STATE_DIR}/worktrees/<owner>-<name>/<work-item-id>;
-#     # there is no configurable or absolute worktree-root override.
+#     # Worktrees use TISSUE_WORKTREE_ROOT when set (an absolute shared root), with
+#     # <owner>-<name>/<work-item-id> appended. If unset, the root falls back to
+#     # ${TISSUE_STATE_DIR}/worktrees. Configure this with the environment scalar;
+#     # there is intentionally no YAML key.
 #     enabled: true
 #     pollIntervalSeconds: 300
 #     maxConcurrentPerRepo: 1

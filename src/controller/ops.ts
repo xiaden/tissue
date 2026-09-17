@@ -25,6 +25,7 @@ import { enqueueIssue } from "./enqueue.ts";
 import { unpauseTriage } from "./triage.ts";
 import { cleanupWorktree, type WorktreeIdentity } from "./worktrees.ts";
 import { redactResidentEndpoint, resolveSourceAgentsDir, validateTissueAgentDefinitions } from "../runtime/resident.ts";
+import { assertRegistryMount, listMarkerSessionIds, resolveSessionRegistryDir } from "./session-registry.ts";
 import type { TissueConfig } from "../config/types.ts";
 import type { JsonLogger } from "../logging/jsonl.ts";
 
@@ -87,7 +88,64 @@ function opencodeStatus(): Record<string, unknown> {
   };
 }
 
-export function statusOperation(ctx: OpsContext): Record<string, unknown> {
+/**
+ * Test/ops seams for the read-only registry view. Production reads `process.env`
+ * and the real `/proc/self/mountinfo`; the mount-table override exists so the
+ * deterministic registry tests (and the CLI doctor test) can assert the mount
+ * state without a real container mount.
+ */
+export interface RegistryOpsOptions {
+  /** Registry environment view; defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  /** Mount-table path forwarded to `assertRegistryMount`; defaults to `/proc/self/mountinfo`. */
+  mountInfoPath?: string;
+}
+
+/** Env override for the mount-table path (container-free doctor/status tests). */
+const REGISTRY_MOUNTINFO_ENV = "TISSUE_SESSION_REGISTRY_MOUNTINFO";
+
+/**
+ * Read-only registry view for `doctor`/`status`: the mount-assertion state and
+ * the marker count. No marker contents and no secrets cross this boundary.
+ *
+ * `prunedAtStartup` is re-derived read-only: the marker ids that have no
+ * `opencode_sessions` row are exactly the set the startup prune removes. Doctor
+ * is a separate process and persists no startup state (no cache/sentinel), so it
+ * reports this deterministic prune set rather than an in-memory startup result.
+ */
+function registryView(db: TissueDb, opts?: RegistryOpsOptions): {
+  dir: string;
+  mountAsserted: boolean;
+  writable: boolean;
+  realMount: boolean;
+  overridden: boolean;
+  markerCount: number;
+  prunedAtStartup: string[];
+} {
+  const env = opts?.env ?? process.env;
+  const mountInfoPath = opts?.mountInfoPath ?? process.env[REGISTRY_MOUNTINFO_ENV];
+  const dir = resolveSessionRegistryDir(env);
+  const mount = assertRegistryMount(dir, mountInfoPath !== undefined ? { mountInfoPath } : {});
+  const markers = listMarkerSessionIds(dir);
+  const known = new Set(listSessions(db).map((session) => session.id));
+  return {
+    dir,
+    mountAsserted: mount.ok,
+    writable: mount.writable,
+    realMount: mount.realMount,
+    // Self-announcing override: true whenever a non-default mount table is in
+    // effect (an explicit opts.mountInfoPath or the env seam), false on the
+    // default production path. The mount assertion is ADR-005's compensating
+    // control for the plugin's deliberate fail-open, so an active override must
+    // be externally observable rather than able to silence the assertion
+    // invisibly.
+    overridden: mountInfoPath !== undefined,
+    markerCount: markers.length,
+    prunedAtStartup: markers.filter((id) => !known.has(id)),
+  };
+}
+
+export function statusOperation(ctx: OpsContext, opts?: RegistryOpsOptions): Record<string, unknown> {
   return withDb(ctx, (db) => {
     const summary = statusSummary(db);
     const wal = `${db.path}-wal`;
@@ -109,6 +167,7 @@ export function statusOperation(ctx: OpsContext): Record<string, unknown> {
       repositories: summary.repositories,
       repositoryReadiness: repositoryReadiness(db),
       opencode: opencodeStatus(),
+      registry: registryView(db, opts),
       gh: { binary: "/usr/bin/gh", authenticated: null, version: null, capability: "not_probed" },
     };
   });
@@ -210,28 +269,34 @@ export async function cleanupOperation(ctx: OpsContext, workItemId: string): Pro
   } finally { closeDb(db); }
 }
 
-export function doctorOperation(ctx: OpsContext): Record<string, unknown> {
+export function doctorOperation(ctx: OpsContext, opts?: RegistryOpsOptions): Record<string, unknown> {
   // Fail closed: validate the DEPLOYED definitions the resident service reads, and
   // compare them against the checked-in source so a stale deployment is reported.
   const agents = validateTissueAgentDefinitions({ sourceDir: resolveSourceAgentsDir() });
-  return withDb(ctx, (db) => ({
-    ok: agents.ok,
-    database: { path: db.path, wal: true },
-    repositories: ctx.config.repos.map((r) => {
-      const id = `${r.owner}/${r.name}`;
-      const row = getRepository(db, r.owner, r.name);
-      return {
-        id,
-        enabled: r.enabled,
-        capability: row?.capability_state ?? "unknown",
-        ready: row?.capability_state === "ready",
-        reasons: readinessReasons(row?.capability_json ?? null),
-      };
-    }),
-    stateDir: ctx.stateDir,
-    agents,
-    opencode: opencodeStatus(),
-  }));
+  return withDb(ctx, (db) => {
+    const registry = registryView(db, opts);
+    return {
+      // The registry mount assertion is the compensating control for the plugin's
+      // deliberate fail-open, so a failed assertion is a doctor failure (L11/L13).
+      ok: agents.ok && registry.mountAsserted,
+      database: { path: db.path, wal: true },
+      repositories: ctx.config.repos.map((r) => {
+        const id = `${r.owner}/${r.name}`;
+        const row = getRepository(db, r.owner, r.name);
+        return {
+          id,
+          enabled: r.enabled,
+          capability: row?.capability_state ?? "unknown",
+          ready: row?.capability_state === "ready",
+          reasons: readinessReasons(row?.capability_json ?? null),
+        };
+      }),
+      stateDir: ctx.stateDir,
+      agents,
+      registry,
+      opencode: opencodeStatus(),
+    };
+  });
 }
 
 export function smokeOperation(ctx: OpsContext): Record<string, unknown> { return { ok: true, checks: doctorOperation(ctx) }; }

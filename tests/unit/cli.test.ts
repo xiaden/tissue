@@ -6,7 +6,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -71,9 +71,32 @@ function deployedAgentsDir(): string {
   return agentsDir;
 }
 
+let registryRoot: string | undefined;
+let registryDirPath: string | undefined;
+/**
+ * Deterministic registry fixture for the CLI subprocess: a real directory that is
+ * writable, plus a mount-table snapshot that lists it, so `doctor`'s registry
+ * mount assertion (src/controller/ops.ts) passes without a container mount. The
+ * snapshot is injected via TISSUE_SESSION_REGISTRY_MOUNTINFO.
+ */
+function registryFixtureEnv(): Record<string, string> {
+  if (!registryRoot || !registryDirPath) {
+    registryRoot = mkdtempSync(join(tmpdir(), "tissue-cli-registry-"));
+    registryDirPath = join(registryRoot, "registry");
+    mkdirSync(registryDirPath, { recursive: true });
+    const mountInfo = join(registryRoot, "mountinfo");
+    writeFileSync(mountInfo, `40 20 0:100 / ${registryDirPath} rw,relatime - ext4 /dev/sda rw\n`, "utf8");
+  }
+  return {
+    TISSUE_SESSION_REGISTRY_DIR: registryDirPath,
+    TISSUE_SESSION_REGISTRY_MOUNTINFO: join(registryRoot, "mountinfo"),
+  };
+}
+
 after(() => {
   if (cfgDir) rmSync(cfgDir, { recursive: true, force: true });
   if (agentsDir) rmSync(agentsDir, { recursive: true, force: true });
+  if (registryRoot) rmSync(registryRoot, { recursive: true, force: true });
 });
 
 interface CliResult {
@@ -217,13 +240,18 @@ test("install-agents deploys the dedicated agents idempotently", async () => {
 });
 
 test("doctor runs environment self-checks", async () => {
-  const r = await runCli(["doctor"], { TISSUE_CONFIG: configPath(), TISSUE_OPENCODE_AGENTS_DIR: deployedAgentsDir() });
+  const r = await runCli(["doctor"], { TISSUE_CONFIG: configPath(), TISSUE_OPENCODE_AGENTS_DIR: deployedAgentsDir(), ...registryFixtureEnv() });
   assert.equal(r.code, 0, r.stdout);
-  const report = JSON.parse(r.stdout.split("\n").find((line) => line.startsWith("{")) ?? "{}") as { ok: boolean; database: { wal: boolean }; agents: { ok: boolean; agentsDir: string } };
+  const report = JSON.parse(r.stdout.split("\n").find((line) => line.startsWith("{")) ?? "{}") as { ok: boolean; database: { wal: boolean }; agents: { ok: boolean; agentsDir: string }; registry: { dir: string; mountAsserted: boolean; overridden: boolean; markerCount: number } };
   assert.equal(report.database.wal, true);
   assert.equal(report.ok, true);
   assert.equal(report.agents.ok, true);
   assert.equal(report.agents.agentsDir, deployedAgentsDir());
+  assert.equal(report.registry.mountAsserted, true, "a real mounted registry passes the assertion");
+  assert.equal(report.registry.dir, registryDirPath);
+  assert.equal(report.registry.markerCount, 0);
+  // The injected mount table is an active override and must self-announce.
+  assert.equal(report.registry.overridden, true, "an injected mount table is reported as overridden");
 });
 
 test("doctor fails closed when the deployed agents are missing", async () => {

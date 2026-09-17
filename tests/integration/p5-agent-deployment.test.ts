@@ -22,7 +22,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -132,6 +132,18 @@ test("C: startup and doctor fail closed on missing or drifted deployed definitio
   const logger = new JsonLogger(new CapturingSink().writeable());
   const config: TissueConfig = { pollIntervalSeconds: 60, maxConcurrentGlobal: 1, retentionDays: 30, agents: {}, repos: [] };
   const prior = process.env.TISSUE_OPENCODE_AGENTS_DIR;
+  // Deterministic registry mount fixture: `doctor` now also asserts the managed-
+  // session registry mount (plan I, P3-S2), so point it at a real directory listed
+  // in an injected mount table instead of the container-only default path.
+  const registryRoot = mkdtempSync(join(tmpdir(), "tissue-doctor-registry-"));
+  const registryDir = join(registryRoot, "registry");
+  mkdirSync(registryDir, { recursive: true });
+  const registryMountInfo = join(registryRoot, "mountinfo");
+  writeFileSync(registryMountInfo, `40 20 0:100 / ${registryDir} rw,relatime - ext4 /dev/sda rw\n`, "utf8");
+  const priorRegistryDir = process.env.TISSUE_SESSION_REGISTRY_DIR;
+  const priorRegistryMountInfo = process.env.TISSUE_SESSION_REGISTRY_MOUNTINFO;
+  process.env.TISSUE_SESSION_REGISTRY_DIR = registryDir;
+  process.env.TISSUE_SESSION_REGISTRY_MOUNTINFO = registryMountInfo;
   try {
     // Missing: a definition the resident would need is simply not deployed.
     const missing = validateTissueAgentDefinitions({ agentsDir: empty, sourceDir: resolveSourceAgentsDir() });
@@ -179,11 +191,16 @@ test("C: startup and doctor fail closed on missing or drifted deployed definitio
   } finally {
     if (prior === undefined) delete process.env.TISSUE_OPENCODE_AGENTS_DIR;
     else process.env.TISSUE_OPENCODE_AGENTS_DIR = prior;
+    if (priorRegistryDir === undefined) delete process.env.TISSUE_SESSION_REGISTRY_DIR;
+    else process.env.TISSUE_SESSION_REGISTRY_DIR = priorRegistryDir;
+    if (priorRegistryMountInfo === undefined) delete process.env.TISSUE_SESSION_REGISTRY_MOUNTINFO;
+    else process.env.TISSUE_SESSION_REGISTRY_MOUNTINFO = priorRegistryMountInfo;
     tissue.cleanup();
     await server.close();
     rmSync(empty, { recursive: true, force: true });
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(healthy, { recursive: true, force: true });
+    rmSync(registryRoot, { recursive: true, force: true });
   }
 });
 

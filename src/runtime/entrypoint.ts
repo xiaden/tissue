@@ -31,9 +31,15 @@ import {
   defaultNormalLoopIo,
   runDaemon,
   SseWakeHint,
+  type DaemonContext,
+  type DaemonRunReport,
   type NormalLoopIo,
 } from "./daemon.ts";
 import { runReconcilePass, type ReconcileReport } from "../controller/reconcile.ts";
+import {
+  runStartupRegistryReconciliation,
+  type RegistryStartupReport,
+} from "../controller/session-registry.ts";
 import {
   parseProviderModel,
   redactResidentEndpoint,
@@ -126,6 +132,25 @@ export interface ProductionAssemblyOptions {
   now?: () => Date;
 }
 
+/**
+ * Optional seams for `runProductionDaemon`/`runProductionDaemonEntrypoint`.
+ * Every field defaults to the production behaviour, so the zero-argument
+ * `runProductionDaemon()` entry path (`npm start`) is unchanged; the seams exist
+ * so the ordered startup pre-step can be tested without a real container mount.
+ */
+export interface ProductionDaemonSeams {
+  /** Registry environment view for the startup mount assertion; defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  /** Mount-table path for the startup mount assertion; defaults to `/proc/self/mountinfo`. */
+  mountInfoPath?: string;
+  /** Structured logger; defaults to the stdout JSONL `daemon` logger. */
+  logger?: JsonLogger;
+  /** Assembly constructor; defaults to `createProductionAssembly`. */
+  createAssembly?: (opts: ProductionAssemblyOptions) => Promise<ProductionAssembly>;
+  /** Resident daemon loop; defaults to `runDaemon`. */
+  runDaemonLoop?: (ctx: DaemonContext) => Promise<DaemonRunReport>;
+}
+
 /** Resolve configured agent/model settings, failing closed on a malformed model. */
 function resolveRoleModel(setting: { model?: string } | undefined): ProviderModel | undefined {
   return setting?.model !== undefined ? parseProviderModel(setting.model) : undefined;
@@ -192,14 +217,41 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-export async function runProductionDaemon(): Promise<void> {
+export async function runProductionDaemon(seams: ProductionDaemonSeams = {}): Promise<void> {
   const stateDir = process.env.TISSUE_STATE_DIR ?? ".tissue";
   const configPath = process.env.TISSUE_CONFIG ?? "./tissue.yml";
   const config = loadConfig(configPath);
-  const logger = new JsonLogger(stdout, "info").op("daemon");
+  const logger = seams.logger ?? new JsonLogger(stdout, "info").op("daemon");
+  const env = seams.env ?? process.env;
   const db = openTissueDb(join(stateDir, "tissue.db"), { retentionDays: config.retentionDays });
   try {
-    const assembly = await createProductionAssembly({
+    // Ordered startup pre-step (L13 / DD §8.3), run STRICTLY before the assembly
+    // and the daemon loop: assert the registry mount -> prune markers with no DB
+    // row -> continue. A mount-assertion failure is a loud structured event and a
+    // non-zero exit; createProductionAssembly/runDaemon are never reached.
+    let startup: RegistryStartupReport;
+    try {
+      startup = await runStartupRegistryReconciliation(
+        db,
+        env,
+        logger,
+        seams.mountInfoPath !== undefined ? { mountInfoPath: seams.mountInfoPath } : {},
+      );
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      logger.error("registry.mount_assertion_failed", { reason });
+      throw error;
+    }
+    logger.info("registry.startup", {
+      dir: startup.dir,
+      mountAsserted: startup.mountAsserted,
+      pruned: startup.pruned,
+      markerCount: startup.markerCount,
+      at: startup.at,
+    });
+
+    const createAssembly = seams.createAssembly ?? createProductionAssembly;
+    const assembly = await createAssembly({
       config,
       logger,
       db,
@@ -210,12 +262,13 @@ export async function runProductionDaemon(): Promise<void> {
         ...(process.env.OPENCODE_SERVER_PASSWORD !== undefined ? { password: process.env.OPENCODE_SERVER_PASSWORD } : {}),
       },
     });
+    const runDaemonLoop = seams.runDaemonLoop ?? runDaemon;
     const wakeHint = new SseWakeHint({
       source: { openStream: () => assembly.transport.eventStream() },
       logger,
       sleep: defaultSleep,
     });
-    await runDaemon({
+    await runDaemonLoop({
       config,
       logger,
       db,
@@ -227,13 +280,28 @@ export async function runProductionDaemon(): Promise<void> {
   } finally { closeDb(db); }
 }
 
+/**
+ * Production entrypoint wrapper: run the daemon and return the process exit
+ * code. A startup failure (for example the registry mount assertion) has already
+ * been logged loudly by `runProductionDaemon`; it is converted here into a
+ * non-zero code and never reaches the daemon loop.
+ */
+export async function runProductionDaemonEntrypoint(seams: ProductionDaemonSeams = {}): Promise<number> {
+  try {
+    await runProductionDaemon(seams);
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`tissue daemon failed: ${message}\n`);
+    return 1;
+  }
+}
+
 if (isMain()) {
   const mode = process.argv[2] ?? "daemon";
   if (mode === "daemon") {
-    runProductionDaemon().catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      process.stderr.write(`tissue daemon failed: ${message}\n`);
-      process.exitCode = 1;
+    runProductionDaemonEntrypoint().then((code) => {
+      if (code !== 0) process.exitCode = code;
     });
   } else {
     process.stdout.write(JSON.stringify(emptySafeStartup(process.env.TISSUE_STATE_DIR ?? ".tissue")) + "\n");
