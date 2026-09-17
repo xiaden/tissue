@@ -8,6 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { createTestDb, seedRepository, seedIssue, REPO_ID } from "../helpers/db.ts";
 import type { TissueDb } from "../../src/db/open.ts";
@@ -38,6 +39,7 @@ import {
   type ReconcileBoundary,
   type ReconcileDeps,
 } from "../../src/controller/reconcile.ts";
+import { ResidentEndpointError } from "../../src/runtime/resident.ts";
 import { enqueueIssue } from "../../src/controller/enqueue.ts";
 import { resolveWorktreeRoot } from "../../src/config/load.ts";
 import { worktreeBranchFor, type CleanupResult, type WorktreeIdentity } from "../../src/controller/worktrees.ts";
@@ -568,5 +570,55 @@ test("reconcile: session census keeps a fresh busy/retry session in its raw stat
     assert.equal(byId.get("ses_retry"), "retry");
   } finally {
     cleanup();
+  }
+});
+
+// ---- L10 single-construction-path boundary (plan TASK-tissue-K, phase 2) --------
+// `reconcile.ts` must never construct an OpenCode client itself: the sole bypass is a
+// caller-supplied driver, accepted only because it came from the production assembly,
+// where `createResidentTransport` already enforced validate → exact-origin allowlist →
+// resolve-and-pin BEFORE credentials attached.
+test("reconcile routes OpenCode client construction through the single guarded factory", () => {
+  const source = readFileSync(new URL("../../src/controller/reconcile.ts", import.meta.url), "utf8");
+  assert.equal(
+    /new\s+OpenCodeHttp\b/.test(source),
+    false,
+    "reconcile must never construct an OpenCodeHttp client directly",
+  );
+  assert.match(
+    source,
+    /createResidentTransport\(/,
+    "reconcile must build its fallback driver through createResidentTransport",
+  );
+  assert.match(
+    source,
+    /ctx\.driver\s*\?\?/,
+    "the sole bypass is a caller-supplied driver from the already-validated assembly",
+  );
+});
+
+// Missing-URL fail-closed pin (additive). With TISSUE_OPENCODE_URL unset, the fallback
+// deps builder (`defaultReconcileDeps`, reached when `ctx.deps` is omitted) must reject
+// before any OpenCode client is constructed. `runReconcilePass` awaits that builder
+// before any phase runs, so the rejection propagates and no phase is reported.
+test("reconcile fallback with TISSUE_OPENCODE_URL unset fails closed before constructing any client", async () => {
+  const previous = process.env.TISSUE_OPENCODE_URL;
+  delete process.env.TISSUE_OPENCODE_URL;
+  try {
+    const sink = new CapturingSink();
+    await assert.rejects(
+      runReconcilePass({ config: MINIMAL_CONFIG, logger: new JsonLogger(sink.writeable(), "info") }),
+      (err: unknown) => {
+        assert.ok(err instanceof ResidentEndpointError, `expected ResidentEndpointError, got ${String(err)}`);
+        assert.match(err.message, /required|never starts an OpenCode serve/);
+        return true;
+      },
+      "a missing TISSUE_OPENCODE_URL must fail closed before any OpenCode client is constructed",
+    );
+    const serialized = JSON.stringify(sink.records());
+    assert.equal(serialized.includes("createResidentTransport"), false, "no transport was built for the accepted path");
+  } finally {
+    if (previous === undefined) delete process.env.TISSUE_OPENCODE_URL;
+    else process.env.TISSUE_OPENCODE_URL = previous;
   }
 });

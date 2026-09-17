@@ -34,9 +34,8 @@ import {
   type SessionRow,
 } from "../db/repositories.ts";
 import { GhClient } from "../integrations/gh-client.ts";
-import { OpenCodeHttp } from "../integrations/opencode-http.ts";
 import { OpenCodeDriver } from "../integrations/opencode-driver.ts";
-import { parseProviderModel, validateResidentOpenCodeEndpoint } from "../runtime/resident.ts";
+import { createResidentTransport, parseProviderModel } from "../runtime/resident.ts";
 import type { JsonLogger } from "../logging/jsonl.ts";
 import type { TissueConfig } from "../config/types.ts";
 import { GhEffectTransport, executeVerifiedEffect } from "./effects.ts";
@@ -118,7 +117,7 @@ const ALL_PHASES: ReconcilePhaseId[] = ["P0", "P1", "P2", "P3", "P4", "P5", "P6"
  * transient gh/network failure cannot hide the housekeeping/drift work.
  */
 export async function runReconcilePass(ctx: ReconcileContext): Promise<ReconcileReport> {
-  const deps = ctx.deps ?? defaultReconcileDeps(ctx);
+  const deps = ctx.deps ?? (await defaultReconcileDeps(ctx));
   const phases: PhaseReport[] = [];
   const startedAt = new Date().toISOString();
   let db: TissueDb | null = null;
@@ -250,29 +249,28 @@ export async function recoverStalePrompting(
   }
   return recovered;
 }
-function defaultReconcileDeps(ctx: ReconcileContext): ReconcileDeps {
+async function defaultReconcileDeps(ctx: ReconcileContext): Promise<ReconcileDeps> {
   const stateDir = ctx.stateDir ?? process.env.TISSUE_STATE_DIR ?? ".tissue";
   const dbPath = join(stateDir, "tissue.db");
   const gh = ctx.gh ?? new GhClient();
-  const endpoint = process.env.TISSUE_OPENCODE_URL;
   const triage = ctx.config.agents.triage;
-  // A caller-supplied driver already validated the endpoint when credentials were attached.
-  const driver = ctx.driver ?? (() => {
-    if (!endpoint) throw new Error("TISSUE_OPENCODE_URL is required; resident OpenCode service is not configured");
-    const resumeEndpoint = validateResidentOpenCodeEndpoint(endpoint);
-    const http = new OpenCodeHttp({
-      baseUrl: resumeEndpoint.toString(),
+  // A caller-supplied driver is accepted ONLY because it came from the production
+  // assembly, where `createResidentTransport` already enforced validate → exact-origin
+  // allowlist → resolve-and-pin before credentials attached. Reconcile itself never
+  // constructs an OpenCode client, so it cannot bypass the L10 guard.
+  const driver = ctx.driver ?? (await (async () => {
+    const transport = await createResidentTransport(process.env, {
       ...(process.env.OPENCODE_SERVER_USERNAME !== undefined ? { username: process.env.OPENCODE_SERVER_USERNAME } : {}),
       ...(process.env.OPENCODE_SERVER_PASSWORD !== undefined ? { password: process.env.OPENCODE_SERVER_PASSWORD } : {}),
     });
     return new OpenCodeDriver({
-      http,
+      http: transport.http,
       ...(triage?.agent !== undefined ? { triageAgent: triage.agent } : {}),
       ...(triage?.model !== undefined ? { triageModel: parseProviderModel(triage.model) } : {}),
       registryDir: resolveSessionRegistryDir(process.env),
       logger: ctx.logger,
     });
-  })();
+  })());
   return {
     now: () => new Date(),
     openDb: () => ctx.db ?? openTissueDb(dbPath, { retentionDays: ctx.config.retentionDays }),

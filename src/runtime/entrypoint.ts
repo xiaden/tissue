@@ -3,13 +3,18 @@
 // A' supervised runtime entrypoint. The exported startup probe remains pure for
 // diagnostics; the production main path consumes `daemon` and stays resident.
 //
-// It is loopback/private-only by construction and contains NO D'-style
-// child-process or per-turn `opencode run` machinery and no `turn_in_flight`
-// ledger. D' is documented only and must not be co-built.
+// The resident endpoint guard is owned by the single transport factory, which
+// validates it as loopback/private — or, when `TISSUE_OPENCODE_ALLOWED_ORIGINS`
+// is set, as an exact-origin allowlist entry that resolve-and-pins entirely to
+// private addresses — BEFORE credentials attach. The runtime contains NO
+// D'-style child-process or per-turn `opencode run` machinery and no
+// `turn_in_flight` ledger. D' is documented only and must not be co-built.
 //
 // Production-closure wiring (P3-S1..S3):
-//   - TISSUE_OPENCODE_URL is validated as a loopback/private resident endpoint
-//     BEFORE OPENCODE_SERVER_USERNAME/PASSWORD are attached.
+//   - The resident endpoint is validated by the single factory as loopback/
+//     private, or as an exact-origin `TISSUE_OPENCODE_ALLOWED_ORIGINS` entry that
+//     resolve-and-pins entirely to private addresses, BEFORE
+//     OPENCODE_SERVER_USERNAME/PASSWORD are attached.
 //   - Configured triage/resolution agent+model are preserved as native
 //     {providerID, modelID} on session creation and every prompt; a concrete
 //     model is never silently selected.
@@ -41,10 +46,9 @@ import {
   type RegistryStartupReport,
 } from "../controller/session-registry.ts";
 import {
+  createResidentTransport,
   parseProviderModel,
-  redactResidentEndpoint,
   resolveSourceAgentsDir,
-  validateResidentOpenCodeEndpoint,
   validateTissueAgentDefinitions,
   type AgentDefinitionStatus,
 } from "./resident.ts";
@@ -120,7 +124,11 @@ export interface ProductionAssemblyOptions {
   logger: JsonLogger;
   db: TissueDb;
   stateDir: string;
-  /** Raw TISSUE_OPENCODE_URL; validated loopback/private before credentials attach. */
+  /**
+   * Raw TISSUE_OPENCODE_URL; validated as loopback/private — or, when
+   * `TISSUE_OPENCODE_ALLOWED_ORIGINS` is set, as an exact allowlist origin that
+   * resolve-and-pins entirely to private addresses — before credentials attach.
+   */
   endpoint: string;
   /** Resident basic-auth credentials (TISSUE_OPENCODE_URL validation precedes attach). */
   credentials?: ResidentCredentials;
@@ -169,8 +177,16 @@ function resolveRoleModel(setting: { model?: string } | undefined): ProviderMode
 
 /** Assemble exactly the runtime used by `tissue daemon`; only external transports are injectable. */
 export async function createProductionAssembly(opts: ProductionAssemblyOptions): Promise<ProductionAssembly> {
-  // Order matters: validate the resident endpoint BEFORE any credential exists.
-  const endpoint = validateResidentOpenCodeEndpoint(opts.endpoint);
+  // Order matters: the single factory validates the resident endpoint (loopback/
+  // private or an exact allowlist origin), applies the exact-origin allowlist, and
+  // pins it to a literal private address BEFORE any credential is attached.
+  // `TISSUE_OPENCODE_URL` is taken from the option (the daemon/CLI pass the
+  // environment value) and `TISSUE_OPENCODE_ALLOWED_ORIGINS` from the environment.
+  const credentials = opts.credentials ?? {};
+  const transport = await createResidentTransport(
+    { ...process.env, TISSUE_OPENCODE_URL: opts.endpoint },
+    credentials,
+  );
   const agentDefinitions = validateTissueAgentDefinitions({
     // Always compare against the checked-in source so a stale deployed definition
     // cannot silently survive a source update.
@@ -181,12 +197,7 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
     throw new Error(`invalid host-global Tissue agent definitions: ${agentDefinitions.errors.join("; ")}`);
   }
 
-  const credentials = opts.credentials ?? {};
-  const http = new OpenCodeHttp({
-    baseUrl: endpoint.toString(),
-    ...(credentials.username !== undefined ? { username: credentials.username } : {}),
-    ...(credentials.password !== undefined ? { password: credentials.password } : {}),
-  });
+  const http = transport.http;
   await http.sessionStatus();
   const gh = opts.gh ?? new GhClient();
 
@@ -208,7 +219,7 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
   return {
     driver,
     transport: http,
-    endpoint: redactResidentEndpoint(opts.endpoint),
+    endpoint: transport.endpointLabel,
     agentDefinitions,
     normalLoop: defaultNormalLoopIo(opts.config, opts.logger, {
       gh,
