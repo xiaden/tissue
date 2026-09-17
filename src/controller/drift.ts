@@ -38,6 +38,7 @@ import {
   setWorkItemState,
   type RepositoryRow,
 } from "../db/repositories.ts";
+import { resolveWorktreeRoot } from "../config/load.ts";
 import { argvPrList, type GhClient } from "../integrations/gh-client.ts";
 import { listLocalBranches, worktreeDirFor, worktreeList } from "../integrations/git-client.ts";
 import type { JsonLogger } from "../logging/jsonl.ts";
@@ -117,7 +118,12 @@ export async function scanAndAdoptDrift(
   // The canonical controller branch: the stored head branch, or the branch the
   // WorkItem id deterministically yields (pre-claim QUEUED rows may not have one).
   const canonicalBranch = workItem.head_branch ?? worktreeBranchFor(workItemId);
-  const root = resolve(process.env.TISSUE_STATE_DIR ?? ".tissue", "worktrees", `${repo.owner}-${repo.name}`);
+  // Expected worktree directory derives from the SAME resolved worktree root
+  // creation uses (`TISSUE_WORKTREE_ROOT`, falling back byte-identically to
+  // `<TISSUE_STATE_DIR ?? ".tissue">/worktrees`) plus the owner-repo segment.
+  // A stale state-rooted derivation would fail to attribute migrated worktrees
+  // and mis-report them as `ROGUE` -> FAILED_HOLD (DD §6.2).
+  const root = resolve(resolveWorktreeRoot(process.env), `${repo.owner}-${repo.name}`);
   const expectedWorktreeDir = worktreeDirFor(root, workItemId);
 
   const worktreeRows = listWorktreesByWorkItem(db, workItemId);
@@ -131,7 +137,8 @@ export async function scanAndAdoptDrift(
   const observed = await scanner.scan(repo);
 
   // Shape filter: only artifacts attributable to THIS WorkItem's controller
-  // identity are considered (exact branch or the deterministic worktree dir).
+  // identity are considered (exact branch or the deterministic worktree dir
+  // derived from the resolved worktree root above).
   const ownedBranches = observed.branches.filter((b) => b === canonicalBranch);
   const ownedWorktrees = observed.worktrees.filter(
     (w) => w.branch === canonicalBranch || w.path === expectedWorktreeDir,

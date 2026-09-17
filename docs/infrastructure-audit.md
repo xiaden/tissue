@@ -8,7 +8,7 @@ The release package contains one s6-rc `longrun` for the A′ supervised reconci
 
 - Production migrations are exactly one: `{ version: 1, name: "initial_schema" }` (`SCHEMA_VERSION = 1`). There is no `owned_serves` table and no owned-serve/legacy-serve lifecycle. There are no forward migrations, compatibility shims, legacy-column support, or upgrade paths.
 - Reconciliation is resident-only: one supervised Tissue daemon (`deploy/s6-rc/tissue`) connects to the pre-existing resident OpenCode endpoint via `TISSUE_OPENCODE_URL` and never starts, supervises, reaps, or restarts a serve.
-- Disposable worktrees live under `<TISSUE_STATE_DIR>/worktrees/<owner>-<name>/<work-item-id>`; there is no configurable or absolute worktree root.
+- Disposable worktrees use the absolute `TISSUE_WORKTREE_ROOT` environment override when set, with layout `<TISSUE_WORKTREE_ROOT>/<owner>-<name>/<work-item-id>`; when unset, the root falls back byte-identically to `<TISSUE_STATE_DIR>/worktrees` (or `.tissue/worktrees`).
 
 ## Prohibited infrastructure audit
 

@@ -39,6 +39,7 @@ import {
   type ReconcileDeps,
 } from "../../src/controller/reconcile.ts";
 import { enqueueIssue } from "../../src/controller/enqueue.ts";
+import { resolveWorktreeRoot } from "../../src/config/load.ts";
 import { worktreeBranchFor, type CleanupResult, type WorktreeIdentity } from "../../src/controller/worktrees.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
@@ -60,6 +61,40 @@ function cleanupResult(identity: WorktreeIdentity, mode: "merged" | "explicit-fa
     branchDeleted: true,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Plan H P3-S3 — injected caller observes the configured container root.
+// ---------------------------------------------------------------------------
+
+test("Plan H mocked terminal cleanup caller passes the configured worktree root", async () => {
+  const { db, cleanup } = createTestDb();
+  const priorRoot = process.env.TISSUE_WORKTREE_ROOT;
+  try {
+    const configuredRoot = "/tmp/tissue-plan-h-container-worktrees";
+    process.env.TISSUE_WORKTREE_ROOT = configuredRoot;
+    seedRepository(db, { id: REPO_ID });
+    const wi = "wi-xiaden-nomarr-mock-root";
+    const branch = worktreeBranchFor(wi);
+    const storedPath = `${configuredRoot}/xiaden-nomarr/${wi}`;
+    insertWorkItem(db, { id: wi, repo_id: REPO_ID, state: "COMPLETED", base_branch: "main", head_branch: branch });
+    insertWorktree(db, { id: "wt-mock-root", work_item_id: wi, path: storedPath, branch, state: "ACTIVE" });
+    let observed: WorktreeIdentity | undefined;
+    const result = await cleanupTerminalLeftovers(db, {
+      now: new Date(),
+      removeWorktree: async (identity, mode) => {
+        observed = identity;
+        return cleanupResult(identity, mode);
+      },
+    });
+    assert.equal(result.cleanedWorktrees.length, 1);
+    assert.equal(observed?.worktreeDir, storedPath);
+    assert.equal(observed?.worktreeDir.startsWith(resolveWorktreeRoot(process.env)), true);
+  } finally {
+    if (priorRoot === undefined) delete process.env.TISSUE_WORKTREE_ROOT;
+    else process.env.TISSUE_WORKTREE_ROOT = priorRoot;
+    cleanup();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // P3-S1  drift scan + whole-diff adoption
