@@ -5,8 +5,8 @@
 1. Confirm the s6 service state with `s6-svstat` and do not restart a resident service merely to probe it.
 2. Deploy the dedicated agents with `tissue install-agents` (idempotent; `--force` only to replace a divergent local edit). The resident service reads the OpenCode GLOBAL agent directory, not `<Tissue>/agents`.
 3. Run `tissue doctor`; it reports the local Tissue database path/WAL setting, state directory, the registry mount state (resolved `dir`, `mountAsserted`, `writable`, `realMount`, `overridden`, `markerCount`, `prunedAtStartup`), deployed agent-definition validation (including source drift), the credential-free resident-endpoint status, and each configured repository's persisted readiness (`configManaged`, `capability`, `ready`, `reasons`). It exits non-zero when the deployed definitions are missing, invalid, or drifted, or when the registry mount assertion fails. It does not itself perform the authenticated `gh`/checkout/base-branch/Issues/protection audit.
-3. Run `tissue reconcile` once. Review the P0–P6 report and ERROR JSONL before enabling polling; reconciliation is the path that performs repository/capability checks when configured.
-4. Use `tissue status` for capacity, leases, sessions, inbox, PR/protection state, FAILED_HOLD, last reconcile, housekeeping, and WAL observability.
+4. Run `tissue reconcile` once. Review the P0–P6 report and ERROR JSONL before enabling polling; reconciliation is the path that performs repository/capability checks when configured.
+5. Use `tissue status` for capacity, leases, sessions, inbox, PR/protection state, FAILED_HOLD, last reconcile, housekeeping, and WAL observability.
 
 The authenticated `gh`, checkout/remotes, base branch, Issues, and protection capability audit is performed by `tissue reconcile` (its P3 phase) and persisted as each repository's `capability_state`, which `doctor` and `status` surface. Dispatch is refused while a repository is not `ready`. Authentication failures are surfaced and retried only under the typed integration policy. They are not converted to healthy or silently bypassed.
 
