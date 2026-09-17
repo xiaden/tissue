@@ -45,6 +45,14 @@ export interface FakeGhScenario {
   headOwner?: string;
   /** Number assigned by `pr create`. */
   prCreateNumber?: number;
+  /**
+   * Deterministic `updatedAt` stamped on the PR created by `pr create`. When
+   * omitted the fake uses the real clock (byte-identical to prior behaviour);
+   * clock-injecting tests set this so the controller polls a PR timestamp that
+   * agrees with their injected clock instead of mixing real time into the
+   * poll watermark comparison.
+   */
+  prCreateUpdatedAt?: string;
   /** Internal: absolute path where the fake appends effect logs. */
   effectLogPath?: string;
 }
@@ -177,7 +185,7 @@ if (args[0] === 'pr' && args[1] === 'create') {
       number: number, state: 'OPEN', headRefName: headBranch, headRefOid: sc.headSha || '',
       headRepositoryOwner: { login: headOwner },
       headRepository: { nameWithOwner: headOwner + '/' + targetName },
-      updatedAt: new Date().toISOString(), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      updatedAt: sc.prCreateUpdatedAt || new Date().toISOString(), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       isDraft: false, url: 'https://example.invalid/pr/' + number
     };
     sc.prList = sc.prList || {};
