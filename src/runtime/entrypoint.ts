@@ -26,7 +26,7 @@ import { JsonLogger } from "../logging/jsonl.ts";
 import { openTissueDb, closeDb } from "../db/open.ts";
 import { GhClient } from "../integrations/gh-client.ts";
 import { OpenCodeHttp } from "../integrations/opencode-http.ts";
-import { OpenCodeDriver } from "../integrations/opencode-driver.ts";
+import { OpenCodeDriver, type ManagedGateVerdict } from "../integrations/opencode-driver.ts";
 import {
   defaultNormalLoopIo,
   runDaemon,
@@ -130,6 +130,17 @@ export interface ProductionAssemblyOptions {
   gh?: GhClient;
   /** Test-only clock injection; production uses wall-clock time. */
   now?: () => Date;
+  /**
+   * Managed-session registry dir (plan I). When omitted the driver resolves it
+   * from `TISSUE_SESSION_REGISTRY_DIR` / the host default.
+   */
+  registryDir?: string;
+  /**
+   * Managed-session gate predicate. Production assembly MUST always supply it
+   * (plan M wires the beacon-backed default); when omitted the loaded half of
+   * the gate is skipped and only the marker invariant applies (plan J seam).
+   */
+  managedGate?: () => ManagedGateVerdict;
 }
 
 /**
@@ -189,6 +200,9 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
     db: opts.db,
     triageAgent,
     ...(triageModel !== undefined ? { triageModel } : {}),
+    logger: opts.logger,
+    ...(opts.registryDir !== undefined ? { registryDir: opts.registryDir } : {}),
+    ...(opts.managedGate !== undefined ? { managedGate: opts.managedGate } : {}),
   });
 
   return {

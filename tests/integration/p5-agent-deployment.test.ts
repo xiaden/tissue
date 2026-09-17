@@ -211,6 +211,8 @@ test("D: enabled work always addresses the dedicated agents, even when config om
   const logger = new JsonLogger(new CapturingSink().writeable());
   const stateRoot = join(process.cwd(), ".tissue", `e2e-agents-${process.pid}-${Date.now()}`);
   const deployed = freshDeployedDir();
+  // Plan J: the real driver writes ses_* markers; supply a writable temp registry.
+  const registryDir = mkdtempSync(join(tmpdir(), "tissue-p5-registry-"));
   let clock = T0;
 
   const scenario: FakeGhScenario = {
@@ -270,6 +272,7 @@ test("D: enabled work always addresses the dedicated agents, even when config om
       stateDir: stateRoot,
       endpoint: server.baseUrl(),
       agentsDir: deployed,
+      registryDir,
       gh: new GhClient({ binary: fake.binary }),
       now: () => new Date(clock),
     });
@@ -305,6 +308,7 @@ test("D: enabled work always addresses the dedicated agents, even when config om
     else process.env.TISSUE_STATE_DIR = priorStateDir;
     rmSync(stateRoot, { recursive: true, force: true });
     rmSync(deployed, { recursive: true, force: true });
+    rmSync(registryDir, { recursive: true, force: true });
     await server.close();
     fake.cleanup();
     tissue.cleanup();

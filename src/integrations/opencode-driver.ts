@@ -56,6 +56,13 @@ import {
   OpenCodeHttp,
   OpenCodeHttpError,
 } from "./opencode-http.ts";
+import {
+  classifySessionMarker,
+  createSessionMarker,
+  ensureSessionMarkerBeforeResume,
+  resolveSessionRegistryDir,
+} from "../controller/session-registry.ts";
+import type { JsonLogger } from "../logging/jsonl.ts";
 
 // Re-exported so callers do not need the raw-client types.
 export type { RealSessionRef, SessionKind, SessionMetadata, SessionStatus };
@@ -110,6 +117,103 @@ export interface OpenCodeDriverOptions {
   db?: TissueDb;
   triageAgent?: string;
   triageModel?: { providerID: string; modelID: string };
+  /**
+   * Managed-session registry directory (plan I). Resolved from
+   * `resolveSessionRegistryDir(process.env)` when omitted, so production callers
+   * pass the same value the startup mount assertion checked.
+   */
+  registryDir?: string;
+  /**
+   * Optional managed-session gate predicate. PRODUCTION ASSEMBLY MUST ALWAYS
+   * SUPPLY IT (plan M wires the beacon-backed default) so the managed path is
+   * fail-closed. When omitted — tests and non-production assembly — only the
+   * loaded half of the gate is skipped; the marker-existence invariant still
+   * applies unconditionally. A predicate reporting `loaded: false` refuses
+   * creation and prompting of a managed session with a typed, logged error.
+   */
+  managedGate?: () => ManagedGateVerdict;
+  /** Structured logger for gate refusals; omitted means no refusal logging. */
+  logger?: JsonLogger;
+}
+
+/** Verdict of an injected managed-session gate predicate (fail-closed). */
+export interface ManagedGateVerdict {
+  loaded: boolean;
+  reason: string;
+}
+
+/**
+ * Typed refusal thrown when the managed-session gate is closed: the marker is
+ * absent on the creation path, or the moderation-plugin predicate reports not
+ * loaded. Carries a machine-readable `reason`; `name === "ManagedSessionGateError"`.
+ */
+export class ManagedSessionGateError extends Error {
+  readonly reason: string;
+  readonly action: string;
+  readonly sessionId?: string;
+  constructor(reason: string, action: string, sessionId?: string) {
+    super(`managed-session gate refused (${action}): ${reason}`);
+    this.name = "ManagedSessionGateError";
+    this.reason = reason;
+    this.action = action;
+    if (sessionId !== undefined) this.sessionId = sessionId;
+  }
+}
+
+/** What a gate call must assert about the marker before it may prompt. */
+type ManagedGateRequest =
+  | { marker: "creation"; registryDir: string; sessionId: string; action: string }
+  | { marker: "resume"; registryDir: string; sessionId: string; action: string }
+  | { marker: "none"; action: string };
+
+/**
+ * The single managed-session gate helper (plan J P2-S3), shared by
+ * `createRealSession`, `promptTriage`, `promptSession` and `promptAsync`. It
+ * enforces the single invariant — "Tissue MUST NOT prompt or resume an OpenCode
+ * session unless that session's marker currently exists" — and, when the
+ * optional predicate is wired, that the moderation plugin is loaded:
+ *
+ *   - `creation`: the marker must ALREADY classify MANAGED (never recreated).
+ *   - `resume`:   the marker is (re)created by the idempotent plan-I helper
+ *                 immediately before the prompt.
+ *   - `none`:     no session id exists yet (the OpenCode session is created
+ *                 after the gate); only the loaded predicate is consulted.
+ *
+ * A refusal throws exactly one `ManagedSessionGateError` and emits exactly one
+ * structured `managed_session.gate_refused` record. It never touches unrelated
+ * tools (`edit`/`bash`/`read`) and never makes OpenCode unavailable.
+ */
+function enforceManagedSessionGate(
+  request: ManagedGateRequest,
+  gate: (() => ManagedGateVerdict) | undefined,
+  logger: JsonLogger | undefined,
+): void {
+  const refuse = (reason: string, sessionId?: string): never => {
+    logger?.warn("managed_session.gate_refused", {
+      action: request.action,
+      reason,
+      ...(sessionId !== undefined ? { sessionId } : {}),
+    });
+    throw new ManagedSessionGateError(reason, request.action, sessionId);
+  };
+
+  if (request.marker === "creation") {
+    // Creation path: the marker must currently exist; never recreate it here.
+    if (classifySessionMarker(request.registryDir, request.sessionId) !== "MANAGED") {
+      refuse("marker-absent", request.sessionId);
+    }
+  } else if (request.marker === "resume") {
+    // Resume path: recreate the marker immediately before the prompt if needed.
+    // One statSync when present; one atomic create otherwise (no cache, no HTTP).
+    ensureSessionMarkerBeforeResume(request.registryDir, request.sessionId);
+  }
+
+  if (gate) {
+    const verdict = gate();
+    if (!verdict.loaded) {
+      refuse(verdict.reason, request.marker === "none" ? undefined : request.sessionId);
+    }
+  }
 }
 
 function isUserMessage(m: OcMessage): m is Extract<OcMessage, { role: "user" }> {
@@ -163,12 +267,26 @@ async function captureObservedMetadata(http: OpenCodeHttp, db: TissueDb | undefi
 /**
  * Real OpenCode session driver. All transport is via OpenCodeHttp (raw HTTP
  * fallback over fetch). Production behavior is real-session-only; no emulation.
+ *
+ * Registration ordering (plan J / L12): create the real session -> write the
+ * `ses_*` registry marker -> persist the durable Tissue mapping -> prompt. The
+ * managed prompt/resume funnels additionally enforce the single invariant that
+ * no session is prompted or resumed unless its marker currently exists, and —
+ * when a gate predicate is wired — that the moderation plugin is loaded. The
+ * production assembly MUST always wire the predicate (plan M); without it the
+ * loaded half of the gate is skipped, never the marker invariant.
  */
 export class OpenCodeDriver {
   private readonly http: OpenCodeHttp;
   private readonly db?: TissueDb;
   private readonly triageAgent: string;
   private readonly triageModel?: { providerID: string; modelID: string };
+  /** Managed-session registry dir (plan I); resolved from env when omitted. */
+  private readonly registryDir: string;
+  /** Fail-closed moderation-plugin predicate; production must supply one. */
+  private readonly managedGate?: () => ManagedGateVerdict;
+  /** Structured logger for gate refusals (optional). */
+  private readonly logger?: JsonLogger;
   /** Defensive guard: refuse overlapping synchronous prompt issues. */
   private syncPromptInFlight = false;
 
@@ -177,6 +295,9 @@ export class OpenCodeDriver {
     this.db = opts.db;
     this.triageAgent = opts.triageAgent ?? TISSUE_TRIAGE_AGENT;
     this.triageModel = opts.triageModel;
+    this.registryDir = opts.registryDir ?? resolveSessionRegistryDir(process.env);
+    this.managedGate = opts.managedGate;
+    this.logger = opts.logger;
   }
 
   /**
@@ -185,6 +306,9 @@ export class OpenCodeDriver {
    * persist the mapping ONLY in the Tissue `opencode_sessions` table.
    */
   async createRealSession(kind: SessionKind, directory: string, metadata: SessionMetadata): Promise<RealSessionRef> {
+    // The gate is consulted BEFORE the OpenCode session exists: a closed managed
+    // gate must refuse creation without producing a server-side session.
+    enforceManagedSessionGate({ marker: "none", action: "create" }, this.managedGate, this.logger);
     const created = await this.http.createSession(directory, { title: undefined });
     const id = created.id;
     if (!/^ses_[A-Za-z0-9]+$/.test(id)) {
@@ -192,6 +316,18 @@ export class OpenCodeDriver {
       throw new OpenCodeHttpError(
         `createRealSession: server returned non-ses_ identity '${id}' (refusing real-session guarantee)`,
         0,
+      );
+    }
+    // Order (L12): marker BEFORE the durable mapping. A marker-write failure is
+    // FATAL and joins the non-ses_ fail-closed set: no RealSessionRef is ever
+    // handed to a caller that prompts, and no durable row is persisted.
+    try {
+      createSessionMarker(this.registryDir, id);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      throw new Error(
+        `createRealSession: managed-session marker write failed for '${id}' ` +
+          `(no real-session guarantee is issued without a marker): ${detail}`,
       );
     }
     const ref: RealSessionRef = { sessionId: id, directory };
@@ -217,6 +353,12 @@ export class OpenCodeDriver {
 
   /** Prompt the triage role and parse exactly one bounded typed envelope. */
   async promptTriage(sessionId: string, digest: IssueTriageDigest): Promise<TriageSuggestion> {
+    // Creation path: the marker must ALREADY exist; never recreate it here.
+    enforceManagedSessionGate(
+      { marker: "creation", registryDir: this.registryDir, sessionId, action: "prompt_triage" },
+      this.managedGate,
+      this.logger,
+    );
     const result = await this.promptSession(sessionId, {
       agent: this.triageAgent,
       ...(this.triageModel ? { model: this.triageModel } : {}),
@@ -298,6 +440,12 @@ export class OpenCodeDriver {
    * HTTP acceptance is NOT completion — the returned turn is the assistant turn.
    */
   async promptSession(sessionId: string, prompt: PromptEnvelope): Promise<PromptObservation> {
+    // Resume path: recreate a missing marker immediately before the prompt.
+    enforceManagedSessionGate(
+      { marker: "resume", registryDir: this.registryDir, sessionId, action: "prompt" },
+      this.managedGate,
+      this.logger,
+    );
     if (this.syncPromptInFlight) {
       throw new SessionDriverError("concurrent prompt refused: a sync prompt is already in flight");
     }
@@ -328,6 +476,12 @@ export class OpenCodeDriver {
    * observed-idle then drive completion via observeCompletion.
    */
   async promptAsync(sessionId: string, prompt: PromptEnvelope): Promise<AcceptedObservation> {
+    // Resume path: recreate a missing marker immediately before the prompt.
+    enforceManagedSessionGate(
+      { marker: "resume", registryDir: this.registryDir, sessionId, action: "prompt_async" },
+      this.managedGate,
+      this.logger,
+    );
     if (this.syncPromptInFlight) {
       throw new SessionDriverError("concurrent prompt refused: a sync prompt is already in flight");
     }

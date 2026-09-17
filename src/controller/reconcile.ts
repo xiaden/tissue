@@ -47,6 +47,7 @@ import { runTriageRepo, type TriageRunSummary } from "./triage.ts";
 import type { SessionDriver, SessionStatus } from "./session-driver.ts";
 import { cleanupWorktree, verifyRepository, type RepoCapability, type WorktreeIdentity } from "./worktrees.ts";
 import { persistRepositoryCapability, synchronizeConfiguredRepositories } from "../db/repositories.ts";
+import { resolveSessionRegistryDir } from "./session-registry.ts";
 
 
 export interface ReconcileContext {
@@ -268,6 +269,8 @@ function defaultReconcileDeps(ctx: ReconcileContext): ReconcileDeps {
       http,
       ...(triage?.agent !== undefined ? { triageAgent: triage.agent } : {}),
       ...(triage?.model !== undefined ? { triageModel: parseProviderModel(triage.model) } : {}),
+      registryDir: resolveSessionRegistryDir(process.env),
+      logger: ctx.logger,
     });
   })();
   return {

@@ -14,7 +14,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { RepositoryConfig, TissueConfig } from "../../src/config/types.ts";
@@ -134,6 +134,8 @@ test("production assembly starts from config + empty DB and completes the lifecy
     assert.ok(server.authRejections >= 1, "resident transport enforces basic auth");
 
     // ---- production assembly (validates endpoint before attaching credentials)
+    const registryDir = join(stateRoot, "registry");
+    mkdirSync(registryDir, { recursive: true });
     const assembly = await createProductionAssembly({
       config,
       logger,
@@ -142,6 +144,7 @@ test("production assembly starts from config + empty DB and completes the lifecy
       endpoint: server.baseUrl(),
       credentials: { username: "tissue", password: "s3cret" },
       agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
+      registryDir,
       gh: new GhClient({ binary: fake.binary }),
       now: () => new Date(clock),
     });

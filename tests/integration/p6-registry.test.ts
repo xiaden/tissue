@@ -50,13 +50,30 @@ import { tmpdir } from "node:os";
 
 import { createTestDb, seedRepository, REPO_ID } from "../helpers/db.ts";
 import { closeDb, openTissueDb, type TissueDb } from "../../src/db/open.ts";
-import { insertSession } from "../../src/db/repositories.ts";
+import { insertSession, listSessions } from "../../src/db/repositories.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
 import { doctorOperation, statusOperation } from "../../src/controller/ops.ts";
 import { installAgentDefinitions } from "../../src/runtime/resident.ts";
-import { runProductionDaemonEntrypoint, type ProductionAssembly } from "../../src/runtime/entrypoint.ts";
+import {
+  createProductionAssembly,
+  runProductionDaemonEntrypoint,
+  type ProductionAssembly,
+  type ProductionAssemblyOptions,
+} from "../../src/runtime/entrypoint.ts";
 import type { DaemonRunReport } from "../../src/runtime/daemon.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
+import {
+  OpenCodeDriver,
+  type OpenCodeDriverOptions,
+  type SessionKind,
+  type SessionMetadata,
+} from "../../src/integrations/opencode-driver.ts";
+import { OpenCodeHttp } from "../../src/integrations/opencode-http.ts";
+import type { IssueTriageDigest } from "../../src/controller/session-driver.ts";
+import {
+  startPessimisticServer,
+  type PessimisticOpenCodeServer,
+} from "../helpers/pessimistic-opencode-server.ts";
 import {
   assertRegistryMount,
   classifySessionMarker,
@@ -1032,5 +1049,824 @@ test("R2 assertRegistryMount decodes an octal-escaped mount point so a registry 
     assert.equal(unlisted.ok, false);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// Plan J — registration ordering + managed-session gate (Phase 1, spec-first).
+//
+// These specs define the Phase 2 production behaviour and are EXPECTED to fail
+// until it lands: `createRealSession` must write the ses_ marker in the managed
+// registry (session -> marker -> durable insert -> first prompt), a marker-write
+// failure is fatal, and the managed prompt/resume funnels require BOTH a current
+// marker and a loaded `managedGate`. Two-state semantics are binding: a marker
+// means MANAGED; absent/unreadable means UNMANAGED; there is no readiness,
+// UNKNOWN, `.ready`, cache, or marker-content state.
+// ---------------------------------------------------------------------------
+
+type ManagedGate = () => { loaded: boolean; reason: string };
+
+/**
+ * Construct the real driver with the plan-J option seam. `registryDir`,
+ * `managedGate`, and `logger` are not part of `OpenCodeDriverOptions` until
+ * Phase 2, so the literal is passed through structurally: at runtime the extra
+ * properties reach the constructor (which currently ignores them — the failing
+ * specs below); after Phase 2 the driver consumes them.
+ */
+function makeDriver(opts: {
+  http: OpenCodeHttp;
+  db?: TissueDb;
+  registryDir?: string;
+  managedGate?: ManagedGate;
+  logger?: JsonLogger;
+}): OpenCodeDriver {
+  return new OpenCodeDriver(opts as unknown as OpenCodeDriverOptions);
+}
+
+/** Wrap the transport so the exact HTTP call order is observable. */
+function recordingHttp(real: OpenCodeHttp, events: string[], onPrompt?: () => void): OpenCodeHttp {
+  return new Proxy(real, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof prop === "string" && typeof value === "function") {
+        return (...args: unknown[]) => {
+          events.push(prop);
+          if ((prop === "sendMessage" || prop === "sendPromptAsync") && onPrompt !== undefined) onPrompt();
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return value;
+    },
+  });
+}
+
+/** Wrap the durable store so the moment insertSession runs is observable. */
+function dbWithInsertProbe(db: TissueDb, probe: () => void): TissueDb {
+  const sql = new Proxy(db.sql, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (prop === "run" && typeof value === "function") {
+        return (statement: string, ...params: unknown[]) => {
+          if (statement.includes("INSERT INTO opencode_sessions")) probe();
+          return (value as (...a: unknown[]) => unknown).apply(target, [statement, ...params]);
+        };
+      }
+      return value;
+    },
+  });
+  return { path: db.path, retentionDays: db.retentionDays, sql, raw: db.raw };
+}
+
+/** The newest live server-side session — the one createRealSession just made. */
+function newestServerSessionId(server: PessimisticOpenCodeServer): string | undefined {
+  return server.liveSessions().at(-1)?.id;
+}
+
+/** Minimal bounded triage digest for creation-path prompt specs. */
+function triageDigest(issueId: string): IssueTriageDigest {
+  return {
+    issueId,
+    repoOwner: "xiaden",
+    repoName: "nomarr",
+    repoId: REPO_ID,
+    issueNumber: 1,
+    titlePreview: "triage ordering",
+    bodyPreview: "bounded body",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    pendingCount: 1,
+    repoCounts: { open: 1, queued: 0, running: 0 },
+  };
+}
+
+/** True when `err` is the typed managed-session gate refusal. */
+function isGateError(err: unknown): boolean {
+  return err instanceof Error && err.name === "ManagedSessionGateError";
+}
+
+// ---------------------------------------------------------------------------
+// P1-S1 — triage ordering: create session -> marker -> durable insert -> prompt.
+// ---------------------------------------------------------------------------
+
+test("J/P1-S1 ordering (triage): session created, then marker, then durable insert, and the marker precedes any prompt", async () => {
+  const registryDir = makeTemp("j-order-triage");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  let markerAtInsert: string | undefined;
+  let markerAtPrompt: string | undefined;
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const real = new OpenCodeHttp({ baseUrl: server.baseUrl() });
+    const http = recordingHttp(real, events, () => {
+      const id = newestServerSessionId(server);
+      markerAtPrompt = id === undefined ? undefined : classifySessionMarker(registryDir, id);
+    });
+    const spyDb = dbWithInsertProbe(db, () => {
+      const id = newestServerSessionId(server);
+      markerAtInsert = id === undefined ? undefined : classifySessionMarker(registryDir, id);
+    });
+    const driver = makeDriver({ http, db: spyDb, registryDir });
+
+    const funnelKinds: SessionKind[] = [];
+    const originalCreate = driver.createRealSession.bind(driver);
+    driver.createRealSession = async (kind, directory, metadata) => {
+      funnelKinds.push(kind);
+      return originalCreate(kind, directory, metadata);
+    };
+
+    const ref = await driver.ensureSession({ repoId: REPO_ID, directory: "/work/triage-order", kind: "triage" });
+
+    assert.deepEqual(funnelKinds, ["triage"], "ensureSession must funnel through the one createRealSession path");
+    assert.equal(classifySessionMarker(registryDir, ref.sessionId), "MANAGED", "the ses_ marker must exist after creation");
+    assert.equal(markerAtInsert, "MANAGED", "the marker must already exist when insertSession persists the mapping");
+    assert.equal(events.includes("createSession"), true, "the real OpenCode session is created first");
+    assert.equal(events.includes("sendMessage"), false, "no prompt is sent during creation");
+    assert.equal(events.includes("sendPromptAsync"), false, "no async prompt is sent during creation");
+    assert.ok(listSessions(db).some((s) => s.id === ref.sessionId), "the durable mapping is persisted");
+
+    await driver.promptSession(ref.sessionId, { text: "begin triage" });
+    assert.equal(markerAtPrompt, "MANAGED", "the marker must exist when the first prompt is issued");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P1-S2 — resolution ordering + one funnel, no directory-shape special-casing.
+// ---------------------------------------------------------------------------
+
+test("J/P1-S2 ordering (resolution): one funnel for both roles regardless of directory shape", async () => {
+  const registryDir = makeTemp("j-order-resolution");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  let markerAtInsert: string | undefined;
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const http = recordingHttp(new OpenCodeHttp({ baseUrl: server.baseUrl() }), events);
+    const spyDb = dbWithInsertProbe(db, () => {
+      const id = newestServerSessionId(server);
+      markerAtInsert = id === undefined ? undefined : classifySessionMarker(registryDir, id);
+    });
+    const driver = makeDriver({ http, db: spyDb, registryDir });
+
+    const funnelKinds: SessionKind[] = [];
+    const originalCreate = driver.createRealSession.bind(driver);
+    driver.createRealSession = async (kind, directory, metadata) => {
+      funnelKinds.push(kind);
+      return originalCreate(kind, directory, metadata);
+    };
+
+    // Deliberately different directory shapes: a repo-root path for triage and a
+    // deep worktree path for resolution. The funnel must not branch on shape.
+    const triage = await driver.ensureSession({ repoId: REPO_ID, directory: "/work/repo-root", kind: "triage" });
+    assert.equal(markerAtInsert, "MANAGED", "triage: marker before durable insert");
+    assert.equal(classifySessionMarker(registryDir, triage.sessionId), "MANAGED", "triage marker exists after creation");
+
+    const resolution = await driver.createRealSession("resolution", "/work/wt/feature/deep/nested", {
+      repoId: REPO_ID,
+      directory: "/work/wt/feature/deep/nested",
+      kind: "resolution",
+    });
+    assert.equal(markerAtInsert, "MANAGED", "resolution: marker before durable insert");
+    assert.equal(classifySessionMarker(registryDir, resolution.sessionId), "MANAGED", "resolution marker exists after creation");
+
+    assert.deepEqual(funnelKinds, ["triage", "resolution"], "both roles use the same createRealSession funnel");
+    assert.equal(events.filter((e) => e === "createSession").length, 2, "each creation makes exactly one real session");
+    assert.ok(listSessions(db).some((s) => s.id === resolution.sessionId), "the resolution mapping is persisted");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P1-S3 — a marker-write failure is fatal for creation.
+// ---------------------------------------------------------------------------
+
+test("J/P1-S3 a marker-write failure aborts createRealSession fatally: no ref, no prompt, no durable row", async () => {
+  const parent = makeTemp("j-marker-fail");
+  const absentRegistry = join(parent, "missing-registry");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const http = recordingHttp(new OpenCodeHttp({ baseUrl: server.baseUrl() }), events);
+    const driver = makeDriver({ http, db, registryDir: absentRegistry });
+
+    let thrown: unknown;
+    try {
+      await driver.createRealSession("triage", "/work/marker-fail", {
+        repoId: REPO_ID,
+        directory: "/work/marker-fail",
+        kind: "triage",
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    assert.ok(thrown instanceof Error, "a marker-write failure must abort createRealSession (no RealSessionRef)");
+    assert.match((thrown as Error).message, /marker/i, "the failure must be distinguishable as a marker-write failure");
+    assert.equal(events.includes("sendMessage"), false, "no prompt may be attempted after a marker-write failure");
+    assert.equal(events.includes("sendPromptAsync"), false, "no async prompt may be attempted after a marker-write failure");
+    assert.equal(listSessions(db).length, 0, "no durable mapping may be persisted when the marker write fails");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P1-S4 — resume: marker-less sessions cannot be prompted; the resume path
+// recreates the marker immediately before the prompt.
+// ---------------------------------------------------------------------------
+
+test("J/P1-S4 resume: a marker-less stored session cannot be prompted; the resume path recreates the marker immediately before the prompt", async () => {
+  const registryDir = makeTemp("j-resume");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  let markerAtPrompt: string | undefined;
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const real = new OpenCodeHttp({ baseUrl: server.baseUrl() });
+    const stored = await real.createSession("/work/resume", {});
+    assert.equal(classifySessionMarker(registryDir, stored.id), "UNMANAGED", "a session with no marker is UNMANAGED");
+
+    const http = recordingHttp(real, [], () => {
+      markerAtPrompt = classifySessionMarker(registryDir, stored.id);
+    });
+    const driver = makeDriver({ http, db, registryDir });
+
+    // Creation-path triage prompt: no marker means refuse, never prompt.
+    await assert.rejects(
+      () => driver.promptTriage(stored.id, triageDigest("issue-resume")),
+      isGateError,
+      "promptTriage must refuse a session whose marker does not currently exist",
+    );
+
+    // Resume path: recreate the marker immediately before the prompt.
+    const obs = await driver.promptSession(stored.id, { text: "resume" });
+    assert.equal(obs.kind, "turn");
+    assert.equal(markerAtPrompt, "MANAGED", "the marker must be recreated before the resume prompt");
+    assert.equal(classifySessionMarker(registryDir, stored.id), "MANAGED", "the marker must exist after resume");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P1-S5 — closed managed gate: typed + logged refusal, unrelated tools intact.
+// ---------------------------------------------------------------------------
+
+test("J/P1-S5 closed managed gate: refusals are typed and logged; read tools are unaffected", async () => {
+  const registryDir = makeTemp("j-closed-gate");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  const sink = new CapturingSink();
+  const logger = new JsonLogger(sink.writeable(), "debug");
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const http = recordingHttp(new OpenCodeHttp({ baseUrl: server.baseUrl() }), events);
+    const driver = makeDriver({
+      http,
+      db,
+      registryDir,
+      logger,
+      managedGate: () => ({ loaded: false, reason: "moderation-plugin-not-loaded" }),
+    });
+
+    // (a) managed creation is refused before any OpenCode session is created.
+    await assert.rejects(
+      () => driver.createRealSession("resolution", "/work/closed", {
+        repoId: REPO_ID,
+        directory: "/work/closed",
+        kind: "resolution",
+      }),
+      (err: unknown) => {
+        const e = err as Error & { reason?: unknown };
+        return e.name === "ManagedSessionGateError" && typeof e.reason === "string";
+      },
+      "a closed managed gate must refuse creation with a typed, machine-readable error",
+    );
+    assert.equal(events.includes("createSession"), false, "the gate is consulted before creating the OpenCode session");
+    assert.equal(sink.records().length, 1, "a refusal emits exactly one structured record");
+
+    // (b) a prompt on an existing managed session is refused with no prompt issued.
+    const stored = await new OpenCodeHttp({ baseUrl: server.baseUrl() }).createSession("/work/closed", {});
+    createSessionMarker(registryDir, stored.id);
+    await assert.rejects(
+      () => driver.promptSession(stored.id, { text: "must-not-send" }),
+      isGateError,
+      "a closed managed gate must refuse the prompt",
+    );
+    assert.equal(events.includes("sendMessage"), false, "no prompt may be sent while the gate is closed");
+    assert.equal(events.includes("sendPromptAsync"), false, "no async prompt may be sent while the gate is closed");
+    assert.equal(sink.records().length, 2, "each refusal emits its own structured record");
+
+    // (c) unrelated read tools are unaffected; no gate error escapes for them.
+    assert.ok(Array.isArray(await driver.listSessions()), "listSessions stays available while the gate is closed");
+    assert.equal(typeof (await driver.getSessionStatus(stored.id)), "string", "getSessionStatus stays available");
+    assert.ok(Array.isArray(await driver.readHistory(stored.id)), "readHistory stays available");
+
+    const unmanaged = await new OpenCodeHttp({ baseUrl: server.baseUrl() }).createSession("/work/unmanaged", {});
+    assert.equal(classifySessionMarker(registryDir, unmanaged.id), "UNMANAGED", "no marker means UNMANAGED");
+    assert.equal((await driver.getSession(unmanaged.id)).id, unmanaged.id, "an unmanaged session is readable, not gated");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P1-S6 — the three crash windows around marker and durable mapping.
+// ---------------------------------------------------------------------------
+
+test("J/P1-S6 crash windows: marker-less orphan ignored; marked orphan with no DB row pruned and never prompted; marker + DB row resumable", async () => {
+  const registryDir = makeTemp("j-crash");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
+    const driver = makeDriver({ http, db, registryDir });
+
+    // (1) crash before the marker: a real session with no marker and no DB row.
+    const orphan = await http.createSession("/work/orphan", {});
+    assert.equal(classifySessionMarker(registryDir, orphan.id), "UNMANAGED", "a marker-less orphan is not managed");
+    assert.equal(listSessions(db).some((s) => s.id === orphan.id), false, "a pre-marker crash leaves no durable row");
+    assert.deepEqual(pruneMarkersWithoutDbRow(registryDir, db), [], "nothing is pruned for a marker-less orphan");
+
+    // (2) crash after the marker, before the durable row: pruned, never prompted.
+    const marked = await http.createSession("/work/marked", {});
+    createSessionMarker(registryDir, marked.id);
+    assert.deepEqual(pruneMarkersWithoutDbRow(registryDir, db), [marked.id], "a marked orphan with no DB row is pruned");
+    assert.equal(classifySessionMarker(registryDir, marked.id), "UNMANAGED", "the pruned marker is gone");
+    await assert.rejects(
+      () => driver.promptTriage(marked.id, triageDigest("issue-orphan")),
+      isGateError,
+      "a pruned orphan must never be prompted",
+    );
+
+    // (3) crash after the durable row: marker + DB row is safe to resume.
+    const durable = await http.createSession("/work/durable", {});
+    createSessionMarker(registryDir, durable.id);
+    insertSession(db, {
+      id: durable.id,
+      kind: "resolution",
+      repo_id: REPO_ID,
+      work_item_id: null,
+      directory: "/work/durable",
+      agent: null,
+      model_json: null,
+      state: "ACTIVE",
+    });
+    const obs = await driver.promptSession(durable.id, { text: "resume durable" });
+    assert.equal(obs.kind, "turn", "marker + durable mapping is resumable");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P1-S7 — the production-assembly seam: createProductionAssembly must supply its
+// managedGate predicate into the driver (the beacon-backed predicate lands in
+// plan M; this only asserts the predicate is threaded through).
+// ---------------------------------------------------------------------------
+
+test("J/P1-S7 seam: createProductionAssembly supplies its managedGate predicate into the driver", async () => {
+  const root = makeTemp("j-assembly");
+  const registryDir = join(root, "registry");
+  const agentsDir = join(root, "agents");
+  const stateDir = join(root, "state");
+  mkdirSync(registryDir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  const server = await startPessimisticServer();
+  const priorAgentsDir = process.env.TISSUE_OPENCODE_AGENTS_DIR;
+  const priorRegistryDir = process.env.TISSUE_SESSION_REGISTRY_DIR;
+  const db = openTissueDb(join(stateDir, "tissue.db"));
+  try {
+    seedRepository(db, { id: REPO_ID });
+    process.env.TISSUE_OPENCODE_AGENTS_DIR = agentsDir;
+    process.env.TISSUE_SESSION_REGISTRY_DIR = registryDir;
+    const install = installAgentDefinitions({ targetDir: agentsDir });
+    assert.equal(install.ok, true, install.errors.join("; "));
+
+    const config: TissueConfig = {
+      pollIntervalSeconds: 60,
+      maxConcurrentGlobal: 3,
+      retentionDays: 30,
+      agents: {},
+      repos: [],
+    };
+    let gateCalls = 0;
+    const assembly = await createProductionAssembly({
+      config,
+      logger: makeLogger(),
+      db,
+      stateDir,
+      endpoint: server.baseUrl(),
+      agentsDir,
+      registryDir,
+      managedGate: () => {
+        gateCalls += 1;
+        return { loaded: true, reason: "test-gate" };
+      },
+    } as unknown as ProductionAssemblyOptions);
+
+    const ref = await assembly.driver.createRealSession("resolution", "/work/assembly", {
+      repoId: REPO_ID,
+      directory: "/work/assembly",
+      kind: "resolution",
+    });
+    await assembly.driver.promptSession(ref.sessionId, { text: "assembly prompt" });
+    assert.ok(gateCalls >= 1, "createProductionAssembly must pass its managedGate predicate into the driver");
+  } finally {
+    if (priorAgentsDir === undefined) delete process.env.TISSUE_OPENCODE_AGENTS_DIR;
+    else process.env.TISSUE_OPENCODE_AGENTS_DIR = priorAgentsDir;
+    if (priorRegistryDir === undefined) delete process.env.TISSUE_SESSION_REGISTRY_DIR;
+    else process.env.TISSUE_SESSION_REGISTRY_DIR = priorRegistryDir;
+    closeDb(db);
+    await server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P3-S3 — the mock-versus-real caller pair.
+//
+// REAL caller (existing, cited): J/P1-S1 (line 1151) and J/P1-S2 (line 1201)
+// run the real OpenCodeDriver with a real temp registry dir and a real TissueDb
+// against the local pessimistic HTTP server, proving
+// session -> marker -> durable insert -> prompt for both roles.
+//
+// MOCKED caller (this test): a hand-written stub transport plus an injected gate
+// predicate, with no server and no real transport, asserting the exact effect
+// order and that a closed gate prevents the HTTP prompt call. It never
+// substitutes for the real caller; both are required.
+// ---------------------------------------------------------------------------
+
+test("J/P3-S3 mocked caller: stub transport + injected gate assert session -> marker -> durable insert -> prompt and a closed-gate prompt refusal reaches no HTTP", async () => {
+  const registryDir = makeTemp("j-mock-caller");
+  const { db, cleanup } = createTestDb();
+  const SESSION_ID = "ses_mockorder01";
+  const calls: string[] = [];
+  let markerAtInsert: string | undefined;
+  let markerAtPrompt: string | undefined;
+  try {
+    seedRepository(db, { id: REPO_ID });
+
+    // A stub transport: no server and no real OpenCodeHttp, just recorded effects.
+    const stub = {
+      async createSession(): Promise<{ id: string }> {
+        calls.push("createSession");
+        return { id: SESSION_ID };
+      },
+      async sendMessage(): Promise<{ info: { role: string; id: string; parentID: string; mode: string; summary: boolean } }> {
+        calls.push("sendMessage");
+        markerAtPrompt = classifySessionMarker(registryDir, SESSION_ID);
+        return { info: { role: "assistant", id: "msg_assistant", parentID: "msg_user", mode: "normal", summary: false } };
+      },
+      async sendPromptAsync(): Promise<void> {
+        calls.push("sendPromptAsync");
+      },
+      async listMessages(): Promise<never[]> {
+        calls.push("listMessages");
+        return [];
+      },
+    };
+    const spyDb = dbWithInsertProbe(db, () => {
+      calls.push("insertSession");
+      markerAtInsert = classifySessionMarker(registryDir, SESSION_ID);
+    });
+
+    const driver = makeDriver({
+      http: stub as unknown as OpenCodeHttp,
+      db: spyDb,
+      registryDir,
+      managedGate: () => ({ loaded: true, reason: "mock-gate-open" }),
+    });
+
+    const ref = await driver.createRealSession("triage", "/work/mock-order", {
+      repoId: REPO_ID,
+      directory: "/work/mock-order",
+      kind: "triage",
+    });
+    assert.equal(ref.sessionId, SESSION_ID);
+    assert.equal(classifySessionMarker(registryDir, SESSION_ID), "MANAGED", "the marker exists after stub creation");
+    assert.equal(markerAtInsert, "MANAGED", "the marker exists when the durable insert runs");
+    assert.ok(calls.indexOf("createSession") < calls.indexOf("insertSession"), "the HTTP session creation precedes the durable insert");
+    assert.equal(calls.includes("sendMessage"), false, "no prompt is issued during creation");
+    assert.ok(listSessions(db).some((s) => s.id === SESSION_ID), "the durable mapping is persisted");
+
+    await driver.promptSession(SESSION_ID, { text: "mocked prompt" });
+    assert.equal(markerAtPrompt, "MANAGED", "the marker exists at the HTTP prompt call");
+    assert.ok(calls.indexOf("insertSession") < calls.indexOf("sendMessage"), "the durable insert precedes the prompt");
+
+    // Closed-gate complement: a refusal must prevent the HTTP prompt call.
+    const refusalCalls: string[] = [];
+    const refusalStub = {
+      async createSession(): Promise<{ id: string }> {
+        refusalCalls.push("createSession");
+        return { id: "ses_mockrefuse01" };
+      },
+      async sendMessage(): Promise<never> {
+        refusalCalls.push("sendMessage");
+        throw new Error("a closed gate must prevent the HTTP prompt call");
+      },
+      async sendPromptAsync(): Promise<never> {
+        refusalCalls.push("sendPromptAsync");
+        throw new Error("a closed gate must prevent the async HTTP prompt call");
+      },
+      async listMessages(): Promise<never[]> {
+        return [];
+      },
+    };
+    const closed = makeDriver({
+      http: refusalStub as unknown as OpenCodeHttp,
+      db,
+      registryDir,
+      managedGate: () => ({ loaded: false, reason: "mock-plugin-not-loaded" }),
+    });
+
+    await assert.rejects(
+      () => closed.createRealSession("resolution", "/work/mock-closed", {
+        repoId: REPO_ID,
+        directory: "/work/mock-closed",
+        kind: "resolution",
+      }),
+      isGateError,
+      "a closed injected gate refuses managed creation",
+    );
+    await assert.rejects(
+      () => closed.promptSession(SESSION_ID, { text: "must-not-send" }),
+      isGateError,
+      "a closed injected gate refuses a managed prompt",
+    );
+    assert.equal(refusalCalls.includes("createSession"), false, "a closed gate creates no OpenCode session");
+    assert.equal(refusalCalls.includes("sendMessage"), false, "a closed gate prevents the HTTP prompt call");
+    assert.equal(refusalCalls.includes("sendPromptAsync"), false, "a closed gate prevents the async HTTP prompt call");
+  } finally {
+    cleanup();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// P4-S2 — a closed-gate refusal disables nothing: the same driver and transport
+// remain fully available once the predicate reports loaded, so the resident
+// service is never disabled or degraded by a refusal.
+// ---------------------------------------------------------------------------
+
+test("J/P4-S2 a closed-gate refusal latches no disabled state: the same driver still creates and prompts when the predicate opens", async () => {
+  const registryDir = makeTemp("j-p4s2-no-disable");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  let loaded = false;
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const http = recordingHttp(new OpenCodeHttp({ baseUrl: server.baseUrl() }), events);
+    const driver = makeDriver({
+      http,
+      db,
+      registryDir,
+      managedGate: () => ({ loaded, reason: loaded ? "plugin-loaded" : "plugin-not-loaded" }),
+    });
+
+    // Closed predicate: the managed creation is refused before any HTTP call, so
+    // the transport (and the resident service behind it) is never touched.
+    await assert.rejects(
+      () =>
+        driver.createRealSession("triage", "/work/p4s2", {
+          repoId: REPO_ID,
+          directory: "/work/p4s2",
+          kind: "triage",
+        }),
+      isGateError,
+      "a closed predicate refuses managed creation",
+    );
+    assert.equal(events.includes("createSession"), false, "a refusal reaches no HTTP transport");
+
+    // Nothing was latched/disabled: the SAME driver + SAME transport create and
+    // prompt successfully after the predicate opens.
+    loaded = true;
+    const ref = await driver.createRealSession("triage", "/work/p4s2", {
+      repoId: REPO_ID,
+      directory: "/work/p4s2",
+      kind: "triage",
+    });
+    assert.match(ref.sessionId, /^ses_[A-Za-z0-9]+$/);
+    assert.equal(classifySessionMarker(registryDir, ref.sessionId), "MANAGED");
+    const obs = await driver.promptSession(ref.sessionId, { text: "post-refusal prompt" });
+    assert.equal(obs.kind, "turn", "the transport still prompts after an earlier refusal");
+    assert.ok(
+      events.includes("sendMessage") || events.includes("sendPromptAsync"),
+      "the HTTP prompt is issued normally after a prior refusal",
+    );
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// P2-S1 — the constructor's registryDir default. Every other createRealSession
+// spec supplies registryDir explicitly; this one omits it so the env-resolved
+// path is the only thing that can place the marker.
+// ---------------------------------------------------------------------------
+
+test("J/P2-S1 constructor default: an omitted registryDir resolves TISSUE_SESSION_REGISTRY_DIR for the marker write", async () => {
+  const envDir = makeTemp("j-env-registry");
+  const server = await startPessimisticServer();
+  const priorRegistryDir = process.env.TISSUE_SESSION_REGISTRY_DIR;
+  try {
+    process.env.TISSUE_SESSION_REGISTRY_DIR = envDir;
+    const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
+    // registryDir deliberately omitted: the constructor must fall back to the
+    // environment variable, not a hardcoded default.
+    const driver = new OpenCodeDriver({ http });
+
+    const ref = await driver.createRealSession("triage", "/work/env-default", {
+      repoId: REPO_ID,
+      directory: "/work/env-default",
+      kind: "triage",
+    });
+
+    assert.match(ref.sessionId, /^ses_[A-Za-z0-9]+$/, "creation still returns a real ses_ identity");
+    assert.equal(
+      classifySessionMarker(envDir, ref.sessionId),
+      "MANAGED",
+      "the marker must be written under the TISSUE_SESSION_REGISTRY_DIR-resolved directory",
+    );
+  } finally {
+    if (priorRegistryDir === undefined) delete process.env.TISSUE_SESSION_REGISTRY_DIR;
+    else process.env.TISSUE_SESSION_REGISTRY_DIR = priorRegistryDir;
+    await server.close();
+    rmSync(envDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P2-S2 — the creation-path triage guard. The marker:'creation' branch is
+// pass-through for a MANAGED session and refuses a closed gate; every existing
+// promptTriage spec asserts only the refusal side.
+// ---------------------------------------------------------------------------
+
+test("J/P2-S2 triage creation guard: a marked session with an open gate passes and returns a parsed triage suggestion", async () => {
+  const registryDir = makeTemp("j-triage-positive");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  let markerAtPrompt: string | undefined;
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const real = new OpenCodeHttp({ baseUrl: server.baseUrl() });
+    const http = recordingHttp(real, events, () => {
+      const id = newestServerSessionId(server);
+      markerAtPrompt = id === undefined ? undefined : classifySessionMarker(registryDir, id);
+    });
+    const driver = makeDriver({
+      http,
+      db,
+      registryDir,
+      managedGate: () => ({ loaded: true, reason: "triage-plugin-loaded" }),
+    });
+
+    // The marker must already exist: create the session through the real funnel.
+    const ref = await driver.createRealSession("triage", "/work/triage-positive", {
+      repoId: REPO_ID,
+      directory: "/work/triage-positive",
+      kind: "triage",
+    });
+    assert.equal(classifySessionMarker(registryDir, ref.sessionId), "MANAGED", "creation wrote the marker");
+
+    const suggestion = await driver.promptTriage(ref.sessionId, triageDigest("issue-j-p2s2"));
+
+    assert.equal(suggestion.issueId, "issue-j-p2s2", "the parsed suggestion is bound to the requested issue");
+    assert.equal(
+      suggestion.disposition,
+      "READY",
+      "the creation-path guard must not over-refuse a marked session (server returns READY)",
+    );
+    assert.equal(events.includes("sendMessage"), true, "the triage prompt actually reaches the HTTP transport");
+    assert.equal(markerAtPrompt, "MANAGED", "the marker already exists when the triage prompt is issued");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+test("J/P2-S2 triage gate: a closed managed gate refuses promptTriage on a marked session with no HTTP prompt", async () => {
+  const registryDir = makeTemp("j-triage-closed");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const http = recordingHttp(new OpenCodeHttp({ baseUrl: server.baseUrl() }), events);
+    const driver = makeDriver({
+      http,
+      db,
+      registryDir,
+      managedGate: () => ({ loaded: false, reason: "triage-plugin-not-loaded" }),
+    });
+    // A marked session: the marker check passes, so only the closed gate can refuse.
+    const stored = await new OpenCodeHttp({ baseUrl: server.baseUrl() }).createSession("/work/triage-closed", {});
+    createSessionMarker(registryDir, stored.id);
+
+    await assert.rejects(
+      () => driver.promptTriage(stored.id, triageDigest("issue-j-p2s2-closed")),
+      isGateError,
+      "a closed managed gate must refuse triage even when the marker currently exists",
+    );
+    assert.equal(events.includes("sendMessage"), false, "no triage prompt may reach HTTP while the gate is closed");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P2-S3 — promptAsync now shares the resume semantics. These specs are the only
+// ones that exercise promptAsync on a marker-less session or through a closed
+// gate; existing async specs always run after createRealSession wrote the marker.
+// ---------------------------------------------------------------------------
+
+test("J/P2-S3 async resume: promptAsync recreates a missing marker immediately before sendPromptAsync and the prompt is accepted", async () => {
+  const registryDir = makeTemp("j-async-resume");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  let markerAtPrompt: string | undefined;
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const real = new OpenCodeHttp({ baseUrl: server.baseUrl() });
+    // No marker: create the server-side session directly, bypassing the funnel.
+    const stored = await real.createSession("/work/async-resume", {});
+    assert.equal(classifySessionMarker(registryDir, stored.id), "UNMANAGED", "the stored session starts with no marker");
+
+    const http = recordingHttp(real, events, () => {
+      markerAtPrompt = classifySessionMarker(registryDir, stored.id);
+    });
+    const driver = makeDriver({ http, db, registryDir });
+
+    const obs = await driver.promptAsync(stored.id, { text: "async resume" });
+
+    assert.equal(obs.kind, "accepted", "an accepted async prompt returns kind 'accepted'");
+    assert.equal(events.includes("sendPromptAsync"), true, "the async prompt reaches the HTTP transport");
+    assert.equal(markerAtPrompt, "MANAGED", "the resume path must recreate the marker before sendPromptAsync");
+    assert.equal(classifySessionMarker(registryDir, stored.id), "MANAGED", "the marker exists after the async resume");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
+});
+
+test("J/P2-S3 async gate: a closed managed gate refuses promptAsync with no sendPromptAsync", async () => {
+  const registryDir = makeTemp("j-async-closed");
+  const server = await startPessimisticServer();
+  const { db, cleanup } = createTestDb();
+  const events: string[] = [];
+  try {
+    seedRepository(db, { id: REPO_ID });
+    const http = recordingHttp(new OpenCodeHttp({ baseUrl: server.baseUrl() }), events);
+    const driver = makeDriver({
+      http,
+      db,
+      registryDir,
+      managedGate: () => ({ loaded: false, reason: "async-plugin-not-loaded" }),
+    });
+    // A marked session, so the refusal is attributable to the closed gate alone.
+    const stored = await new OpenCodeHttp({ baseUrl: server.baseUrl() }).createSession("/work/async-closed", {});
+    createSessionMarker(registryDir, stored.id);
+
+    await assert.rejects(
+      () => driver.promptAsync(stored.id, { text: "must-not-send" }),
+      isGateError,
+      "a closed managed gate must refuse the async resume",
+    );
+    assert.equal(events.includes("sendPromptAsync"), false, "no async prompt may reach HTTP while the gate is closed");
+  } finally {
+    cleanup();
+    await server.close();
+    rmSync(registryDir, { recursive: true, force: true });
   }
 });

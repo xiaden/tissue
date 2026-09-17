@@ -24,7 +24,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { RepositoryConfig, TissueConfig } from "../../src/config/types.ts";
@@ -170,6 +170,8 @@ test("same-repository E2E: config + empty DB, same session, false autoMerge no-m
     await assert.rejects(() => bareClient.sessionStatus());
     assert.ok(server.authRejections >= 1, "resident transport enforces basic auth");
 
+    const registryDir = join(stateRoot, "registry");
+    mkdirSync(registryDir, { recursive: true });
     const assembly = await createProductionAssembly({
       config,
       logger,
@@ -178,6 +180,7 @@ test("same-repository E2E: config + empty DB, same session, false autoMerge no-m
       endpoint: server.baseUrl(),
       credentials: { username: "tissue", password: "s3cret" },
       agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
+      registryDir,
       gh: new GhClient({ binary: fake.binary }),
       now: () => new Date(clock),
     });
@@ -450,6 +453,8 @@ test("target/fork E2E: target coaxk/subarr, writable xiaden/subarr via pushRemot
     assert.equal(cap.protection.enabled, true);
     assert.equal(cap.readiness.ready, true, cap.readiness.reasons.join("; "));
 
+    const registryDir = join(stateRoot, "registry");
+    mkdirSync(registryDir, { recursive: true });
     const assembly = await createProductionAssembly({
       config,
       logger,
@@ -458,6 +463,7 @@ test("target/fork E2E: target coaxk/subarr, writable xiaden/subarr via pushRemot
       endpoint: server.baseUrl(),
       credentials: { username: "tissue", password: "s3cret" },
       agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
+      registryDir,
       gh,
       now: () => new Date(clock),
     });

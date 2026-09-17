@@ -34,9 +34,14 @@ import { recordTransition } from "../../src/domain/transitions.ts";
 import { applyEnvelope, type AgentEnvelope } from "../../src/domain/envelopes.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const REPO = "xiaden/nomarr";
 const CONFIG: TissueConfig = { pollIntervalSeconds: 300, maxConcurrentGlobal: 3, retentionDays: 30, agents: {}, repos: [] };
+// Plan J: the real driver writes ses_* markers; give it a writable temp registry.
+const REGISTRY_DIR = mkdtempSync(join(tmpdir(), "tissue-r19-registry-"));
 
 function snapshot(issueNumber: number, title: string, updatedAt = "2026-09-10T00:00:00.000Z") {
   return {
@@ -182,7 +187,7 @@ test("R19 pessimistic OpenCode busy/missing session states never become completi
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
   const t = createTestDb();
-  const driver = new OpenCodeDriver({ http, db: t.db });
+  const driver = new OpenCodeDriver({ http, db: t.db, registryDir: REGISTRY_DIR });
   try {
     seedRepository(t.db);
     insertWorkItem(t.db, { id: "wi-busy", repo_id: REPO, state: "RUNNING", base_branch: "main" });

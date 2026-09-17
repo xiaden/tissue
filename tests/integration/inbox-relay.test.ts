@@ -29,6 +29,9 @@ import { relayOldestInbox } from "../../src/controller/inbox-relay.ts";
 import { startPessimisticServer, type PessimisticOpenCodeServer } from "../helpers/pessimistic-opencode-server.ts";
 import { createTestDb, seedIssue, seedRepository } from "../helpers/db.ts";
 import { createTempRepo } from "../helpers/git.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 interface Harness {
   db: ReturnType<typeof createTestDb>["db"];
@@ -48,7 +51,9 @@ async function harness(): Promise<Harness> {
   // host-specific path that only exists on one machine.
   const checkout = await createTempRepo();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http, db: t.db });
+  // Plan J: createRealSession writes the ses_* marker into this writable dir.
+  const registryDir = mkdtempSync(join(tmpdir(), "tissue-inbox-registry-"));
+  const driver = new OpenCodeDriver({ http, db: t.db, registryDir });
   const repo = seedRepository(t.db);
   const workItem = insertWorkItem(t.db, {
     id: "wi-xiaden-nomarr-7",
@@ -83,6 +88,7 @@ async function harness(): Promise<Harness> {
       await server.close();
       t.cleanup();
       checkout.cleanup();
+      rmSync(registryDir, { recursive: true, force: true });
     },
   };
 }
