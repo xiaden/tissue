@@ -53,6 +53,7 @@ import { createWorktree, worktreeBranchFor } from "../controller/worktrees.ts";
 import type { RealSessionRef, SessionDriver, SessionMetadata } from "../controller/session-driver.ts";
 import { executeVerifiedEffect, GhEffectTransport } from "../controller/effects.ts";
 import { recordTransition } from "../domain/transitions.ts";
+import type { SessionDependencyHealth } from "../controller/reconcile.ts";
 import { parseProviderModel } from "./resident.ts";
 import type { GhClient } from "../integrations/gh-client.ts";
 
@@ -210,6 +211,10 @@ export interface NormalLoopSummary {
   relays: Array<{ workItemId: string; status: string }>;
   effects: number;
   errors: NormalLoopError[];
+  /** True when resident-dependency unavailability withheld prompt-dependent phases. */
+  gated: boolean;
+  /** Why the pass was gated (`opencode_unavailable`); present only when gated. */
+  gateReason?: string;
 }
 
 function messageOf(err: unknown): string {
@@ -250,12 +255,16 @@ export function promoteReadyWorkItems(db: TissueDb): number {
 /**
  * One level-triggered normal-loop pass. Never throws operationally: each phase
  * records its error and later phases still run, so one failing repository or
- * effect cannot starve the rest of the loop.
+ * effect cannot starve the rest of the loop. When the optional resident
+ * dependency `health` is explicitly `false`, the prompt-dependent phases
+ * (triage, claim + ensure-resolution, relay) are skipped together while polling,
+ * promotion, and effects still run.
  */
 export async function runNormalLoopPass(
   db: TissueDb,
   config: TissueConfig,
   io: NormalLoopIo,
+  health?: SessionDependencyHealth,
 ): Promise<NormalLoopSummary> {
   const now = io.now();
   synchronizeConfiguredRepositories(db, config, now);
@@ -263,6 +272,10 @@ export async function runNormalLoopPass(
   let reposPolled = 0;
   let issuesIngested = 0;
   let triageRuns = 0;
+  // Fail closed: an explicit unhealthy signal withholds every prompt-dependent
+  // phase together; an absent signal (`undefined`) is not gated and preserves
+  // prior behavior.
+  const dependencyGated = health !== undefined && health.openCodeAvailable === false;
 
   for (const repo of listRepositories(db)) {
     if (repo.enabled !== 1) continue;
@@ -275,44 +288,52 @@ export async function runNormalLoopPass(
     } catch (err) {
       errors.push({ phase: `poll:${repo.id}`, error: messageOf(err) });
     }
-    try {
-      if (repo.config_managed === 1) assertDispatchReady(db, repo.id, "triage");
-      const triage = await io.runTriage(db, repo.id, now);
-      if (triage.ran) triageRuns += 1;
-    } catch (err) {
-      errors.push({ phase: `triage:${repo.id}`, error: messageOf(err) });
+    if (!dependencyGated) {
+      try {
+        if (repo.config_managed === 1) assertDispatchReady(db, repo.id, "triage");
+        const triage = await io.runTriage(db, repo.id, now);
+        if (triage.ran) triageRuns += 1;
+      } catch (err) {
+        errors.push({ phase: `triage:${repo.id}`, error: messageOf(err) });
+      }
     }
   }
 
   const promoted = promoteReadyWorkItems(db);
 
+  // Claim and ensure-resolution are gated together: never claim a WorkItem that
+  // cannot get a session while the resident dependency is unhealthy.
   const claimed: string[] = [];
-  for (;;) {
-    let claim: WorkClaim | null;
-    try {
-      claim = io.claimNext(db, now);
-    } catch (err) {
-      errors.push({ phase: "claim", error: messageOf(err) });
-      break;
-    }
-    if (!claim) break;
-    claimed.push(claim.workItemId);
-    try {
-      await io.ensureResolution(db, claim, now);
-    } catch (err) {
-      errors.push({ phase: `ensure:${claim.workItemId}`, error: messageOf(err) });
+  if (!dependencyGated) {
+    for (;;) {
+      let claim: WorkClaim | null;
+      try {
+        claim = io.claimNext(db, now);
+      } catch (err) {
+        errors.push({ phase: "claim", error: messageOf(err) });
+        break;
+      }
+      if (!claim) break;
+      claimed.push(claim.workItemId);
+      try {
+        await io.ensureResolution(db, claim, now);
+      } catch (err) {
+        errors.push({ phase: `ensure:${claim.workItemId}`, error: messageOf(err) });
+      }
     }
   }
 
   const relays: Array<{ workItemId: string; status: string }> = [];
-  for (const workItem of listWorkItemsByStates(db, ["RUNNING", "WAITING"])) {
-    try {
-      const wiRepo = getRepositoryById(db, workItem.repo_id);
-      if (wiRepo?.config_managed === 1) assertDispatchReady(db, wiRepo.id, "dispatch");
-      const result = await io.relay(db, workItem.id, now);
-      relays.push({ workItemId: workItem.id, status: result.status });
-    } catch (err) {
-      errors.push({ phase: `relay:${workItem.id}`, error: messageOf(err) });
+  if (!dependencyGated) {
+    for (const workItem of listWorkItemsByStates(db, ["RUNNING", "WAITING"])) {
+      try {
+        const wiRepo = getRepositoryById(db, workItem.repo_id);
+        if (wiRepo?.config_managed === 1) assertDispatchReady(db, wiRepo.id, "dispatch");
+        const result = await io.relay(db, workItem.id, now);
+        relays.push({ workItemId: workItem.id, status: result.status });
+      } catch (err) {
+        errors.push({ phase: `relay:${workItem.id}`, error: messageOf(err) });
+      }
     }
   }
 
@@ -332,7 +353,17 @@ export async function runNormalLoopPass(
     relays,
     effects,
     errors,
+    gated: dependencyGated,
+    ...(dependencyGated ? { gateReason: "opencode_unavailable" } : {}),
   };
+  if (dependencyGated) {
+    // Exactly one observable warning per pass; OpenCode-independent work above
+    // still ran, so safe local reconciliation is never lost.
+    io.logger.warn("daemon.dependency_gated", {
+      reason: "opencode_unavailable",
+      withheld: ["triage", "claim", "ensure_resolution", "relay"],
+    });
+  }
   io.logger.info("daemon.normal_loop", {
     repos_polled: reposPolled,
     issues_ingested: issuesIngested,
@@ -342,6 +373,7 @@ export async function runNormalLoopPass(
     relays: relays.length,
     effects,
     errors: errors.length,
+    gated: dependencyGated,
   });
   return summary;
 }
@@ -634,12 +666,28 @@ export class SseWakeHint implements WakeHint {
 
 // ---- daemon loop -----------------------------------------------------------------
 
+/**
+ * Resident-dependency health carried across the reconcile -> daemon seam. The
+ * production `ReconcileReport` structurally satisfies this shape (it exposes
+ * `residentOpenCodeAvailable`); a legacy/void reconcile stub leaves the field
+ * undefined, which means "not gated" and preserves prior behavior.
+ */
+export interface DaemonReconcileResult {
+  residentOpenCodeAvailable?: boolean;
+}
+
 export interface DaemonContext {
   config: TissueConfig;
   logger: JsonLogger;
   db: TissueDb;
   /** Ordered P0-P6 startup reconcile, run exactly once before the loop. */
-  reconcile(): Promise<unknown>;
+  reconcile(): Promise<DaemonReconcileResult | void>;
+  /**
+   * Optional fail-closed resident-dependency probe. Re-evaluated at the start of
+   * every iteration so a restored service resumes prompt-dependent work without a
+   * daemon restart; a rejected probe is treated as unhealthy (never rethrown).
+   */
+  checkResidentHealth?(): Promise<boolean>;
   normalLoop: NormalLoopIo;
   wakeHint?: WakeHint;
   sleep(ms: number): Promise<void>;
@@ -661,19 +709,43 @@ export interface DaemonRunReport {
  * SSE wake hint or a jittered polling deadline. The polling deadline is the
  * correctness backstop; SSE only shortens the wait. Never depends on SSE for
  * progress.
+ *
+ * Resident dependency health crosses the reconcile -> daemon seam: the
+ * reconcile result seeds the loop's gate, and an optional
+ * `DaemonContext.checkResidentHealth()` re-probes at the start of every
+ * iteration so a restored service resumes prompt-dependent work without a
+ * restart. A rejected probe fails closed (unhealthy) and is never rethrown. The
+ * daemon keeps polling while unhealthy and never exits on unavailability.
  */
 export async function runDaemon(ctx: DaemonContext): Promise<DaemonRunReport> {
-  await ctx.reconcile();
-  ctx.logger.info("daemon.reconciled");
+  const seeded = (await ctx.reconcile())?.residentOpenCodeAvailable;
+  ctx.logger.info("daemon.reconciled", { resident_opencode_available: seeded });
   ctx.wakeHint?.start();
 
   const passes: NormalLoopSummary[] = [];
   let iterations = 0;
+  // Seeded from reconcile; `undefined` (legacy/void reconcile with no probe)
+  // means not gated, preserving prior behavior.
+  let openCodeAvailable: boolean | undefined = seeded;
   try {
     while (!ctx.signal?.aborted) {
       if (ctx.maxIterations !== undefined && iterations >= ctx.maxIterations) break;
       iterations += 1;
-      passes.push(await runNormalLoopPass(ctx.db, ctx.config, ctx.normalLoop));
+      if (ctx.checkResidentHealth) {
+        try {
+          openCodeAvailable = await ctx.checkResidentHealth();
+        } catch {
+          openCodeAvailable = false;
+        }
+      }
+      passes.push(
+        await runNormalLoopPass(
+          ctx.db,
+          ctx.config,
+          ctx.normalLoop,
+          openCodeAvailable === undefined ? undefined : { openCodeAvailable },
+        ),
+      );
       if (ctx.signal?.aborted) break;
       if (ctx.maxIterations !== undefined && iterations >= ctx.maxIterations) break;
 

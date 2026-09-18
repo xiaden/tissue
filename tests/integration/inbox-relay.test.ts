@@ -10,6 +10,11 @@
 //   - bounded noReply window recycles DELIVERING->PENDING + human-inspect;
 //   - past W_wedge the WorkItem is held FAILED_HOLD;
 //   - idle gate holds (never prompts) while the session is busy.
+//
+// TASK-tissue-G Phase 1 spec-first coverage: a resolution session that is
+// genuinely `missing` (deleted server-side) escalates to FAILED_HOLD instead of
+// holding `busy_hold` forever — both for a PENDING bundle (never claimed) and
+// for an in-flight DELIVERING bundle (evidence preserved, no relabelling).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -224,6 +229,80 @@ test("crash window: an existing DELIVERING row with a completed turn is adopted,
     assert.equal(h.server.getRec(h.sessionId)?.messages.length, before, "completion adopted without a second prompt");
     const rows = listInboxByWorkItem(h.db, h.workItemId);
     assert.equal(rows[0]?.state, "DELIVERED");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("pending bundle for a missing resolution session escalates FAILED_HOLD instead of busy_hold", async () => {
+  const h = await harness();
+  try {
+    const id = seedEvent(h, "pending-missing-1");
+    h.server.deleteSession(h.sessionId);
+
+    const res = await relayOldestInbox(h.db, h.workItemId, h.driver, OPTS);
+    assert.equal(res.status, "session_missing", "a nonexistent session never yields busy_hold");
+    assert.notEqual(res.status, "busy_hold");
+
+    const wi = h.db.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", h.workItemId);
+    assert.equal(wi?.state, "FAILED_HOLD", "the owning WorkItem is put in an explicit recoverable state");
+
+    const rows = listInboxByWorkItem(h.db, h.workItemId);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.id, id);
+    assert.equal(rows[0]?.state, "PENDING", "the bundle is never claimed");
+    assert.equal(rows[0]?.delivery_nonce, null);
+    assert.equal(h.server.getRec(h.sessionId)?.messages.length, 0, "no prompt is sent to a missing session");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("delivery-time session loss holds FAILED_HOLD and preserves the DELIVERING evidence", async () => {
+  const h = await harness();
+  try {
+    const id = seedEvent(h, "delivery-missing-1");
+    const first = await relayOldestInbox(h.db, h.workItemId, h.driver, OPTS);
+    assert.equal(first.status, "observing");
+    const nonce = first.nonce;
+    assert.ok(nonce, "an in-flight delivery records its durable nonce");
+
+    h.server.deleteSession(h.sessionId);
+    const res = await relayOldestInbox(h.db, h.workItemId, h.driver, OPTS);
+    assert.equal(res.status, "session_missing");
+
+    const wi = h.db.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", h.workItemId);
+    assert.equal(wi?.state, "FAILED_HOLD");
+
+    const row = listInboxByWorkItem(h.db, h.workItemId).find((r) => r.id === id);
+    assert.equal(row?.state, "DELIVERING", "the DELIVERING evidence is left in place until cleanup");
+    assert.equal(row?.delivery_nonce, nonce, "the original nonce is preserved");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("a transport failure while sampling idle propagates and is never read as a lost session", async () => {
+  const h = await harness();
+  try {
+    seedEvent(h, "transport-failure-1");
+    // A thrown getSessionStatus is a transport failure, NOT evidence the session
+    // is gone: the relay must surface it rather than convert it to `missing`.
+    const throwing = {
+      getSessionStatus: async (): Promise<never> => {
+        throw new Error("resident OpenCode transport failure");
+      },
+      promptAsync: h.driver.promptAsync.bind(h.driver),
+      observeCompletion: h.driver.observeCompletion.bind(h.driver),
+    };
+
+    await assert.rejects(() => relayOldestInbox(h.db, h.workItemId, throwing, OPTS), /transport failure/);
+
+    const wi = h.db.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", h.workItemId);
+    assert.equal(wi?.state, "RUNNING", "a transport failure is not evidence the session is gone");
+    const rows = listInboxByWorkItem(h.db, h.workItemId);
+    assert.equal(rows[0]?.state, "PENDING");
+    assert.equal(rows[0]?.delivery_nonce, null);
   } finally {
     await h.cleanup();
   }

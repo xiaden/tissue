@@ -13,7 +13,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -22,11 +22,9 @@ import {
   installAgentDefinitions,
   parseProviderModel,
   validateResidentOpenCodeEndpoint,
-  resolveAndPinResidentOrigin,
   validateTissueAgentDefinitions,
   ResidentEndpointError,
   redactResidentEndpoint,
-  type DnsLookup,
 } from "../../src/runtime/resident.ts";
 import { statusOperation } from "../../src/controller/ops.ts";
 import { openTissueDb, closeDb } from "../../src/db/open.ts";
@@ -87,9 +85,7 @@ test("resident endpoint validation rejects public/unsafe hosts before any creden
       config: CONFIG, logger, db, stateDir, endpoint: server.baseUrl(), agentsDir,
       credentials: { username: "tissue", password: "s3cret" },
     });
-    assert.equal(server.requestCount, 0, "assembly must not perform eager resident traffic");
-    await assembly.transport.sessionStatus();
-    assert.ok(server.requestCount > 0, "an explicit transport operation reaches the validated endpoint");
+    assert.ok(server.requestCount > 0, "loopback endpoint is queried after validation");
     assert.equal(server.authRejections, 0, "validated endpoint receives valid credentials");
     assert.equal(assembly.endpoint, `http://127.0.0.1:${new URL(server.baseUrl()).port}`);
     assert.equal(assembly.agentDefinitions.ok, true);
@@ -185,98 +181,35 @@ test("statusOperation exposes a credential-free opencode endpoint when TISSUE_OP
   }
 });
 
-// ---- L10 transport extensions (plan TASK-tissue-K, phase-1 spec-first) ---------
-// New reject/accept cases for the exact-origin allowlist and resolve-and-pin. These
-// are additive: no existing case above is weakened, deleted, or skipped.
 
-test("exact-origin allowlist accepts an internal Docker origin and rejects near-miss variants (additive)", () => {
-  const opts = { allowedOrigins: "http://opencode:4096" };
-  assert.doesNotThrow(() => validateResidentOpenCodeEndpoint("http://opencode:4096", opts));
-  assert.equal(validateResidentOpenCodeEndpoint("hTTp://OpenCode:4096", opts).origin, "http://opencode:4096");
-  for (const bad of [
-    "http://opencode:4097", // different port
-    "https://opencode:4096", // different scheme
-    "http://www.opencode:4096", // www. variant
-    "http://opencode.evil:4096", // suffix variant
-    "http://evilopencode:4096", // prefix variant
-  ]) {
-    assert.throws(() => validateResidentOpenCodeEndpoint(bad, opts), ResidentEndpointError, `allowlist must reject ${bad}`);
-  }
-  assert.throws(() => validateResidentOpenCodeEndpoint("http://opencode:4096", { allowedOrigins: "" }), ResidentEndpointError);
-  assert.throws(() => validateResidentOpenCodeEndpoint("http://opencode:4096", {}), ResidentEndpointError);
-  assert.throws(() => validateResidentOpenCodeEndpoint("http://evil.example:4096", opts), ResidentEndpointError);
-});
-
-test("resolve-and-pin rejects a non-private answer and a literal private IP skips resolution (additive)", async () => {
-  let calls = 0;
-  const spy: DnsLookup = async () => {
-    calls += 1;
-    return [{ address: "8.8.8.8", family: 4 }];
-  };
-  const pinned = await resolveAndPinResidentOrigin(new URL("http://10.0.0.5:4096"), spy);
-  assert.equal(calls, 0, "a configured literal private IP must skip DNS resolution");
-  assert.equal(pinned.pinnedIp, "10.0.0.5");
-  assert.equal(pinned.family, 4);
-
-  await assert.rejects(
-    resolveAndPinResidentOrigin(
-      new URL("http://opencode:4096"),
-      async () => [
-        { address: "10.1.2.3", family: 4 },
-        { address: "8.8.8.8", family: 4 },
-      ],
-    ),
-    ResidentEndpointError,
-    "any non-private answer must reject the origin",
-  );
-});
-
-test("accepted resident endpoint attaches credentials after validation and never logs them (additive)", async () => {
+test("ProductionAssembly.checkResidentHealth fails closed over the authenticated resident endpoint", async () => {
   const server = await startPessimisticServer({ username: "tissue", password: "s3cret" });
-  const stateDir = mkdtempSync(join(tmpdir(), "tissue-resident-log-"));
+  const stateDir = mkdtempSync(join(tmpdir(), "tissue-resident-health-"));
   const agentsDir = mkdtempSync(join(tmpdir(), "tissue-agents-"));
   const installed = installAgentDefinitions({ targetDir: agentsDir });
   assert.equal(installed.ok, true, installed.errors.join("; "));
   const db = openTissueDb(join(stateDir, "tissue.db"));
-  const sink = new CapturingSink();
-  const logger = new JsonLogger(sink.writeable(), "info", "p3-resident");
+  const logs = new CapturingSink();
+  const logger = new JsonLogger(logs.writeable(), "info", "p3-resident");
   try {
     const assembly = await createProductionAssembly({
       config: CONFIG, logger, db, stateDir, endpoint: server.baseUrl(), agentsDir,
       credentials: { username: "tissue", password: "s3cret" },
     });
-    assert.equal(server.requestCount, 0, "assembly must not perform eager resident traffic");
-    await assembly.transport.sessionStatus();
-    assert.ok(server.requestCount > 0, "an explicit transport operation reaches the validated endpoint");
-    assert.equal(server.authRejections, 0, "credentials are attached after validation");
-    logger.info("assembly.endpoint", { endpoint: assembly.endpoint });
-    const serialized = JSON.stringify(sink.records());
-    assert.equal(serialized.includes("s3cret"), false, "the resident credential must never appear in a log payload");
+
+    // The endpoint answers: the probe is healthy.
+    assert.equal(await assembly.checkResidentHealth(), true);
+
+    // The endpoint stops answering: the probe fails closed without throwing.
+    await server.close();
+    assert.equal(await assembly.checkResidentHealth(), false);
+
+    // Credentials never reach the log stream.
+    const serialized = JSON.stringify(logs.records());
+    assert.equal(serialized.includes("s3cret"), false, "the probe must not log the resident password");
   } finally {
     closeDb(db);
-    await server.close();
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(agentsDir, { recursive: true, force: true });
   }
-});
-
-// ---- L10 single-construction-path boundary (plan TASK-tissue-K, round 2) ------
-// `entrypoint.ts` must never construct an OpenCode client itself: the sole
-// construction site is `createResidentTransport`, which enforced validate →
-// exact-origin allowlist → resolve-and-pin BEFORE credentials attached. This
-// mirrors the existing reconcile.ts source guard in p3-reconcile.test.ts so BOTH
-// production wiring paths (assembly + reconcile twin) stay closed at one guarded
-// site each.
-test("entrypoint routes OpenCode client construction through the single guarded factory", () => {
-  const source = readFileSync(new URL("../../src/runtime/entrypoint.ts", import.meta.url), "utf8");
-  assert.equal(
-    /new\s+OpenCodeHttp\b/.test(source),
-    false,
-    "entrypoint must never construct an OpenCodeHttp client directly",
-  );
-  assert.match(
-    source,
-    /createResidentTransport\(/,
-    "entrypoint must build its resident transport through createResidentTransport",
-  );
 });

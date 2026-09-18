@@ -34,7 +34,7 @@ import { recordTransition } from "../../src/domain/transitions.ts";
 import { applyEnvelope, type AgentEnvelope } from "../../src/domain/envelopes.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -42,6 +42,11 @@ const REPO = "xiaden/nomarr";
 const CONFIG: TissueConfig = { pollIntervalSeconds: 300, maxConcurrentGlobal: 3, retentionDays: 30, agents: {}, repos: [] };
 // Plan J: the real driver writes ses_* markers; give it a writable temp registry.
 const REGISTRY_DIR = mkdtempSync(join(tmpdir(), "tissue-r19-registry-"));
+
+// Each test gets a clean marker namespace while preserving a writable registry root.
+function resetRegistry(): void {
+  for (const entry of readdirSync(REGISTRY_DIR)) rmSync(join(REGISTRY_DIR, entry), { force: true });
+}
 
 function snapshot(issueNumber: number, title: string, updatedAt = "2026-09-10T00:00:00.000Z") {
   return {
@@ -77,13 +82,13 @@ test("R19 every reconcile fault boundary is isolated and later recovery remains 
     const faults: ReconcileBoundary[] = [];
     const deps: ReconcileDeps = {
       now: () => new Date("2026-09-10T00:00:00.000Z"), openDb: () => t.db, closeDb: () => {},
-      verifyRepos: async () => [], censusSessions: async () => [],
+      verifyRepos: async () => [], probeResident: async () => {}, censusSessions: async () => [],
       reconcileArtifacts: async () => ({ expiredLeases: 0, effects: 0, cleaned: [], retained: [] }),
       scanDrift: async () => [], housekeep: async () => ({ checked: 0, terminalMarked: 0, pruned: 0, issueIds: [], at: new Date().toISOString(), counters: { terminalMarked: 0, pruned: 0, lastAt: null }, lastAction: null }),
       resumeNormalLoop: async () => ({ recovered: [], claimed: null }), injectFault: (boundary) => { faults.push(boundary); },
     };
     const report = await runReconcilePass({ config: CONFIG, logger: new JsonLogger(new CapturingSink().writeable()), db: t.db, deps });
-    assert.deepEqual(faults, ["cleanup", "drift_fail", "ingest", "reparent", "prompt_before_completion"]);
+    assert.deepEqual(faults, ["recovery", "cleanup", "drift_fail", "ingest", "reparent", "prompt_before_completion"]);
     assert.deepEqual(report.phases.map((phase) => phase.phase), ["P0", "P1", "P2", "P3", "P4", "P5", "P6"]);
     assert.ok(report.phases.every((phase) => phase.ok));
   } finally { t.cleanup(); }
@@ -187,6 +192,7 @@ test("R19 pessimistic OpenCode busy/missing session states never become completi
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
   const t = createTestDb();
+  resetRegistry();
   const driver = new OpenCodeDriver({ http, db: t.db, registryDir: REGISTRY_DIR });
   try {
     seedRepository(t.db);
@@ -223,6 +229,62 @@ test("R19 pessimistic OpenCode busy/missing session states never become completi
     const fresh = await driver.createRealSession("resolution", "/fresh", { repoId: REPO, directory: "/fresh", kind: "resolution", workItemId: "wi-fresh" });
     assert.equal(await driver.getSessionStatus(fresh.sessionId), "idle");
     assert.deepEqual(await driver.observeCompletion(fresh.sessionId, nonce), { matched: false, reason: "nonce_not_found" });
+  } finally {
+    t.cleanup();
+    await server.close();
+  }
+});
+
+test("R19 deleted resolution session: census is missing, reconcile holds FAILED_HOLD, session preserved", async () => {
+  // The census is computed with the REAL driver over the pessimistic server, then
+  // fed through the real reconcile pass: a genuinely missing real session must be
+  // interpreted into explicit durable recovery, never a fabricated completion or
+  // a fabricated replacement session.
+  const server = await startPessimisticServer();
+  const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
+  const t = createTestDb();
+  resetRegistry();
+  const driver = new OpenCodeDriver({ http, db: t.db, registryDir: REGISTRY_DIR });
+  try {
+    const repo = seedRepository(t.db);
+    const wi = insertWorkItem(t.db, { id: "wi-census-loss", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    const ref = await driver.createRealSession("resolution", "/lost", {
+      repoId: repo.id,
+      directory: "/lost",
+      kind: "resolution",
+      workItemId: wi.id,
+    });
+    server.deleteSession(ref.sessionId);
+
+    const census = await classifySessionCensus(t.db, (id) => driver.getSessionStatus(id), new Date());
+    assert.equal(
+      census.find((entry) => entry.sessionId === ref.sessionId)?.classification,
+      "missing",
+      "a deleted real session classifies missing, never a fabricated completion",
+    );
+
+    const deps: ReconcileDeps = {
+      now: () => new Date(), openDb: () => t.db, closeDb: () => {},
+      verifyRepos: async () => [], probeResident: async () => {}, censusSessions: async () => census,
+      reconcileArtifacts: async () => ({ expiredLeases: 0, effects: 0, cleaned: [], retained: [] }),
+      scanDrift: async () => [],
+      housekeep: async () => ({ checked: 0, terminalMarked: 0, pruned: 0, issueIds: [], at: new Date().toISOString(), counters: { terminalMarked: 0, pruned: 0, lastAt: null }, lastAction: null }),
+      resumeNormalLoop: async () => ({ recovered: [], claimed: null }),
+    };
+    const report = await runReconcilePass({ config: CONFIG, logger: new JsonLogger(new CapturingSink().writeable()), db: t.db, deps });
+    assert.equal(report.phases.find((phase) => phase.phase === "P2")?.ok, true);
+
+    assert.equal(
+      getWorkItem(t.db, wi.id)?.state,
+      "FAILED_HOLD",
+      "the lost resolution session never leaves the WorkItem indefinitely dispatchable",
+    );
+    // The real session mapping is preserved; no fabricated replacement session.
+    assert.equal(t.db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM opencode_sessions")?.c, 1);
+    assert.equal(
+      t.db.sql.get<{ state: string }>("SELECT state FROM opencode_sessions WHERE id = ?", ref.sessionId)?.state,
+      "ACTIVE",
+    );
   } finally {
     t.cleanup();
     await server.close();

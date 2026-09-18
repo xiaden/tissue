@@ -321,3 +321,341 @@ test("jittered reconnect delay is bounded, capped, non-zero, and deterministic",
   assert.equal(reconnectDelayMs(10, 1000, 30_000, () => 1), 30_000);
   assert.ok(reconnectDelayMs(0, 1000, 30_000, () => 0) >= 1);
 });
+
+
+// ---------------------------------------------------------------------------
+// TASK-tissue-G Phase 6  reconcile -> daemon seam fail-closed gate
+// ---------------------------------------------------------------------------
+
+test("daemon: a failed resident census gates every prompt-dependent phase while OpenCode-independent work still runs", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db);
+    const sink = new CapturingSink();
+    const calls = { triage: 0, claim: 0, ensure: 0, relay: 0, poll: 0, ingest: 0, effects: 0 };
+    const spyIo = fakeIo({
+      logger: new JsonLogger(sink.writeable()),
+      pollRepository: async (repo) => {
+        calls.poll += 1;
+        return emptySnapshot(repo.id);
+      },
+      ingest: (database, snapshot) => {
+        calls.ingest += 1;
+        return ingestRepositorySnapshot(database, snapshot);
+      },
+      runTriage: async () => {
+        calls.triage += 1;
+        return { ran: true };
+      },
+      claimNext: () => {
+        calls.claim += 1;
+        return null;
+      },
+      ensureResolution: async () => {
+        calls.ensure += 1;
+        return null;
+      },
+      relay: async () => {
+        calls.relay += 1;
+        return { status: "no_pending" };
+      },
+      executeEffects: async () => {
+        calls.effects += 1;
+        return 0;
+      },
+    });
+
+    let reconciles = 0;
+    const report = await runDaemon({
+      config: CONFIG,
+      logger: new JsonLogger(sink.writeable()),
+      db,
+      reconcile: async () => {
+        reconciles += 1;
+        // A failed resident census: the seam must seed the gate from this value.
+        return { residentOpenCodeAvailable: false };
+      },
+      normalLoop: spyIo,
+      sleep: async () => {},
+      pollIntervalMs: 1,
+      maxIterations: 2,
+    });
+
+    assert.equal(reconciles, 1, "reconcile runs exactly once");
+    assert.equal(report.iterations, 2, "more than one iteration is exercised");
+    assert.equal(report.passes.length, 2);
+    assert.ok(report.passes.every((p) => p.gated === true), "the reconcile-seeded gate holds every pass");
+
+    assert.equal(calls.triage, 0, "no triage prompt while the dependency is unobservable");
+    assert.equal(calls.claim, 0, "no WorkItem claim while the dependency is unobservable");
+    assert.equal(calls.ensure, 0, "no resolution session ensure while the dependency is unobservable");
+    assert.equal(calls.relay, 0, "no relay prompt while the dependency is unobservable");
+
+    assert.ok(calls.poll >= 2, "polling still runs");
+    assert.ok(calls.ingest >= 2, "ingest still runs");
+    assert.ok(calls.effects >= 2, "effects still run");
+  } finally {
+    cleanup();
+  }
+});
+
+test("daemon: an injected health probe resumes prompt-dependent work on the next iteration without a restart", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db);
+    insertWorkItem(db, { id: "wi-seam", repo_id: REPO_ID, state: "RUNNING", base_branch: "main" });
+    const sink = new CapturingSink();
+    const logger = new JsonLogger(sink.writeable());
+    const calls = { triage: 0, claim: 0, ensure: 0, relay: 0 };
+
+    let claimSeq = 0;
+    const io = fakeIo({
+      logger,
+      runTriage: async () => {
+        calls.triage += 1;
+        return { ran: true };
+      },
+      claimNext: () => {
+        calls.claim += 1;
+        claimSeq += 1;
+        return claimSeq === 1
+          ? { workItemId: "wi-seam", repoId: REPO_ID, leaseToken: "lease-x", leaseUntil: "2026-09-10T00:05:00.000Z", priority: 0 }
+          : null;
+      },
+      ensureResolution: async () => {
+        calls.ensure += 1;
+        return null;
+      },
+      relay: async () => {
+        calls.relay += 1;
+        return { status: "no_pending" };
+      },
+    });
+
+    let healthCalls = 0;
+    const report = await runDaemon({
+      config: CONFIG,
+      logger,
+      db,
+      reconcile: async () => ({ residentOpenCodeAvailable: false }),
+      checkResidentHealth: async () => {
+        healthCalls += 1;
+        return healthCalls > 1;
+      },
+      normalLoop: io,
+      sleep: async () => {},
+      pollIntervalMs: 1,
+      maxIterations: 3,
+    });
+
+    assert.equal(healthCalls, 3, "the probe is re-evaluated every iteration");
+    assert.equal(report.iterations, 3, "a single runDaemon call, no restart");
+    assert.equal(report.passes.length, 3);
+    assert.equal(report.passes[0]!.gated, true, "iteration 1 is gated");
+    assert.equal(report.passes[1]!.gated, false, "iteration 2 resumes as soon as the probe reports healthy");
+    assert.equal(report.passes[2]!.gated, false);
+
+    assert.equal(calls.triage, 2, "triage ran on the two healthy iterations only");
+    assert.ok(calls.claim >= 1, "claim ran after health was restored");
+    assert.equal(calls.ensure, 1, "ensure-resolution ran after health was restored");
+    assert.ok(calls.relay >= 1, "relay ran after health was restored");
+
+    const gated = sink.records().filter((r) => r.event === "daemon.dependency_gated");
+    assert.equal(gated.length, 1, "exactly one gate warning for the single gated pass");
+    assert.equal(gated[0]!.lvl, "warn");
+    assert.equal(gated[0]!.reason, "opencode_unavailable");
+  } finally {
+    cleanup();
+  }
+});
+
+test("normal loop back-compat: an absent health signal is not gated and an explicit healthy signal runs today's phases", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db);
+    insertWorkItem(db, { id: "wi-compat", repo_id: REPO_ID, state: "RUNNING", base_branch: "main" });
+
+    // 3-arg call (legacy direct callers): undefined health is NOT gated.
+    const legacyCalls = { triage: 0, claim: 0, relay: 0 };
+    const legacy = fakeIo({
+      runTriage: async () => {
+        legacyCalls.triage += 1;
+        return { ran: true };
+      },
+      claimNext: () => {
+        legacyCalls.claim += 1;
+        return null;
+      },
+      relay: async () => {
+        legacyCalls.relay += 1;
+        return { status: "no_pending" };
+      },
+    });
+    const legacySummary = await runNormalLoopPass(db, CONFIG, legacy);
+    assert.equal(legacySummary.gated, false, "undefined health preserves prior behavior");
+    assert.equal(legacySummary.gateReason, undefined);
+    assert.equal(legacyCalls.triage, 1);
+    assert.ok(legacyCalls.claim >= 1);
+    assert.ok(legacyCalls.relay >= 1);
+
+    // 4-arg call with an explicit healthy signal: prompt phases run as today.
+    const healthyCalls = { triage: 0, claim: 0, relay: 0 };
+    const healthy = fakeIo({
+      runTriage: async () => {
+        healthyCalls.triage += 1;
+        return { ran: true };
+      },
+      claimNext: () => {
+        healthyCalls.claim += 1;
+        return null;
+      },
+      relay: async () => {
+        healthyCalls.relay += 1;
+        return { status: "no_pending" };
+      },
+    });
+    const healthySummary = await runNormalLoopPass(db, CONFIG, healthy, { openCodeAvailable: true });
+    assert.equal(healthySummary.gated, false);
+    assert.equal(healthySummary.gateReason, undefined);
+    assert.equal(healthyCalls.triage, 1);
+    assert.ok(healthyCalls.claim >= 1);
+    assert.ok(healthyCalls.relay >= 1);
+  } finally {
+    cleanup();
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// TASK-tissue-G QA round 2  health-probe fail-closed + gate-vs-promotion seam
+// ---------------------------------------------------------------------------
+
+test("daemon: a rejecting health probe fails closed and never crashes the loop", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db);
+    const sink = new CapturingSink();
+    const calls = { triage: 0, claim: 0, ensure: 0, relay: 0, poll: 0, ingest: 0, effects: 0 };
+    const spyIo = fakeIo({
+      logger: new JsonLogger(sink.writeable()),
+      pollRepository: async (repo) => {
+        calls.poll += 1;
+        return emptySnapshot(repo.id);
+      },
+      ingest: (database, snapshot) => {
+        calls.ingest += 1;
+        return ingestRepositorySnapshot(database, snapshot);
+      },
+      runTriage: async () => {
+        calls.triage += 1;
+        return { ran: true };
+      },
+      claimNext: () => {
+        calls.claim += 1;
+        return null;
+      },
+      ensureResolution: async () => {
+        calls.ensure += 1;
+        return null;
+      },
+      relay: async () => {
+        calls.relay += 1;
+        return { status: "no_pending" };
+      },
+      executeEffects: async () => {
+        calls.effects += 1;
+        return 0;
+      },
+    });
+
+    const report = await runDaemon({
+      config: CONFIG,
+      logger: new JsonLogger(sink.writeable()),
+      db,
+      // Healthy seed, but the per-iteration probe rejects and must override it.
+      reconcile: async () => ({ residentOpenCodeAvailable: true }),
+      checkResidentHealth: async () => {
+        throw new Error("resident unreachable");
+      },
+      normalLoop: spyIo,
+      sleep: async () => {},
+      pollIntervalMs: 1,
+      maxIterations: 2,
+    });
+
+    assert.equal(report.iterations, 2, "the loop resolves and survives the rejected probe");
+    assert.equal(report.passes.length, 2);
+    assert.ok(report.passes.every((p) => p.gated === true), "the rejection overrides the healthy seed");
+
+    assert.equal(calls.triage, 0, "no triage prompt while the dependency is unobservable");
+    assert.equal(calls.claim, 0, "no WorkItem claim while the dependency is unobservable");
+    assert.equal(calls.ensure, 0, "no resolution session ensure while the dependency is unobservable");
+    assert.equal(calls.relay, 0, "no relay prompt while the dependency is unobservable");
+
+    assert.ok(calls.poll >= 2, "polling still runs");
+    assert.ok(calls.ingest >= 2, "ingest still runs");
+    assert.ok(calls.effects >= 2, "effects still run");
+
+    const gated = sink.records().filter((r) => r.event === "daemon.dependency_gated");
+    assert.equal(gated.length, 2, "one gate warning per gated pass");
+    assert.ok(gated.every((r) => r.lvl === "warn"));
+    assert.ok(gated.every((r) => r.reason === "opencode_unavailable"));
+  } finally {
+    cleanup();
+  }
+});
+
+test("daemon: a gated pass still promotes READY->QUEUED and reports the gate reason", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db);
+    insertWorkItem(db, { id: "wi-gated", repo_id: REPO_ID, state: "READY", base_branch: "main" });
+    const sink = new CapturingSink();
+    const calls = { triage: 0, claim: 0, ensure: 0, relay: 0 };
+    const spyIo = fakeIo({
+      logger: new JsonLogger(sink.writeable()),
+      runTriage: async () => {
+        calls.triage += 1;
+        return { ran: true };
+      },
+      claimNext: () => {
+        calls.claim += 1;
+        return null;
+      },
+      ensureResolution: async () => {
+        calls.ensure += 1;
+        return null;
+      },
+      relay: async () => {
+        calls.relay += 1;
+        return { status: "no_pending" };
+      },
+    });
+
+    const report = await runDaemon({
+      config: CONFIG,
+      logger: new JsonLogger(sink.writeable()),
+      db,
+      reconcile: async () => ({ residentOpenCodeAvailable: false }),
+      normalLoop: spyIo,
+      sleep: async () => {},
+      pollIntervalMs: 1,
+      maxIterations: 1,
+    });
+
+    assert.equal(report.passes.length, 1);
+    assert.equal(report.passes[0]!.gated, true);
+    assert.equal(report.passes[0]!.gateReason, "opencode_unavailable");
+    assert.equal(report.passes[0]!.promoted, 1, "promotion is outside the gate");
+
+    const state = db.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = 'wi-gated'")?.state;
+    assert.equal(state, "QUEUED", "the gated pass still promoted the READY WorkItem");
+
+    assert.equal(calls.triage, 0, "no triage prompt while the dependency is unobservable");
+    assert.equal(calls.claim, 0, "no WorkItem claim while the dependency is unobservable");
+    assert.equal(calls.ensure, 0, "no resolution session ensure while the dependency is unobservable");
+    assert.equal(calls.relay, 0, "no relay prompt while the dependency is unobservable");
+  } finally {
+    cleanup();
+  }
+});

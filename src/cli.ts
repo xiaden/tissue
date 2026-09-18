@@ -170,6 +170,7 @@ const hDaemon: Handler = async (ctx) => {
       logger,
       db,
       reconcile: assembly.reconcile,
+      checkResidentHealth: assembly.checkResidentHealth,
       normalLoop: assembly.normalLoop,
       wakeHint,
       sleep,

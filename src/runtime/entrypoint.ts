@@ -117,6 +117,12 @@ export interface ProductionAssembly {
   transport: OpenCodeHttp;
   normalLoop: NormalLoopIo;
   reconcile: () => Promise<ReconcileReport>;
+  /**
+   * Fail-closed resident-dependency probe over the same authenticated transport
+   * the daemon already uses. Returns false (never throws) when the resident
+   * service is unreachable; credentials are never logged.
+   */
+  checkResidentHealth(): Promise<boolean>;
   /** Credential-free endpoint label (scheme://host:port) for status/logs. */
   endpoint: string;
   agentDefinitions: AgentDefinitionStatus;
@@ -212,9 +218,12 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
    const expectedSha256 = plugin.expectedSha256 ?? "";
    const managedGate = opts.managedGate ?? (() => verifyModerationPluginLoaded({ moderationDir, pluginsDir: plugin.pluginsDir, expectedSha256 }));
    const gate = managedGate();
-   if (!gate.loaded) opts.logger.warn("moderation.plugin_not_verified", { reason: gate.reason, deployedSha256: plugin.sha256 });
+    if (!gate.loaded) opts.logger.warn("moderation.plugin_not_verified", { reason: gate.reason, deployedSha256: plugin.sha256 });
+    // Preserve the main-branch issue fix: assembly startup performs one authenticated
+    // resident-health request before exposing the production driver.
+    await transport.http.sessionStatus();
 
-   const http = transport.http;
+    const http = transport.http;
    const gh = opts.gh ?? new GhClient();
 
   const triage = opts.config.agents.triage;
@@ -251,6 +260,15 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
       driver,
       gh,
     }),
+    checkResidentHealth: async () => {
+      try {
+        await http.sessionStatus();
+        return true;
+      } catch {
+        // Unreachable resident service is unhealthy; never surface credentials.
+        return false;
+      }
+    },
   };
 }
 
@@ -334,6 +352,7 @@ export async function runProductionDaemon(seams: ProductionDaemonSeams = {}): Pr
       logger,
       db,
       reconcile: assembly.reconcile,
+      checkResidentHealth: assembly.checkResidentHealth,
       normalLoop: assembly.normalLoop,
       wakeHint,
       sleep: defaultSleep,
