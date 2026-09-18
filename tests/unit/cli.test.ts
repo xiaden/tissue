@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { COMMANDS, lookupCommand } from "../../src/cli.ts";
-import { installAgentDefinitions } from "../../src/runtime/resident.ts";
+import { installAgentDefinitions, installModerationPlugin } from "../../src/runtime/resident.ts";
 import { startPessimisticServer } from "../helpers/pessimistic-opencode-server.ts";
 
 const execFileP = promisify(execFile);
@@ -43,6 +43,7 @@ const EXPECTED_COMMANDS = [
   "unpause",
   "cleanup",
   "install-agents",
+  "install-plugin",
   "doctor",
   "smoke",
 ];
@@ -57,6 +58,8 @@ function configPath(): string {
 }
 
 let agentsDir: string | undefined;
+let pluginDir: string | undefined;
+let moderationDir: string | undefined;
 /**
  * A real deployment of the checked-in dedicated Tissue agents. Production
  * validates the DEPLOYED definitions in the OpenCode global agent dir, so a test
@@ -96,6 +99,8 @@ function registryFixtureEnv(): Record<string, string> {
 after(() => {
   if (cfgDir) rmSync(cfgDir, { recursive: true, force: true });
   if (agentsDir) rmSync(agentsDir, { recursive: true, force: true });
+  if (pluginDir) rmSync(pluginDir, { recursive: true, force: true });
+  if (moderationDir) rmSync(moderationDir, { recursive: true, force: true });
   if (registryRoot) rmSync(registryRoot, { recursive: true, force: true });
 });
 
@@ -240,7 +245,12 @@ test("install-agents deploys the dedicated agents idempotently", async () => {
 });
 
 test("doctor runs environment self-checks", async () => {
-  const r = await runCli(["doctor"], { TISSUE_CONFIG: configPath(), TISSUE_OPENCODE_AGENTS_DIR: deployedAgentsDir(), ...registryFixtureEnv() });
+  pluginDir = mkdtempSync(join(tmpdir(), "tissue-cli-plugin-"));
+  moderationDir = mkdtempSync(join(tmpdir(), "tissue-cli-moderation-"));
+  const deployment = installModerationPlugin({ pluginsDir: pluginDir, sourceDir: join(ROOT, "plugin"), moderationDir, restartEpoch: 6_000 });
+  assert.equal(deployment.ok, true, deployment.errors.join("; "));
+  writeFileSync(join(moderationDir, "plugin-loaded.json"), JSON.stringify({ kind: "loaded", pluginSha256: deployment.deployedSha256, serverStartedAt: 6_001 }));
+  const r = await runCli(["doctor"], { TISSUE_CONFIG: configPath(), TISSUE_OPENCODE_AGENTS_DIR: deployedAgentsDir(), TISSUE_OPENCODE_PLUGINS_DIR: pluginDir, TISSUE_MODERATION_DIR: moderationDir, ...registryFixtureEnv() });
   assert.equal(r.code, 0, r.stdout);
   const report = JSON.parse(r.stdout.split("\n").find((line) => line.startsWith("{")) ?? "{}") as { ok: boolean; database: { wal: boolean }; agents: { ok: boolean; agentsDir: string }; registry: { dir: string; mountAsserted: boolean; overridden: boolean; markerCount: number } };
   assert.equal(report.database.wal, true);

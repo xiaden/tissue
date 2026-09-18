@@ -24,7 +24,7 @@ import { recordTransition } from "../domain/transitions.ts";
 import { enqueueIssue } from "./enqueue.ts";
 import { unpauseTriage } from "./triage.ts";
 import { cleanupWorktree, type WorktreeIdentity } from "./worktrees.ts";
-import { redactResidentEndpoint, resolveSourceAgentsDir, validateTissueAgentDefinitions } from "../runtime/resident.ts";
+import { redactResidentEndpoint, resolveSourceAgentsDir, validateTissueAgentDefinitions, validateModerationPlugin, verifyModerationPluginLoaded } from "../runtime/resident.ts";
 import { assertRegistryMount, listMarkerSessionIds, resolveSessionRegistryDir } from "./session-registry.ts";
 import type { TissueConfig } from "../config/types.ts";
 import type { JsonLogger } from "../logging/jsonl.ts";
@@ -99,6 +99,7 @@ export interface RegistryOpsOptions {
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
   /** Mount-table path forwarded to `assertRegistryMount`; defaults to `/proc/self/mountinfo`. */
   mountInfoPath?: string;
+  pluginsDir?: string;
 }
 
 /** Env override for the mount-table path (container-free doctor/status tests). */
@@ -166,8 +167,9 @@ export function statusOperation(ctx: OpsContext, opts?: RegistryOpsOptions): Rec
       transitions: listRecentTransitions(db, 100),
       repositories: summary.repositories,
       repositoryReadiness: repositoryReadiness(db),
-      opencode: opencodeStatus(),
-      registry: registryView(db, opts),
+       opencode: opencodeStatus(),
+       plugin: pluginView(opts),
+       registry: registryView(db, opts),
       gh: { binary: "/usr/bin/gh", authenticated: null, version: null, capability: "not_probed" },
     };
   });
@@ -269,16 +271,30 @@ export async function cleanupOperation(ctx: OpsContext, workItemId: string): Pro
   } finally { closeDb(db); }
 }
 
+function pluginView(opts?: RegistryOpsOptions): Record<string, unknown> {
+  const validation = validateModerationPlugin(opts?.pluginsDir !== undefined ? { pluginsDir: opts.pluginsDir } : {});
+  const moderationDir = process.env.TISSUE_MODERATION_DIR ?? "/tissue-moderation";
+  const loaded = validation.expectedSha256 !== null
+    ? verifyModerationPluginLoaded({ moderationDir, pluginsDir: validation.pluginsDir, expectedSha256: validation.expectedSha256 })
+    : { loaded: false, reason: "checked-in plugin is missing or unreadable" };
+  return { loaded: loaded.loaded, reason: loaded.reason, deployedSha256: validation.sha256, beacon: loaded.beacon };
+}
+
 export function doctorOperation(ctx: OpsContext, opts?: RegistryOpsOptions): Record<string, unknown> {
   // Fail closed: validate the DEPLOYED definitions the resident service reads, and
   // compare them against the checked-in source so a stale deployment is reported.
   const agents = validateTissueAgentDefinitions({ sourceDir: resolveSourceAgentsDir() });
+  const plugin = opts?.pluginsDir !== undefined ? validateModerationPlugin({ pluginsDir: opts.pluginsDir }) : validateModerationPlugin();
+  const moderationDir = process.env.TISSUE_MODERATION_DIR ?? "/tissue-moderation";
+  const pluginLoaded = plugin.expectedSha256 !== null
+    ? verifyModerationPluginLoaded({ moderationDir, pluginsDir: plugin.pluginsDir, expectedSha256: plugin.expectedSha256 })
+    : { loaded: false, reason: "checked-in plugin is missing or unreadable" };
   return withDb(ctx, (db) => {
     const registry = registryView(db, opts);
     return {
       // The registry mount assertion is the compensating control for the plugin's
       // deliberate fail-open, so a failed assertion is a doctor failure (L11/L13).
-      ok: agents.ok && registry.mountAsserted,
+      ok: agents.ok && plugin.ok && pluginLoaded.loaded && registry.mountAsserted,
       database: { path: db.path, wal: true },
       repositories: ctx.config.repos.map((r) => {
         const id = `${r.owner}/${r.name}`;
@@ -293,6 +309,8 @@ export function doctorOperation(ctx: OpsContext, opts?: RegistryOpsOptions): Rec
       }),
       stateDir: ctx.stateDir,
       agents,
+      plugin: { loaded: pluginLoaded.loaded, reason: pluginLoaded.reason, deployedSha256: plugin.sha256, beacon: pluginLoaded.beacon },
+      fired: { attested: false },
       registry,
       opencode: opencodeStatus(),
     };

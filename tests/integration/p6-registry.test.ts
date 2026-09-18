@@ -53,7 +53,7 @@ import { closeDb, openTissueDb, type TissueDb } from "../../src/db/open.ts";
 import { insertSession, listSessions } from "../../src/db/repositories.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
 import { doctorOperation, statusOperation } from "../../src/controller/ops.ts";
-import { installAgentDefinitions } from "../../src/runtime/resident.ts";
+import { installAgentDefinitions, installModerationPlugin } from "../../src/runtime/resident.ts";
 import {
   createProductionAssembly,
   runProductionDaemonEntrypoint,
@@ -585,8 +585,12 @@ test("P3-S2/S3 doctor fails closed and both doctor/status expose the registry mo
   const mountInfo = join(root, "mountinfo");
   const stateDir = join(root, "state");
   const agentsDir = join(root, "agents");
+  const pluginsDir = join(root, "plugins");
+  const moderationDir = join(root, "moderation");
   mkdirSync(registryDir, { recursive: true });
   mkdirSync(stateDir, { recursive: true });
+  mkdirSync(pluginsDir, { recursive: true });
+  mkdirSync(moderationDir, { recursive: true });
   const config: TissueConfig = {
     pollIntervalSeconds: 60,
     maxConcurrentGlobal: 3,
@@ -595,10 +599,21 @@ test("P3-S2/S3 doctor fails closed and both doctor/status expose the registry mo
     repos: [],
   };
   const priorAgentsDir = process.env.TISSUE_OPENCODE_AGENTS_DIR;
+  const priorPluginsDir = process.env.TISSUE_OPENCODE_PLUGINS_DIR;
+  const priorModerationDir = process.env.TISSUE_MODERATION_DIR;
   process.env.TISSUE_OPENCODE_AGENTS_DIR = agentsDir;
+  process.env.TISSUE_OPENCODE_PLUGINS_DIR = pluginsDir;
+  process.env.TISSUE_MODERATION_DIR = moderationDir;
   try {
     const install = installAgentDefinitions({ targetDir: agentsDir });
     assert.equal(install.ok, true, install.errors.join("; "));
+    const pluginInstall = installModerationPlugin({ pluginsDir, moderationDir, restartEpoch: 1_000 });
+    assert.equal(pluginInstall.ok, true, pluginInstall.errors.join("; "));
+    assert.equal(typeof pluginInstall.deployedSha256, "string");
+    writeFileSync(
+      join(moderationDir, "plugin-loaded.json"),
+      JSON.stringify({ kind: "loaded", pluginSha256: pluginInstall.deployedSha256, serverStartedAt: 1_001 }),
+    );
 
     // One retained DB session and two markers: exactly one marker is a prune
     // candidate (no DB row), matching the startup prune set.
@@ -648,6 +663,10 @@ test("P3-S2/S3 doctor fails closed and both doctor/status expose the registry mo
   } finally {
     if (priorAgentsDir === undefined) delete process.env.TISSUE_OPENCODE_AGENTS_DIR;
     else process.env.TISSUE_OPENCODE_AGENTS_DIR = priorAgentsDir;
+    if (priorPluginsDir === undefined) delete process.env.TISSUE_OPENCODE_PLUGINS_DIR;
+    else process.env.TISSUE_OPENCODE_PLUGINS_DIR = priorPluginsDir;
+    if (priorModerationDir === undefined) delete process.env.TISSUE_MODERATION_DIR;
+    else process.env.TISSUE_MODERATION_DIR = priorModerationDir;
     rmSync(root, { recursive: true, force: true });
   }
 });

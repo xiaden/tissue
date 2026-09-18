@@ -24,7 +24,7 @@
 
 import { createHash } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
@@ -555,6 +555,144 @@ export function validateTissueAgentDefinitions(opts: AgentValidationOptions = {}
     agents: [triage.status, resolution.status],
     errors,
   };
+}
+
+// ---- moderation plugin deployment ----------------------------------------------
+
+const MODERATION_PLUGIN_FILE = "tissue-moderation.ts";
+const MODERATION_BEACON_FILE = "plugin-loaded.json";
+const MODERATION_DEPLOY_RECORD = "deploy-record.json";
+
+export interface PluginValidationStatus {
+  ok: boolean;
+  pluginsDir: string;
+  sourceDir: string;
+  file: string;
+  present: boolean;
+  sha256: string | null;
+  expectedSha256: string | null;
+  errors: string[];
+}
+
+export interface PluginInstallStatus {
+  ok: boolean;
+  sourceDir: string;
+  targetDir: string;
+  deployedSha256: string | null;
+  action?: "installed" | "unchanged" | "exists-divergent";
+  freshProcessResolution?: "plan-O-container-venue";
+  dbOpened: number;
+  reconciled: boolean;
+  errors: string[];
+}
+
+export interface PluginLoadBeacon {
+  kind: "loaded";
+  pluginSha256: string;
+  serverStartedAt: number;
+}
+
+function resolvePluginSourceDir(sourceDir?: string): string {
+  return resolve(sourceDir ?? resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "plugin"));
+}
+
+/** Resolve the resident global plugin directory; deployment is host-side, while Tissue is read-only. */
+export function resolveOpenCodeGlobalPluginsDir(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = (env.TISSUE_OPENCODE_PLUGINS_DIR ?? "").trim();
+  if (explicit.length > 0) {
+    if (!isAbsolute(explicit)) throw new ResidentEndpointError("TISSUE_OPENCODE_PLUGINS_DIR must be an absolute path");
+    return resolve(explicit);
+  }
+  const xdg = (env.XDG_CONFIG_HOME ?? "").trim();
+  if (xdg.length > 0 && isAbsolute(xdg)) return join(resolve(xdg), "opencode", "plugins");
+  const home = (env.HOME ?? "").trim();
+  if (home.length > 0 && isAbsolute(home)) return join(resolve(home), ".config", "opencode", "plugins");
+  throw new ResidentEndpointError("cannot resolve the OpenCode global plugin directory: set TISSUE_OPENCODE_PLUGINS_DIR or HOME/XDG_CONFIG_HOME");
+}
+
+/** Validate only the Tissue-owned global plugin; sibling plugins are deliberately ignored. */
+export function validateModerationPlugin(opts: { pluginsDir?: string; sourceDir?: string } = {}): PluginValidationStatus {
+  const pluginsDir = resolve(opts.pluginsDir ?? resolveOpenCodeGlobalPluginsDir());
+  const sourceDir = resolvePluginSourceDir(opts.sourceDir);
+  const file = resolve(pluginsDir, MODERATION_PLUGIN_FILE);
+  const sourceFile = resolve(sourceDir, MODERATION_PLUGIN_FILE);
+  const errors: string[] = [];
+  const present = existsSync(file);
+  const sourceText = (() => { try { return readFileSync(sourceFile, "utf8"); } catch { return null; } })();
+  const deployedText = (() => { try { return readFileSync(file, "utf8"); } catch { return null; } })();
+  const expectedSha256 = sourceText === null ? null : createHash("sha256").update(sourceText).digest("hex");
+  const sha256 = deployedText === null ? null : createHash("sha256").update(deployedText).digest("hex");
+  if (sourceText === null) errors.push(`${sourceFile}: checked-in plugin is missing or unreadable`);
+  if (!present) errors.push(`${file}: missing deployed moderation plugin`);
+  if (deployedText !== null) {
+    if (!/^\s*export\s+(?:async\s+)?(?:function|const|class)\s+TissueModeration\b/m.test(deployedText)) errors.push(`${file}: expected named TissueModeration export`);
+    if (/^\s*import\s/m.test(deployedText) || /\brequire\s*\(/.test(deployedText)) errors.push(`${file}: runtime imports are not permitted`);
+  }
+  if (expectedSha256 !== null && sha256 !== expectedSha256) errors.push(`${file}: deployed plugin has drifted from checked-in source`);
+  return { ok: errors.length === 0, pluginsDir, sourceDir, file, present, sha256, expectedSha256, errors };
+}
+
+/** Host-side deploy principal writes the plugin; the long-running Tissue service mounts it read-only. */
+export function installModerationPlugin(opts: { pluginsDir?: string; sourceDir?: string; force?: boolean; moderationDir?: string; restartEpoch?: number } = {}): PluginInstallStatus {
+  const sourceDir = resolvePluginSourceDir(opts.sourceDir);
+  const targetDir = resolve(opts.pluginsDir ?? resolveOpenCodeGlobalPluginsDir());
+  const file = resolve(targetDir, MODERATION_PLUGIN_FILE);
+  const sourceFile = resolve(sourceDir, MODERATION_PLUGIN_FILE);
+  const errors: string[] = [];
+  let source: Buffer;
+  try { source = readFileSync(sourceFile); } catch (err) { return { ok: false, sourceDir, targetDir, deployedSha256: null, dbOpened: 0, reconciled: false, errors: [`cannot read ${sourceFile} (${(err as Error).message})`] }; }
+  const deployedSha256 = createHash("sha256").update(source).digest("hex");
+  try {
+    if (!existsSync(dirname(targetDir))) return { ok: false, sourceDir, targetDir, deployedSha256, dbOpened: 0, reconciled: false, errors: [`cannot access parent of ${targetDir}`] };
+    if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true, mode: 0o755 });
+  } catch (err) { return { ok: false, sourceDir, targetDir, deployedSha256, dbOpened: 0, reconciled: false, errors: [`cannot create ${targetDir} (${(err as Error).message})`] }; }
+  if (!existsSync(targetDir)) return { ok: false, sourceDir, targetDir, deployedSha256, dbOpened: 0, reconciled: false, errors: [`cannot access ${targetDir}`] };
+  let action: PluginInstallStatus["action"];
+  if (existsSync(file)) {
+    if (readFileSync(file).equals(source)) action = "unchanged";
+    else if (!opts.force) { return { ok: false, sourceDir, targetDir, deployedSha256, action: "exists-divergent", dbOpened: 0, reconciled: false, errors: [`${file}: differs from ${sourceFile}; re-run with --force to overwrite`] }; }
+    else action = "installed";
+  } else action = "installed";
+  try {
+    if (action === "installed") writeFileSync(file, source, { mode: statSync(sourceFile).mode & 0o777 });
+    const moderationSetting = opts.moderationDir ?? process.env.TISSUE_MODERATION_DIR;
+    if (moderationSetting !== undefined) {
+      const moderationDir = resolve(moderationSetting);
+      mkdirSync(moderationDir, { recursive: true, mode: 0o755 });
+      writeFileSync(resolve(moderationDir, MODERATION_DEPLOY_RECORD), JSON.stringify({ deployedSha256, restartEpoch: opts.restartEpoch ?? Date.now(), deployedAt: new Date().toISOString(), pluginVersion: "1.0.0" }));
+    }
+  } catch (err) { errors.push(`${file}: cannot write deployment (${(err as Error).message})`); }
+  return { ok: errors.length === 0, sourceDir, targetDir, deployedSha256, action, freshProcessResolution: "plan-O-container-venue", dbOpened: 0, reconciled: false, errors };
+}
+
+export function readPluginLoadBeacon(moderationDir: string): PluginLoadBeacon | null {
+  try {
+    const value = JSON.parse(readFileSync(resolve(moderationDir, MODERATION_BEACON_FILE), "utf8")) as Record<string, unknown>;
+    if (value.kind !== "loaded" || typeof value.pluginSha256 !== "string" || typeof value.serverStartedAt !== "number" || !Number.isFinite(value.serverStartedAt)) return null;
+    return { kind: "loaded", pluginSha256: value.pluginSha256, serverStartedAt: value.serverStartedAt };
+  } catch { return null; }
+}
+
+export function verifyModerationPluginLoaded(opts: { moderationDir: string; pluginsDir: string; expectedSha256: string }): { loaded: boolean; reason: string; beacon?: PluginLoadBeacon } {
+  try { if (!statSync(opts.pluginsDir).isDirectory()) return { loaded: false, reason: "plugin directory is not a readable mount" }; } catch { return { loaded: false, reason: "plugin directory is not a readable mount" }; }
+  const deployedPlugin = resolve(opts.pluginsDir, MODERATION_PLUGIN_FILE);
+  let deployedSha256: string;
+  try {
+    if (!statSync(deployedPlugin).isFile()) return { loaded: false, reason: "deployed moderation plugin is missing or unreadable" };
+    deployedSha256 = createHash("sha256").update(readFileSync(deployedPlugin)).digest("hex");
+  } catch { return { loaded: false, reason: "deployed moderation plugin is missing or unreadable" }; }
+  if (deployedSha256 !== opts.expectedSha256) return { loaded: false, reason: "deployed moderation plugin SHA does not match expected plugin" };
+  const beacon = readPluginLoadBeacon(opts.moderationDir);
+  if (beacon === null) return { loaded: false, reason: "load beacon is missing or unparseable" };
+  let record: { deployedSha256?: unknown; restartEpoch?: unknown };
+  try { record = JSON.parse(readFileSync(resolve(opts.moderationDir, MODERATION_DEPLOY_RECORD), "utf8")) as { deployedSha256?: unknown; restartEpoch?: unknown }; } catch { return { loaded: false, reason: "deploy record is missing or unparseable", beacon }; }
+  if (record.deployedSha256 !== opts.expectedSha256 || beacon.pluginSha256 !== record.deployedSha256 || deployedSha256 !== record.deployedSha256) return { loaded: false, reason: "plugin SHA does not match deployed record", beacon };
+  if (typeof record.restartEpoch !== "number" || beacon.serverStartedAt < record.restartEpoch) return { loaded: false, reason: "load beacon predates deployment restart epoch", beacon };
+  return { loaded: true, reason: "plugin loaded after deployment", beacon };
+}
+
+export function clearPluginLoadBeacon(moderationDir: string): boolean {
+  try { unlinkSync(resolve(moderationDir, MODERATION_BEACON_FILE)); return true; } catch { return false; }
 }
 
 // ---- agent deployment ----------------------------------------------------------

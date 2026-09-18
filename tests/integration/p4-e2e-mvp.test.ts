@@ -24,12 +24,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import type { RepositoryConfig, TissueConfig } from "../../src/config/types.ts";
 import { createProductionAssembly } from "../../src/runtime/entrypoint.ts";
-import { installAgentDefinitions } from "../../src/runtime/resident.ts";
+import { installAgentDefinitions, installModerationPlugin } from "../../src/runtime/resident.ts";
 import { runNormalLoopPass } from "../../src/runtime/daemon.ts";
 import {
   getActiveResolutionSession,
@@ -107,12 +108,16 @@ function productionConfig(repo: RepositoryConfig): TissueConfig {
 }
 
 test("same-repository E2E: config + empty DB, same session, false autoMerge no-merge, external adoption, cleanup", async () => {
-  const temp = await createTempRepo();
-  const tissue = createTestDb();
-  const server = await startPessimisticServer({ username: "tissue", password: "s3cret" });
+  let temp: Awaited<ReturnType<typeof createTempRepo>> | undefined;
+  let tissue: ReturnType<typeof createTestDb> | undefined;
+  let server: Awaited<ReturnType<typeof startPessimisticServer>> | undefined;
   const logs = new CapturingSink();
   const logger = new JsonLogger(logs.writeable());
-  const stateRoot = join(process.cwd(), ".tissue", `e2e-mvp-${process.pid}-${Date.now()}`);
+  let stateRoot: string | undefined;
+  let pluginDir: string | undefined;
+  let moderationDir: string | undefined;
+  const priorModerationDir = process.env.TISSUE_MODERATION_DIR;
+  const priorStateDir = process.env.TISSUE_STATE_DIR;
   let clock = T0;
 
   const REPO_ID = "xiaden/nomarr";
@@ -139,11 +144,22 @@ test("same-repository E2E: config + empty DB, same session, false autoMerge no-m
     prChecks: { [`${REPO_ID}#101`]: [{ name: "ci", status: "IN_PROGRESS", conclusion: "PENDING" }] },
     prReviews: { [`${REPO_ID}#101`]: [] },
   };
-  const fake = writeFakeGh(scenario);
-  const priorStateDir = process.env.TISSUE_STATE_DIR;
-  process.env.TISSUE_STATE_DIR = stateRoot;
+  let fake: ReturnType<typeof writeFakeGh> | undefined;
 
   try {
+    temp = await createTempRepo();
+    tissue = createTestDb();
+    server = await startPessimisticServer({ username: "tissue", password: "s3cret" });
+    stateRoot = join(process.cwd(), ".tissue", `e2e-mvp-${process.pid}-${Date.now()}`);
+    pluginDir = mkdtempSync(join(tmpdir(), "tissue-p4-e2e-plugin-"));
+    moderationDir = mkdtempSync(join(tmpdir(), "tissue-p4-e2e-moderation-"));
+    const pluginInstall = installModerationPlugin({ pluginsDir: pluginDir, moderationDir, restartEpoch: T0 });
+    assert.equal(pluginInstall.ok, true, pluginInstall.errors.join("; "));
+    writeFileSync(join(moderationDir, "plugin-loaded.json"), JSON.stringify({ kind: "loaded", pluginSha256: pluginInstall.deployedSha256, serverStartedAt: T0 + 1 }));
+    process.env.TISSUE_MODERATION_DIR = moderationDir;
+    fake = writeFakeGh(scenario);
+    process.env.TISSUE_STATE_DIR = stateRoot;
+
     await declareGithubRemote(temp.clone, temp.bare, REPO_ID);
 
     const repo: RepositoryConfig = {
@@ -179,8 +195,9 @@ test("same-repository E2E: config + empty DB, same session, false autoMerge no-m
       stateDir: stateRoot,
       endpoint: server.baseUrl(),
       credentials: { username: "tissue", password: "s3cret" },
-      agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
-      registryDir,
+       agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
+       pluginsDir: pluginDir,
+       registryDir,
       gh: new GhClient({ binary: fake.binary }),
       now: () => new Date(clock),
     });
@@ -362,22 +379,31 @@ test("same-repository E2E: config + empty DB, same session, false autoMerge no-m
   } finally {
     if (priorStateDir === undefined) delete process.env.TISSUE_STATE_DIR;
     else process.env.TISSUE_STATE_DIR = priorStateDir;
-    rmSync(stateRoot, { recursive: true, force: true });
-    await server.close();
-    fake.cleanup();
-    tissue.cleanup();
-    await temp.cleanup();
+    if (priorModerationDir === undefined) delete process.env.TISSUE_MODERATION_DIR;
+    else process.env.TISSUE_MODERATION_DIR = priorModerationDir;
+    if (stateRoot) rmSync(stateRoot, { recursive: true, force: true });
+    if (pluginDir) rmSync(pluginDir, { recursive: true, force: true });
+    if (moderationDir) rmSync(moderationDir, { recursive: true, force: true });
+    if (server) await server.close();
+    if (fake) fake.cleanup();
+    if (tissue) tissue.cleanup();
+    if (temp) await temp.cleanup();
   }
 });
 
 test("target/fork E2E: target coaxk/subarr, writable xiaden/subarr via pushRemote, identity + rogue drift", async () => {
-  const temp = await createTempRepo();
-  const tissue = createTestDb();
-  const server = await startPessimisticServer({ username: "tissue", password: "s3cret" });
+  let temp: Awaited<ReturnType<typeof createTempRepo>> | undefined;
+  let tissue: ReturnType<typeof createTestDb> | undefined;
+  let server: Awaited<ReturnType<typeof startPessimisticServer>> | undefined;
   const logs = new CapturingSink();
   const logger = new JsonLogger(logs.writeable());
-  const stateRoot = join(process.cwd(), ".tissue", `e2e-fork-${process.pid}-${Date.now()}`);
+  let stateRoot: string | undefined;
+  let pluginDir: string | undefined;
+  let moderationDir: string | undefined;
+  const priorModerationDir = process.env.TISSUE_MODERATION_DIR;
+  const priorStateDir = process.env.TISSUE_STATE_DIR;
   let clock = T0;
+  let fake: ReturnType<typeof writeFakeGh> | undefined;
 
   const TARGET = "coaxk/subarr";
   const PUSH = "xiaden/subarr";
@@ -403,11 +429,19 @@ test("target/fork E2E: target coaxk/subarr, writable xiaden/subarr via pushRemot
     prChecks: { [`${TARGET}#201`]: [{ name: "ci", status: "IN_PROGRESS", conclusion: "PENDING" }] },
     prReviews: { [`${TARGET}#201`]: [] },
   };
-  const fake = writeFakeGh(scenario);
-  const priorStateDir = process.env.TISSUE_STATE_DIR;
-  process.env.TISSUE_STATE_DIR = stateRoot;
-
   try {
+    temp = await createTempRepo();
+    tissue = createTestDb();
+    server = await startPessimisticServer({ username: "tissue", password: "s3cret" });
+    stateRoot = join(process.cwd(), ".tissue", `e2e-fork-${process.pid}-${Date.now()}`);
+    pluginDir = mkdtempSync(join(tmpdir(), "tissue-p4-fork-plugin-"));
+    moderationDir = mkdtempSync(join(tmpdir(), "tissue-p4-fork-moderation-"));
+    const pluginInstall = installModerationPlugin({ pluginsDir: pluginDir, moderationDir, restartEpoch: T0 });
+    assert.equal(pluginInstall.ok, true, pluginInstall.errors.join("; "));
+    writeFileSync(join(moderationDir, "plugin-loaded.json"), JSON.stringify({ kind: "loaded", pluginSha256: pluginInstall.deployedSha256, serverStartedAt: T0 + 1 }));
+    process.env.TISSUE_MODERATION_DIR = moderationDir;
+    fake = writeFakeGh(scenario);
+    process.env.TISSUE_STATE_DIR = stateRoot;
     await declareGithubRemote(temp.clone, temp.bare, TARGET, "origin");
     await declareGithubRemote(temp.clone, temp.bare, PUSH, "fork");
 
@@ -462,9 +496,10 @@ test("target/fork E2E: target coaxk/subarr, writable xiaden/subarr via pushRemot
       stateDir: stateRoot,
       endpoint: server.baseUrl(),
       credentials: { username: "tissue", password: "s3cret" },
-      agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
-      registryDir,
-      gh,
+       agentsDir: deployAgents(join(stateRoot, "opencode-agents")),
+       pluginsDir: pluginDir,
+       registryDir,
+       gh,
       now: () => new Date(clock),
     });
     const portBefore = server.port;
@@ -567,10 +602,14 @@ test("target/fork E2E: target coaxk/subarr, writable xiaden/subarr via pushRemot
   } finally {
     if (priorStateDir === undefined) delete process.env.TISSUE_STATE_DIR;
     else process.env.TISSUE_STATE_DIR = priorStateDir;
-    rmSync(stateRoot, { recursive: true, force: true });
-    await server.close();
-    fake.cleanup();
-    tissue.cleanup();
-    await temp.cleanup();
+    if (priorModerationDir === undefined) delete process.env.TISSUE_MODERATION_DIR;
+    else process.env.TISSUE_MODERATION_DIR = priorModerationDir;
+    if (stateRoot) rmSync(stateRoot, { recursive: true, force: true });
+    if (pluginDir) rmSync(pluginDir, { recursive: true, force: true });
+    if (moderationDir) rmSync(moderationDir, { recursive: true, force: true });
+    if (server) await server.close();
+    if (fake) fake.cleanup();
+    if (tissue) tissue.cleanup();
+    if (temp) await temp.cleanup();
   }
 });

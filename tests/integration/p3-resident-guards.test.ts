@@ -87,7 +87,9 @@ test("resident endpoint validation rejects public/unsafe hosts before any creden
       config: CONFIG, logger, db, stateDir, endpoint: server.baseUrl(), agentsDir,
       credentials: { username: "tissue", password: "s3cret" },
     });
-    assert.ok(server.requestCount > 0, "loopback endpoint is queried after validation");
+    assert.equal(server.requestCount, 0, "assembly must not perform eager resident traffic");
+    await assembly.transport.sessionStatus();
+    assert.ok(server.requestCount > 0, "an explicit transport operation reaches the validated endpoint");
     assert.equal(server.authRejections, 0, "validated endpoint receives valid credentials");
     assert.equal(assembly.endpoint, `http://127.0.0.1:${new URL(server.baseUrl()).port}`);
     assert.equal(assembly.agentDefinitions.ok, true);
@@ -243,7 +245,9 @@ test("accepted resident endpoint attaches credentials after validation and never
       config: CONFIG, logger, db, stateDir, endpoint: server.baseUrl(), agentsDir,
       credentials: { username: "tissue", password: "s3cret" },
     });
-    assert.ok(server.requestCount > 0, "accepted endpoint is queried after validation");
+    assert.equal(server.requestCount, 0, "assembly must not perform eager resident traffic");
+    await assembly.transport.sessionStatus();
+    assert.ok(server.requestCount > 0, "an explicit transport operation reaches the validated endpoint");
     assert.equal(server.authRejections, 0, "credentials are attached after validation");
     logger.info("assembly.endpoint", { endpoint: assembly.endpoint });
     const serialized = JSON.stringify(sink.records());

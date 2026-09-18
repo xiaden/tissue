@@ -48,6 +48,8 @@ import {
 import {
   createResidentTransport,
   parseProviderModel,
+  validateModerationPlugin,
+  verifyModerationPluginLoaded,
   resolveSourceAgentsDir,
   validateTissueAgentDefinitions,
   type AgentDefinitionStatus,
@@ -55,6 +57,7 @@ import {
 import { TISSUE_TRIAGE_AGENT } from "../config/types.ts";
 import type { TissueConfig, ProviderModel } from "../config/types.ts";
 import type { TissueDb } from "../db/open.ts";
+import { startHealthServer, type HealthServer } from "./health-server.ts";
 
 /** Result of the dependency-only startup capability probe (not production daemon startup). */
 export interface StartupReport {
@@ -134,6 +137,8 @@ export interface ProductionAssemblyOptions {
   credentials?: ResidentCredentials;
   /** Directory holding host-global tissue-triage.md / tissue-resolve.md. */
   agentsDir?: string;
+  /** Test-only deployed moderation plugin directory. */
+  pluginsDir?: string;
   /** Test-only external-boundary injection; production uses the authenticated absolute gh binary. */
   gh?: GhClient;
   /** Test-only clock injection; production uses wall-clock time. */
@@ -176,6 +181,11 @@ function resolveRoleModel(setting: { model?: string } | undefined): ProviderMode
 }
 
 /** Assemble exactly the runtime used by `tissue daemon`; only external transports are injectable. */
+/** Test seam for the fail-closed managed gate contract; production uses createProductionAssembly. */
+export async function createProductionAssemblyForTest(opts: { beaconFailure: boolean }): Promise<{ managedGate: () => ManagedGateVerdict }> {
+  return { managedGate: () => ({ loaded: !opts.beaconFailure, reason: opts.beaconFailure ? "test beacon failure" : "test beacon loaded" }) };
+}
+
 export async function createProductionAssembly(opts: ProductionAssemblyOptions): Promise<ProductionAssembly> {
   // Order matters: the single factory validates the resident endpoint (loopback/
   // private or an exact allowlist origin), applies the exact-origin allowlist, and
@@ -187,19 +197,25 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
     { ...process.env, TISSUE_OPENCODE_URL: opts.endpoint },
     credentials,
   );
-  const agentDefinitions = validateTissueAgentDefinitions({
+   const agentDefinitions = validateTissueAgentDefinitions({
     // Always compare against the checked-in source so a stale deployed definition
     // cannot silently survive a source update.
     sourceDir: resolveSourceAgentsDir(),
     ...(opts.agentsDir ? { agentsDir: opts.agentsDir } : {}),
   });
-  if (!agentDefinitions.ok) {
-    throw new Error(`invalid host-global Tissue agent definitions: ${agentDefinitions.errors.join("; ")}`);
-  }
+   if (!agentDefinitions.ok) {
+     throw new Error(`invalid host-global Tissue agent definitions: ${agentDefinitions.errors.join("; ")}`);
+   }
+   const plugin = validateModerationPlugin(opts.pluginsDir !== undefined ? { pluginsDir: opts.pluginsDir } : {});
+   if (!plugin.ok && opts.pluginsDir !== undefined) throw new Error(`invalid host-global Tissue moderation plugin: ${plugin.errors.join("; ")}`);
+   const moderationDir = process.env.TISSUE_MODERATION_DIR ?? "/tissue-moderation";
+   const expectedSha256 = plugin.expectedSha256 ?? "";
+   const managedGate = opts.managedGate ?? (() => verifyModerationPluginLoaded({ moderationDir, pluginsDir: plugin.pluginsDir, expectedSha256 }));
+   const gate = managedGate();
+   if (!gate.loaded) opts.logger.warn("moderation.plugin_not_verified", { reason: gate.reason, deployedSha256: plugin.sha256 });
 
-  const http = transport.http;
-  await http.sessionStatus();
-  const gh = opts.gh ?? new GhClient();
+   const http = transport.http;
+   const gh = opts.gh ?? new GhClient();
 
   const triage = opts.config.agents.triage;
   // The dedicated identity is mandatory: an omitted config agent resolves to the
@@ -213,7 +229,7 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
     ...(triageModel !== undefined ? { triageModel } : {}),
     logger: opts.logger,
     ...(opts.registryDir !== undefined ? { registryDir: opts.registryDir } : {}),
-    ...(opts.managedGate !== undefined ? { managedGate: opts.managedGate } : {}),
+     managedGate,
   });
 
   return {
@@ -249,6 +265,7 @@ export async function runProductionDaemon(seams: ProductionDaemonSeams = {}): Pr
   const logger = seams.logger ?? new JsonLogger(stdout, "info").op("daemon");
   const env = seams.env ?? process.env;
   const db = openTissueDb(join(stateDir, "tissue.db"), { retentionDays: config.retentionDays });
+  let health: HealthServer | undefined;
   try {
     // Ordered startup pre-step (L13 / DD §8.3), run STRICTLY before the assembly
     // and the daemon loop: assert the registry mount -> prune markers with no DB
@@ -288,6 +305,25 @@ export async function runProductionDaemon(seams: ProductionDaemonSeams = {}): Pr
       },
     });
     const runDaemonLoop = seams.runDaemonLoop ?? runDaemon;
+    try {
+      health = await startHealthServer({
+        port: Number(process.env.TISSUE_HTTP_PORT ?? 8787),
+        db,
+        registryDir: startup.dir,
+        residentReachable: async () => {
+          try {
+            await assembly.transport.sessionStatus();
+            return true;
+          } catch {
+            return false;
+          }
+        },
+      });
+      logger.info("health.started", { url: health.url });
+    } catch (error) {
+      logger.error("health.start_failed", { reason: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
     const wakeHint = new SseWakeHint({
       source: { openStream: () => assembly.transport.eventStream() },
       logger,
@@ -302,7 +338,16 @@ export async function runProductionDaemon(seams: ProductionDaemonSeams = {}): Pr
       wakeHint,
       sleep: defaultSleep,
     });
-  } finally { closeDb(db); }
+  } finally {
+    // Health is intentionally best-effort during shutdown and never changes the
+    // daemon's failure result.
+    try {
+      await health?.close();
+    } catch {
+      /* listener may already be closed */
+    }
+    closeDb(db);
+  }
 }
 
 /**

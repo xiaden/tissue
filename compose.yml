@@ -1,0 +1,110 @@
+# Tissue packaging topology (RA-01 / OQ3).
+# The owner retains the resident OpenCode and NPM service definitions. They are shown
+# here as owner-side placeholders so this file documents the shared network/mount contract.
+# Do not add depends_on: Tissue and OpenCode are independent failure domains.
+#
+# Mount ownership:
+# - state is private and writable only by Tissue;
+# - worktrees and monitored checkouts are shared RW at byte-identical absolute paths;
+# - registry is Tissue RW / OpenCode RO;
+# - moderation is Tissue RO / OpenCode RW;
+# - global plugins and agents are Tissue RO / OpenCode RW, written only by tissue-deploy;
+# - the config bind is read-only in Tissue.
+#
+# RA-06 operator sequence: stop the resident OpenCode service, run
+# `docker compose --profile deploy run --rm tissue-deploy`, then start OpenCode again.
+# Plugin changes require this stop -> deploy -> start path because OpenCode binds plugin
+# discovery at server start; the deploy one-shot is the only writer of plugin artifacts.
+
+services:
+  tissue:
+    image: tissue:local
+    entrypoint: ["/app/container/entrypoint.sh"]
+    user: "1000:1000"
+    restart: "on-failure:3"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8787"
+    networks:
+      - tissue-net
+    environment:
+      TISSUE_STATE_DIR: /var/lib/tissue/state
+      TISSUE_WORKTREE_ROOT: /srv/tissue/worktrees
+      TISSUE_SESSION_REGISTRY_DIR: /tissue-session-registry
+      TISSUE_MODERATION_DIR: /tissue-moderation
+      TISSUE_OPENCODE_URL: http://opencode:4096
+      TISSUE_OPENCODE_ALLOWED_ORIGINS: http://opencode:4096
+      TISSUE_OPENCODE_PLUGINS_DIR: /home/opencode/.config/opencode/plugins
+      TISSUE_OPENCODE_AGENTS_DIR: /home/opencode/.config/opencode/agents
+      TISSUE_CONFIG: /config/tissue.yml
+      TISSUE_HTTP_PORT: "8787"
+    volumes:
+      - tissue-state:/var/lib/tissue/state:rw
+      - tissue-worktrees:/srv/tissue/worktrees:rw
+      - tissue-session-registry:/tissue-session-registry:rw
+      - tissue-moderation:/tissue-moderation:ro
+      - /workspace/subarr:/workspace/subarr:rw
+      - tissue-plugins:/home/opencode/.config/opencode/plugins:ro
+      - tissue-agents:/home/opencode/.config/opencode/agents:ro
+      - ./tissue.yml:/config/tissue.yml:ro
+    healthcheck:
+      # Liveness only: resident OpenCode reachability is informational readiness,
+      # never a restart gate. Plan O leg 1 validates this in a built container.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  # OQ3 owner-side service: retain the owner's image, command, ports, and other mounts.
+  opencode:
+    image: opencode:owner-side
+    networks:
+      - tissue-net
+    volumes:
+      - tissue-worktrees:/srv/tissue/worktrees:rw
+      - tissue-session-registry:/tissue-session-registry:ro
+      - tissue-moderation:/tissue-moderation:rw
+      - /workspace/subarr:/workspace/subarr:rw
+      - tissue-plugins:/home/opencode/.config/opencode/plugins:rw
+      - tissue-agents:/home/opencode/.config/opencode/agents:rw
+
+  # OQ3 owner-side NPM service; the owner supplies its proxy configuration.
+  npm:
+    image: npm:owner-side
+    networks:
+      - tissue-net
+
+  tissue-deploy:
+    image: tissue:local
+    entrypoint: ["node", "/app/src/cli.ts"]
+    command: ["install-plugin"]
+    user: "1000:1000"
+    restart: "no"
+    profiles: ["deploy"]
+    networks:
+      - tissue-net
+    volumes:
+      - tissue-moderation:/tissue-moderation:rw
+      - tissue-plugins:/home/opencode/.config/opencode/plugins:rw
+      - tissue-agents:/home/opencode/.config/opencode/agents:rw
+
+networks:
+  tissue-net:
+    name: tissue-net
+    driver: bridge
+
+volumes:
+  tissue-state:
+  tissue-worktrees:
+  tissue-session-registry:
+  tissue-moderation:
+  tissue-plugins:
+  tissue-agents:

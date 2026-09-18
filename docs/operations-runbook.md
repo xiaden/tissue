@@ -1,5 +1,13 @@
 # Tissue operational runbook
 
+## Container startup and internal health
+
+The packaged deployment runs Tissue as an independent `tissue` container on the user-defined `tissue-net` network. It exposes port `8787` to that Docker network only; there is no host `ports:` publication. NPM reaches the service by the Docker service name, while OpenCode remains a separate failure domain. Tissue does not use `depends_on`, so stopping or restarting one service does not implicitly restart the other.
+
+The container entry sequence is ordered: `container/prepare-volumes.sh` prepares the contracted state, worktree, registry, moderation, plugin, and agent directories for UID/GID `1000:1000`; `container/entrypoint.sh` then invokes the Node daemon. Node asserts the registry is a real writable persistent mount and prunes markers without a durable session row before assembling transports or entering the reconcile loop. A failed assertion is logged and exits non-zero. The long-running Tissue service has read-only moderation/plugin/agent mounts; the `tissue-deploy` profile is the separate writer for deployment artifacts.
+
+The internal health listener is credential-free and serves `GET /` on port `8787`. Its liveness result reflects Tissue DB/process progress only. The response also reports informational readiness, folded from registry-directory availability and resident reachability; resident failure does not make Tissue liveness false or supervise either service. A closed DB returns HTTP 503 while the listener remains available. Unknown paths and methods return 404. The Compose healthcheck must probe the implemented `GET /` endpoint, not `/health`; operators should treat any `/health` probe as stale configuration.
+
 ## Startup, reconcile, and authentication
 
 1. Confirm the s6 service state with `s6-svstat` and do not restart a resident service merely to probe it.
