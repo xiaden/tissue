@@ -90,8 +90,30 @@ jobs:
                 # CI fixture: validate checked-in definitions without claiming
                 # ownership of the resident OpenCode global agent directory.
                 TISSUE_OPENCODE_AGENTS_DIR: /app/agents
+                TISSUE_OPENCODE_PLUGINS_DIR: /home/opencode/.config/opencode/plugins
               volumes:
                 - .:/workspace/tissue:ro
+            fixture-attest:
+              image: tissue:ci
+              networks:
+                - tissue-net
+              user: "0:0"
+              entrypoint: ["node", "-e"]
+              command:
+                - >-
+                  const fs = require('node:fs');
+                  const crypto = require('node:crypto');
+                  const source = fs.readFileSync('/app/plugin/tissue-moderation.ts');
+                  const deployedSha256 = crypto.createHash('sha256').update(source).digest('hex');
+                  const restartEpoch = 1700000000000;
+                  fs.mkdirSync('/home/opencode/.config/opencode/plugins', { recursive: true });
+                  fs.copyFileSync('/app/plugin/tissue-moderation.ts', '/home/opencode/.config/opencode/plugins/tissue-moderation.ts');
+                  fs.mkdirSync('/tissue-moderation', { recursive: true });
+                  fs.writeFileSync('/tissue-moderation/deploy-record.json', JSON.stringify({ deployedSha256, restartEpoch, pluginVersion: 'ci-fixture' }));
+                  fs.writeFileSync('/tissue-moderation/plugin-loaded.json', JSON.stringify({ kind: 'loaded', pluginSha256: deployedSha256, serverStartedAt: restartEpoch + 1 }));
+              volumes:
+                - tissue-moderation:/tissue-moderation:rw
+                - tissue-plugins:/home/opencode/.config/opencode/plugins:rw
             opencode-fixture:
               image: tissue-opencode-http-fixture:ci
               networks:
@@ -101,7 +123,6 @@ jobs:
                 - tissue-session-registry:/tissue-session-registry:ro
                 - /workspace/subarr:/workspace/subarr:rw
           YAML
-          echo 'CI-only dependency-free HTTP fixture; no external runtime or registry dependency.'
       - name: "Leg 1 — Build Tissue and HTTP fixture images"
         run: |
           set -euo pipefail
@@ -110,6 +131,8 @@ jobs:
           docker build --tag tissue-opencode-http-fixture:ci tests/fixtures/opencode-http-fixture 2>&1 | tee -a leg-1-build.log
           test -n "$(docker image inspect tissue:ci --format '{{.Id}}')"
           test -n "$(docker image inspect tissue-opencode-http-fixture:ci --format '{{.Id}}')"
+      - name: Prepare deterministic Tissue fixture attestation
+        run: docker compose -f compose.yml -f ci-compose.yml run --rm --no-deps fixture-attest
       - name: "Leg 2 — Compose config"
         run: |
           set -euo pipefail

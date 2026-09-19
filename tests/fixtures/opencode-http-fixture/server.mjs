@@ -106,15 +106,24 @@ async function route(req, res) {
     if (parts.length === 2 && method === "DELETE") { if (session) session.deleted = true; return finish(res, method, route, 204, undefined, parts[1]); }
     if (!session) return finish(res, method, route, 404, { error: "missing session" }, parts[1]);
     if (parts[2] === "abort" && method === "POST") { session.status = "idle"; return finish(res, method, route, 204, undefined, session.id); }
-    if (parts[2] === "message" && method === "GET") return finish(res, method, route, 200, session.messages, session.id);
+    if (parts[2] === "message" && method === "GET") {
+      const response = finish(res, method, route, 200, session.messages, session.id);
+      if (session.status === "retry") session.status = "idle";
+      return response;
+    }
     if ((parts[2] === "message" || parts[2] === "prompt_async") && method === "POST") {
       const body = await readJson(req);
       if (!validPrompt(body)) return finish(res, method, route, 400, { error: "prompt parts must contain text" }, session.id);
       const text = promptText(body);
       const parentID = appendUser(session, text, body);
       if (parts[2] === "prompt_async") {
-         session.status = text.includes("retry ") ? "retry" : "busy";
-         setTimeout(() => { if (!session.deleted) { appendAssistant(session, parentID); session.status = "idle"; } }, 5);
+        if (text.includes("retry ")) {
+          session.status = "retry";
+          appendAssistant(session, parentID);
+        } else {
+          session.status = "busy";
+          setTimeout(() => { if (!session.deleted) { appendAssistant(session, parentID); session.status = "idle"; } }, 50);
+        }
          return finish(res, method, route, 204, undefined, session.id);
        }
       const assistantID = appendAssistant(session, parentID, text.includes("Return exactly one JSON triage envelope") ? JSON.stringify({ kind: "triage", envelope_id: "fixture-envelope", issue_id: "fixture-issue", disposition: "READY", reason: "fixture" }) : "fixture response");

@@ -38,13 +38,14 @@ test("container job has exactly eight deterministic fixture legs", () => {
   for (const name of names) assert.match(stepNamed(name).run, /set -euo pipefail/);
 });
 
-test("fixture workflow has no actual OpenCode or plugin prerequisite", () => {
+test("fixture workflow has no actual OpenCode runtime prerequisite", () => {
   assert.match(workflowText, /opencode-http-fixture/);
   assert.match(workflowText, /tests\/fixtures\/opencode-http-fixture/);
   assert.match(workflowText, /opencode-fixture/);
+  assert.match(workflowText, /Prepare deterministic Tissue fixture attestation/);
   assert.doesNotMatch(workflowText, /opencode-ai@|opencode web|debug config|npm install|install-plugin|install-agents/);
   assert.doesNotMatch(workflowText, /plugin.*mount|agent.*mount/i);
-  assert.doesNotMatch(workflowText, /fired|beacon|resident plugin|hook execution/i);
+  assert.doesNotMatch(workflowText, /fired|resident plugin|hook execution/i);
 });
 
 test("diagnostics and teardown always run and fixture smoke is a real network caller", () => {
