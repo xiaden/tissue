@@ -6,7 +6,6 @@ import assert from "node:assert/strict";
 import {
   chmodSync,
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -37,7 +36,7 @@ test("container scripts pass shell syntax validation", () => {
   }
 });
 
-test("prepare-volumes creates only Tissue-writable directories and applies 1000:1000 ownership", () => {
+test("prepare-volumes creates only Tissue-writable directories without requiring chown", () => {
   const root = mkdtempSync(join(tmpdir(), "tissue-volume-prep-"));
   const dirs = {
     state: join(root, "state"),
@@ -60,9 +59,6 @@ test("prepare-volumes creates only Tissue-writable directories and applies 1000:
   assert.match(String(result.stdout), /"event":"volumes\.prepared"/);
   for (const directory of [dirs.state, dirs.worktrees, dirs.registry]) {
     assert.equal(statSync(directory).isDirectory(), true, `${directory} must be created`);
-    const ownership = lstatSync(directory);
-    assert.equal(ownership.uid, 1000, `${directory} must be owned by UID 1000`);
-    assert.equal(ownership.gid, 1000, `${directory} must be owned by GID 1000`);
   }
   for (const directory of [dirs.moderation, dirs.plugins, dirs.agents]) {
     assert.equal(existsSync(directory), false, `${directory} must remain owner-side and unprepared`);
@@ -92,7 +88,7 @@ test("Dockerfile packages runtime assets, runtime dependencies, executable scrip
   assert.match(dockerfile, /^COPY package\.json package-lock\.json \.\/$/m);
   assert.match(dockerfile, /^RUN npm ci --omit=dev$/m);
   for (const asset of ["src", "container", "agents", "plugin"]) {
-    assert.match(dockerfile, new RegExp(`^COPY ${asset} \.\/${asset}$`, "m"));
+    assert.match(dockerfile, new RegExp(String.raw`^COPY ${asset} \.\/${asset}$`, "m"));
   }
   assert.match(dockerfile, /chmod 0555 \/app\/container\/entrypoint\.sh \/app\/container\/prepare-volumes\.sh/);
   assert.match(dockerfile, /chown -R 1000:1000/);

@@ -74,6 +74,8 @@ jobs:
           services:
             tissue:
               image: tissue:ci
+              environment:
+                TISSUE_CONFIG: /workspace/tissue/tissue.example.yml
               volumes:
                 - .:/workspace/tissue:ro
             tissue-deploy:

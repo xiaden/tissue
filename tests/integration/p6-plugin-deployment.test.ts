@@ -447,7 +447,18 @@ test("status exposes credential-free plugin attestation and fails closed on miss
 
 test("install-plugin is advertised with --force and has exit-code semantics", async () => {
   assert.match(usage("tissue"), /install-plugin \[--force\]/);
-  assert.equal(await main(["node", "tissue", "install-plugin", "--force"]), 0);
+  const priorPluginsDir = process.env.TISSUE_OPENCODE_PLUGINS_DIR;
+  const fixtureRoot = tempDir("tissue-plugin-cli-");
+  const pluginsDir = join(fixtureRoot, "plugins");
+  mkdirSync(pluginsDir);
+  process.env.TISSUE_OPENCODE_PLUGINS_DIR = pluginsDir;
+  try {
+    assert.equal(await main(["node", "tissue", "install-plugin", "--force"]), 0);
+  } finally {
+    if (priorPluginsDir === undefined) delete process.env.TISSUE_OPENCODE_PLUGINS_DIR;
+    else process.env.TISSUE_OPENCODE_PLUGINS_DIR = priorPluginsDir;
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test("clearPluginLoadBeacon deletes an existing beacon and returns true", () => {
