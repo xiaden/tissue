@@ -32,7 +32,7 @@ test("container job has exactly eight deterministic fixture legs", () => {
     "Leg 5 — Exact shared mounts and private-state isolation",
     "Leg 6 — Registry failure is loud and doctor unhealthy",
     "Leg 7 — Healthy Tissue doctor",
-    "Leg 8 — Deterministic real HTTP driver smoke",
+    "Leg 8 — Deterministic fixture HTTP driver smoke",
   ];
   assert.deepEqual(steps().filter((step) => /^Leg [1-8] /.test(step.name ?? "")).map((step) => step.name), names);
   for (const name of names) assert.match(stepNamed(name).run, /set -euo pipefail/);
@@ -53,7 +53,7 @@ test("diagnostics and teardown always run and fixture smoke is a real network ca
   assert.equal(stepNamed("Upload container leg logs").with.path, "leg-*.log");
   assert.equal(stepNamed("Tear down CI topology").if, "always()");
   assert.match(stepNamed("Tear down CI topology").run, /down --volumes --remove-orphans/);
-  assert.match(stepNamed("Leg 8 — Deterministic real HTTP driver smoke").run, /opencode-http-fixture\.test\.ts/);
+  assert.match(stepNamed("Leg 8 — Deterministic fixture HTTP driver smoke").run, /opencode-http-fixture\.test\.ts/);
 });
 
 test("fixture context is dependency-free and exposes the contracted routes", () => {
@@ -64,4 +64,31 @@ test("fixture context is dependency-free and exposes the contracted routes", () 
   for (const route of ["/session", "/session/status", "/message", "/prompt_async", "/abort", "/event"]) assert.match(server, new RegExp(route.replace("/", "\\/")));
   assert.match(server, /ses_/);
   assert.match(server, /projectID/);
+});
+
+
+test("verify is deterministic and OpenCode-independent", () => {
+  const verify = workflow.jobs?.verify as Record<string, any> | undefined;
+  assert.ok(verify);
+  assert.deepEqual(verify.permissions, undefined);
+  const commands = (verify.steps as Record<string, any>[]).map((step) => String(step.run ?? "")).join("\n");
+  assert.match(commands, /npm run typecheck/);
+  assert.match(commands, /npm run lint/);
+  assert.match(commands, /npm test/);
+  assert.doesNotMatch(commands, /docker|opencode|model|github_token|OPENCODE_SERVER/i);
+  assert.doesNotMatch(JSON.stringify(verify), /opencode-ai|opencode web|live OpenCode|debug config/i);
+});
+
+test("real compatibility is a distinct opt-in 1.18.31 job", () => {
+  const compat = workflow.jobs?.["opencode-compat"] as Record<string, any> | undefined;
+  assert.ok(compat);
+  assert.equal(compat.name, "opencode-compat");
+  assert.match(String(compat.if), /run-opencode-compat/);
+  assert.equal(compat["timeout-minutes"], 10);
+  const text = JSON.stringify(compat);
+  assert.match(text, /1\.18\.31/);
+  assert.match(text, /deploy-plugin/);
+  assert.match(text, /compat-smoke/);
+  assert.doesNotMatch(text, /npm install|opencode-ai@|model|github_token|live database|docker compose/i);
+  assert.notEqual(compat, container);
 });

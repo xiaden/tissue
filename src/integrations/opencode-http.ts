@@ -1,18 +1,18 @@
 // src/integrations/opencode-http.ts
 //
-// M6 raw loopback HTTP client for the OpenCode 1.18.x server API (R3/R5/R10,
+// M6 raw loopback HTTP client for the OpenCode 1.18.31 server API (R3/R5/R10,
 // CONTRACTS `createRealSession`/`getSessionStatus`/`promptSession`/
 // `observeCompletion` inputs). This is a typed, argv-free, JSON-only transport
 // over Node's global `fetch` — no subprocess, no shell, no free-form strings. It
 // is the canonical transport used by src/integrations/opencode-driver.ts so the
-// driver is deterministic and can be exercised end-to-end against BOTH a real
-// `opencode serve` and the pessimistic test fake (tests/helpers/
+// driver is deterministic and can be exercised end-to-end against the
+// dependency-free fixture and the pessimistic historical test fake (tests/helpers/
 // pessimistic-opencode-server.ts) through the same code path.
 //
 // Design notes:
 //   - Bind everything to a caller-supplied 127.0.0.1 base URL. Never bind or
 //     reach a public endpoint (R21/DD security).
-//   - Sessions are OpenCode-created durable rows. `directory` is passed as the
+//   - Sessions use server-assigned durable rows. `directory` is passed as the
 //     `?directory=` query so the session binds to the intended repo/worktree
 //     project (OQ3 evidence: directory+server-assigned projectID, never a
 //     derived project id).
@@ -22,13 +22,11 @@
 //     {info,parts}); async prompt = POST /session/{id}/prompt_async (→ 204
 //     "accepted", which is NOT completion). HTTP 204 alone is never completion.
 //
-// The SDK/plugin packages present on this host are @opencode-ai/sdk + plugin
-// 1.17.18 against server 1.18.18 (measured skew U-1; npm latest 1.18.30). The
-// 1.17.18 generated client DOES declare session.list/create/status/get/delete/
-// abort/messages/prompt/promptAsync, so no generated method is absent. This
-// module deliberately implements the RAW HTTP fallback (DD RG-6 "or tested raw
-// HTTP fallback") as the canonical, version-skew-immune transport; it is the
-// path exercised by the driver contract tests and the real-server probes.
+// Historical release-gate evidence used an older SDK/server pairing. The active
+// boundary is the pinned OpenCode v1.18.31 OpenAPI contract; this module uses the
+// deliberately version-skew-immune raw HTTP fallback (DD RG-6 "or tested raw
+// HTTP fallback") as its canonical transport. The path is exercised by the
+// driver contract tests and the deterministic fixture.
 
 /** A session as returned by the server (create/list/get). */
 export interface OcSession {
@@ -47,11 +45,13 @@ export type OcSessionStatus =
   | { type: "retry"; attempt: number; message: string; next: number }
   | { type: "busy" };
 
-/** A user message (no parentID) or an assistant message (has parentID). */
+/** A user message or an assistant message with its parent turn. */
 export interface OcUserMessage {
   id: string;
   sessionID: string;
   role: "user";
+  /** User turns never have an assistant parent link. */
+  parentID?: never;
   time: { created: number };
   agent: string;
   model?: { providerID: string; modelID: string };

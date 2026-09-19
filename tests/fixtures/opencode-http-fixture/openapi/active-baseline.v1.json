@@ -1,0 +1,9 @@
+{
+  "version": "1.18.31",
+  "tag": "v1.18.31",
+  "commit": "a97622c801f4ca571530ddc51076af659a9c32cd",
+  "spec_url": "https://raw.githubusercontent.com/anomalyco/opencode/v1.18.31/packages/sdk/openapi.json",
+  "spec_path": "packages/sdk/openapi.json",
+  "openapi": "3.1.0",
+  "sha256": "00502bd13e9c86f3ca9e765e99a57e06fa9f434ca16f2a714766d1444f8d37f3"
+}

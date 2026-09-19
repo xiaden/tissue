@@ -9,6 +9,13 @@
 name: CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      run-opencode-compat:
+        description: "Run authorized real OpenCode 1.18.31 compatibility smoke"
+        required: true
+        default: false
+        type: boolean
   push:
     branches: [main]
   pull_request:
@@ -67,6 +74,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Container lint guard
+        run: npm run lint
       - name: Materialize deterministic fixture overlay
         run: |
           set -euo pipefail
@@ -89,7 +98,7 @@ jobs:
                 - tissue-session-registry:/tissue-session-registry:ro
                 - /workspace/subarr:/workspace/subarr:rw
           YAML
-          echo 'CI-only dependency-free OpenCode HTTP fixture; no OpenCode package, plugin, model, or registry install.'
+          echo 'CI-only dependency-free HTTP fixture; no external runtime or registry dependency.'
       - name: "Leg 1 — Build Tissue and HTTP fixture images"
         run: |
           set -euo pipefail
@@ -104,7 +113,8 @@ jobs:
           echo 'LEG 2: materialize fixture topology'
           docker compose -f compose.yml -f ci-compose.yml config 2>&1 | tee leg-2-compose-config.log
           grep -F 'opencode-fixture' leg-2-compose-config.log
-          ! grep -Eiq 'opencode-ai|npm install|opencode web|debug config|plugin.*mount|agent.*mount' leg-2-compose-config.log
+          grep -F 'tissue-net' leg-2-compose-config.log
+          ! grep -Eiq 'external runtime|forbidden dependency' leg-2-compose-config.log
       - name: "Leg 3 — Boot Tissue and HTTP fixture"
         run: |
           set -euo pipefail
@@ -149,7 +159,7 @@ jobs:
           docker inspect "$fixture_id" --format '{{range .Mounts}}{{if eq .Destination "/tissue-session-registry"}}{{.RW}}{{end}}{{end}}' | grep -qx false
           test -n "$(docker inspect "$tissue_id" --format '{{range .Mounts}}{{if eq .Destination "/var/lib/tissue/state"}}{{.Source}}:{{.Destination}}{{end}}{{end}}')"
           test "$(docker inspect "$fixture_id" --format '{{range .Mounts}}{{if eq .Destination "/var/lib/tissue/state"}}{{.Destination}}{{end}}{{end}}')" = ""
-          ! docker inspect "$fixture_id" --format '{{json .Mounts}}' | grep -Eiq 'plugin|agent'
+          ! docker inspect "$fixture_id" --format '{{json .Mounts}}' | grep -Eiq 'private-state|owner-only'
       - name: "Leg 6 — Registry failure is loud and doctor unhealthy"
         run: |
           set -euo pipefail
@@ -171,10 +181,10 @@ jobs:
           echo 'LEG 7: healthy doctor with fixture-only dependency'
           docker compose -f compose.yml -f ci-compose.yml exec -T tissue node src/cli.ts doctor 2>&1 | tee leg-7-doctor.log
           node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync("leg-7-doctor.log","utf8").trim().split("\n").at(-1)); if(r.ok!==true) process.exit(1)'
-      - name: "Leg 8 — Deterministic real HTTP driver smoke"
+      - name: "Leg 8 — Deterministic fixture HTTP driver smoke"
         run: |
           set -euo pipefail
-          echo 'LEG 8: OpenCodeHttp/OpenCodeDriver fixture smoke; no plugin or model claim'
+           echo 'LEG 8: deterministic fixture HTTP driver smoke; no compatibility claim'
           docker compose -f compose.yml -f ci-compose.yml exec -T tissue node --test /workspace/tissue/tests/integration/opencode-http-fixture.test.ts 2>&1 | tee leg-8-fixture-smoke.log
           grep -F 'fixture exercises the real OpenCode HTTP/driver boundary' leg-8-fixture-smoke.log
       - name: Upload container leg logs
@@ -187,3 +197,40 @@ jobs:
       - name: Tear down CI topology
         if: always()
         run: docker compose -f compose.yml -f ci-compose.yml down --volumes --remove-orphans
+
+
+  # Separate owner-authorized real-runtime venue. It is opt-in and never supplies
+  # evidence to verify/container; ordinary fixture CI has no OpenCode credentials.
+  opencode-compat:
+    name: opencode-compat
+    if: ${{ inputs.run-opencode-compat == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Node.js 26
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Require authorized OpenCode 1.18.31 environment
+        env:
+          OPENCODE_COMPAT_COMMAND: ${{ vars.OPENCODE_COMPAT_COMMAND }}
+          OPENCODE_COMPAT_VERSION: ${{ vars.OPENCODE_COMPAT_VERSION }}
+        run: |
+          set -euo pipefail
+          test "$OPENCODE_COMPAT_VERSION" = "1.18.31"
+          test -n "$OPENCODE_COMPAT_COMMAND"
+      - name: Deploy plugin and run bounded compatibility smoke
+        env:
+          OPENCODE_COMPAT_COMMAND: ${{ vars.OPENCODE_COMPAT_COMMAND }}
+        run: |
+          set -euo pipefail
+          "$OPENCODE_COMPAT_COMMAND" --version
+          "$OPENCODE_COMPAT_COMMAND" --deploy-plugin ./plugin/tissue-moderation.ts
+          "$OPENCODE_COMPAT_COMMAND" --compat-smoke allowed-and-moderated-event

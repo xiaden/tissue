@@ -1,7 +1,7 @@
 // tests/helpers/pessimistic-opencode-server.ts
 //
 // M6 TEST-ONLY pessimistic fake OpenCode server (DD RG-3/RG-4 evidence inputs).
-// A node:http loopback server speaking the OpenCode 1.18.x REST surface used by
+// A node:http loopback server speaking the historical OpenCode REST surface used by
 // the REAL driver (opencode-http.ts / opencode-driver.ts) so the driver contract
 // tests exercise the production transport end-to-end against a controllable
 // server — no SDK client, no real `opencode serve`, no shared opencode.db.
@@ -50,7 +50,7 @@ export class PessimisticOpenCodeServer {
   private projSeq = 1;
   port = 0;
   /**
-   * When a sync/async prompt arrives on a busy session. Real OpenCode 1.18.18
+   * When a sync/async prompt arrives on a busy session. Historical release-gate
    * does NOT busy-reject (RG-3): it accepts the prompt and persists the user
    * message. Default is therefore the aligned `accept_no_reply`; `http_409`
    * remains only as an explicit opt-in robustness scenario — never as an
