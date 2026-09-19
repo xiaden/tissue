@@ -87,6 +87,9 @@ jobs:
                 TISSUE_CONFIG: /workspace/tissue/tissue.example.yml
                 TISSUE_OPENCODE_URL: http://opencode-fixture:4096
                 TISSUE_OPENCODE_ALLOWED_ORIGINS: http://opencode-fixture:4096
+                # CI fixture: validate checked-in definitions without claiming
+                # ownership of the resident OpenCode global agent directory.
+                TISSUE_OPENCODE_AGENTS_DIR: /app/agents
               volumes:
                 - .:/workspace/tissue:ro
             opencode-fixture:
