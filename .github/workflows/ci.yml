@@ -50,3 +50,140 @@ jobs:
 
       - name: Test
         run: npm test
+
+  container:
+    name: container
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Node.js 26
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Materialize deterministic fixture overlay
+        run: |
+          set -euo pipefail
+          cat > ci-compose.yml <<'YAML'
+          services:
+            tissue:
+              image: tissue:ci
+              environment:
+                TISSUE_CONFIG: /workspace/tissue/tissue.example.yml
+                TISSUE_OPENCODE_URL: http://opencode-fixture:4096
+                TISSUE_OPENCODE_ALLOWED_ORIGINS: http://opencode-fixture:4096
+              volumes:
+                - .:/workspace/tissue:ro
+            opencode-fixture:
+              image: tissue-opencode-http-fixture:ci
+              networks:
+                - tissue-net
+              volumes:
+                - tissue-worktrees:/srv/tissue/worktrees:rw
+                - tissue-session-registry:/tissue-session-registry:ro
+                - /workspace/subarr:/workspace/subarr:rw
+          YAML
+          echo 'CI-only dependency-free OpenCode HTTP fixture; no OpenCode package, plugin, model, or registry install.'
+      - name: "Leg 1 — Build Tissue and HTTP fixture images"
+        run: |
+          set -euo pipefail
+          echo 'LEG 1: build images'
+          docker build --tag tissue:ci . 2>&1 | tee leg-1-build.log
+          docker build --tag tissue-opencode-http-fixture:ci tests/fixtures/opencode-http-fixture 2>&1 | tee -a leg-1-build.log
+          test -n "$(docker image inspect tissue:ci --format '{{.Id}}')"
+          test -n "$(docker image inspect tissue-opencode-http-fixture:ci --format '{{.Id}}')"
+      - name: "Leg 2 — Compose config"
+        run: |
+          set -euo pipefail
+          echo 'LEG 2: materialize fixture topology'
+          docker compose -f compose.yml -f ci-compose.yml config 2>&1 | tee leg-2-compose-config.log
+          grep -F 'opencode-fixture' leg-2-compose-config.log
+          ! grep -Eiq 'opencode-ai|npm install|opencode web|debug config|plugin.*mount|agent.*mount' leg-2-compose-config.log
+      - name: "Leg 3 — Boot Tissue and HTTP fixture"
+        run: |
+          set -euo pipefail
+          echo 'LEG 3: boot and health'
+          docker compose -f compose.yml -f ci-compose.yml up -d tissue opencode-fixture 2>&1 | tee leg-3-boot.log
+          docker compose -f compose.yml -f ci-compose.yml ps tissue opencode-fixture | tee -a leg-3-boot.log
+          for service in tissue opencode-fixture; do
+            id="$(docker compose -f compose.yml -f ci-compose.yml ps -q "$service")"
+            test -n "$id"
+            status="$(docker inspect "$id" --format '{{.State.Status}}')"
+            health="$(docker inspect "$id" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}')"
+            printf '%s status=%s health=%s\n' "$service" "$status" "$health" | tee -a leg-3-boot.log
+            if [ "$status" != running ] || { [ "$health" != healthy ] && [ "$health" != none ]; }; then
+              docker inspect "$id" >> leg-3-boot.log
+              docker logs "$id" >> leg-3-boot.log 2>&1 || true
+              exit 1
+            fi
+          done
+      - name: "Leg 4 — tissue-net membership"
+        run: |
+          set -euo pipefail
+          echo 'LEG 4: network membership'
+          membership="$(docker network inspect tissue-net --format '{{json .Containers}}')"
+          echo "$membership" | tee leg-4-network.log
+          for service in tissue opencode-fixture; do
+            id="$(docker compose -f compose.yml -f ci-compose.yml ps -q "$service")"
+            echo "$membership" | grep -F "\"$id\""
+          done
+      - name: "Leg 5 — Exact shared mounts and private-state isolation"
+        run: |
+          set -euo pipefail
+          echo 'LEG 5: mount identity and modes'
+          tissue_id="$(docker compose -f compose.yml -f ci-compose.yml ps -q tissue)"
+          fixture_id="$(docker compose -f compose.yml -f ci-compose.yml ps -q opencode-fixture)"
+          docker inspect "$tissue_id" "$fixture_id" --format '{{json .Mounts}}' | tee leg-5-mounts.log
+          for path in /srv/tissue/worktrees /workspace/subarr; do
+            t="$(docker inspect "$tissue_id" --format '{{range .Mounts}}{{if eq .Destination "'"$path"'"}}{{.Source}}:{{.Destination}}{{end}}{{end}}')"
+            f="$(docker inspect "$fixture_id" --format '{{range .Mounts}}{{if eq .Destination "'"$path"'"}}{{.Source}}:{{.Destination}}{{end}}{{end}}')"
+            test -n "$t" && test "$t" = "$f"
+          done
+          docker inspect "$tissue_id" --format '{{range .Mounts}}{{if eq .Destination "/tissue-session-registry"}}{{.RW}}{{end}}{{end}}' | grep -qx true
+          docker inspect "$fixture_id" --format '{{range .Mounts}}{{if eq .Destination "/tissue-session-registry"}}{{.RW}}{{end}}{{end}}' | grep -qx false
+          test -n "$(docker inspect "$tissue_id" --format '{{range .Mounts}}{{if eq .Destination "/var/lib/tissue/state"}}{{.Source}}:{{.Destination}}{{end}}{{end}}')"
+          test "$(docker inspect "$fixture_id" --format '{{range .Mounts}}{{if eq .Destination "/var/lib/tissue/state"}}{{.Destination}}{{end}}{{end}}')" = ""
+          ! docker inspect "$fixture_id" --format '{{json .Mounts}}' | grep -Eiq 'plugin|agent'
+      - name: "Leg 6 — Registry failure is loud and doctor unhealthy"
+        run: |
+          set -euo pipefail
+          echo 'LEG 6: missing/unwritable/container-local-empty registry'
+          set +e
+          docker compose -f compose.yml -f ci-compose.yml run --rm --no-deps -e TISSUE_SESSION_REGISTRY_DIR=/ci-missing-registry tissue > leg-6-registry-failure.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          grep -Eiq 'registry|mount|error|failed|unhealthy' leg-6-registry-failure.log
+          set +e
+          docker compose -f compose.yml -f ci-compose.yml run --rm --no-deps --entrypoint node -e TISSUE_SESSION_REGISTRY_DIR=/ci-missing-registry tissue /app/src/cli.ts doctor >> leg-6-registry-failure.log 2>&1
+          doctor_rc=$?
+          set -e
+          test "$doctor_rc" -ne 0
+      - name: "Leg 7 — Healthy Tissue doctor"
+        run: |
+          set -euo pipefail
+          echo 'LEG 7: healthy doctor with fixture-only dependency'
+          docker compose -f compose.yml -f ci-compose.yml exec -T tissue node src/cli.ts doctor 2>&1 | tee leg-7-doctor.log
+          node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync("leg-7-doctor.log","utf8").trim().split("\n").at(-1)); if(r.ok!==true) process.exit(1)'
+      - name: "Leg 8 — Deterministic real HTTP driver smoke"
+        run: |
+          set -euo pipefail
+          echo 'LEG 8: OpenCodeHttp/OpenCodeDriver fixture smoke; no plugin or model claim'
+          docker compose -f compose.yml -f ci-compose.yml exec -T tissue node --test /workspace/tissue/tests/integration/opencode-http-fixture.test.ts 2>&1 | tee leg-8-fixture-smoke.log
+          grep -F 'fixture exercises the real OpenCode HTTP/driver boundary' leg-8-fixture-smoke.log
+      - name: Upload container leg logs
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: tissue-container-leg-logs-${{ github.run_id }}
+          path: leg-*.log
+          if-no-files-found: ignore
+      - name: Tear down CI topology
+        if: always()
+        run: docker compose -f compose.yml -f ci-compose.yml down --volumes --remove-orphans

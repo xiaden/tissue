@@ -26,6 +26,9 @@ import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
 import { createTestDb, seedRepository } from "../helpers/db.ts";
 import { startPessimisticServer } from "../helpers/pessimistic-opencode-server.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const REPO_ID = "xiaden/nomarr";
 const WI = "wi-xiaden-nomarr-7";
@@ -141,6 +144,7 @@ test("reconcile: health is published only after recovery succeeds (throwing reco
 test("reconcile: a GLOBAL /session/status 404 is dependency failure, never per-session session loss", async () => {
   const server = await startPessimisticServer({ username: "tissue", password: "s3cret" });
   const { db, cleanup } = createTestDb();
+  const registryDir = mkdtempSync(join(tmpdir(), "tissue-session-registry-health-"));
   try {
     seedRepository(db, { id: REPO_ID });
     insertWorkItem(db, { id: WI, repo_id: REPO_ID, state: "RUNNING", base_branch: "main" });
@@ -150,7 +154,7 @@ test("reconcile: a GLOBAL /session/status 404 is dependency failure, never per-s
       username: "tissue",
       password: "s3cret",
     });
-    const driver = new OpenCodeDriver({ http, db });
+    const driver = new OpenCodeDriver({ http, db, registryDir });
     const session = await driver.createRealSession("resolution", "/tmp/wt", {
       repoId: REPO_ID,
       workItemId: WI,
@@ -200,5 +204,8 @@ test("reconcile: a GLOBAL /session/status 404 is dependency failure, never per-s
   } finally {
     cleanup();
     await server.close();
+    // The registry is test-only state; never leave a marker directory behind.
+    // The variable is initialized only in this test's try block.
+    rmSync(registryDir, { recursive: true, force: true });
   }
 });

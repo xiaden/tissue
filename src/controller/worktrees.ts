@@ -11,8 +11,10 @@
 //     default branch, unreachable remote, insufficient auth) — never silently
 //     healthy — and throws when authenticated gh readiness cannot be established.
 //   - createWorktree creates ONLY a controller-generated `tissue/wi_<opaque-id>`
-//     branch and one linked worktree under `<TISSUE_STATE_DIR>/worktrees/<owner-name>`;
-//     no other branch shape or location is ever created.
+//     branch and one linked worktree under the resolved worktree root
+//     (`TISSUE_WORKTREE_ROOT`, falling back to `<TISSUE_STATE_DIR>/worktrees`)
+//     at `<root>/<owner-name>/<work-item-id>`; no other branch shape or location is
+//     ever created.
 //   - .tissue/ is excluded in the worktree (R17) so untrusted bodies are never
 //     staged by a broad `git add -A`.
 //   - cleanupWorktree removes the disposable worktree/branch only under the
@@ -23,6 +25,7 @@
 import { mkdirSync, realpathSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
+import { resolveWorktreeRoot } from "../config/load.ts";
 import type { RepositoryConfig } from "../config/types.ts";
 import type { GhClient, ProtectionState } from "../integrations/gh-client.ts";
 import { GhError } from "../integrations/gh-client.ts";
@@ -59,9 +62,10 @@ export interface WorktreeIdentity {
   /** HEAD object id captured at creation/verification time. */
   headSha: string | null;
   /**
-   * The repository segment under `<state>/worktrees` (owner-name). Creation and
-   * cleanup both resolve the canonical containment root from this relative
-   * segment, so neither can be redirected outside the controller-owned boundary.
+   * The repository segment under the resolved worktree root (owner-name).
+   * Creation and cleanup both resolve the canonical containment root from this
+   * relative segment, so neither can be redirected outside the controller-owned
+   * boundary.
    */
   repoSlug: string;
 }
@@ -175,27 +179,30 @@ export function assertNoSymlinkEscape(root: string, candidate: string, label = "
 }
 
 /**
- * Resolve the canonical containment root for a repository segment under the
- * Tissue state root: `<state>/worktrees/<subdir>`. `subdir` is always a relative
- * repository slug (owner-name); traversal or absolute segments are rejected so
- * the resolved root can never escape `<state>/worktrees`.
+ * Resolve the canonical containment root for a repository segment under an
+ * already-resolved worktree root: `<root>/<subdir>`. `root` is the value
+ * returned by `resolveWorktreeRoot` (the `<...>/worktrees` level), NOT the raw
+ * state root — there is exactly ONE canonical `worktrees` composition, owned by
+ * the resolver, so this function must not append `worktrees` again. `subdir` is
+ * always a relative repository slug (owner-name); traversal or absolute segments
+ * are rejected so the resolved root can never escape the worktree root.
  * (CONTRACTS resolveContainedWorktreeRoot.)
  */
-export function resolveContainedWorktreeRoot(stateRoot: string, subdir: string): string {
-  const base = resolve(resolve(stateRoot), "worktrees");
-  const root = resolve(base, subdir);
-  assertContainedPath(base, root, "worktree root");
-  return root;
+export function resolveContainedWorktreeRoot(root: string, subdir: string): string {
+  const base = resolve(root);
+  const contained = resolve(base, subdir);
+  assertContainedPath(base, contained, "worktree root");
+  return contained;
 }
 
 export function resolveContainedWorktreePath(
-  stateRoot: string,
+  root: string,
   subdir: string,
   workItemId: string,
 ): string {
-  const root = resolveContainedWorktreeRoot(stateRoot, subdir);
-  const dir = worktreeDirFor(root, workItemId);
-  assertContainedPath(root, dir, "worktree directory");
+  const containedRoot = resolveContainedWorktreeRoot(root, subdir);
+  const dir = worktreeDirFor(containedRoot, workItemId);
+  assertContainedPath(containedRoot, dir, "worktree directory");
   return dir;
 }
 
@@ -343,13 +350,22 @@ export async function createWorktree(
     throw new GitError(`branch '${branch}' already exists — refusing to reuse an identity`);
   }
 
-  // Disposable space is always under `<TISSUE_STATE_DIR>/worktrees/<owner-name>`;
-  // there is no configurable worktree root and no absolute-path seam.
-  const stateRoot = resolve(process.env.TISSUE_STATE_DIR ?? ".tissue");
+  // Disposable space lives under the resolved worktree root: `TISSUE_WORKTREE_ROOT`
+  // when set, otherwise `<TISSUE_STATE_DIR ?? ".tissue">/worktrees`. That root is a
+  // SHARED storage domain separate from the PRIVATE state root (L7; ADR-003).
+  const root = resolveWorktreeRoot(process.env);
   const repoSlug = `${repo.owner}-${repo.name}`;
-  const ownedRoot = resolveContainedWorktreeRoot(stateRoot, repoSlug);
+  const ownedRoot = resolveContainedWorktreeRoot(root, repoSlug);
+  // Validate the PHYSICAL ancestry of the repository-slug root against the resolved
+  // configured root BEFORE the recursive mkdir can follow it. The lexical containment
+  // above cannot see an existing `<root>/<owner>-<repo>` symlink whose target lives
+  // outside the root: `mkdirSync(..., {recursive:true})` would follow it, and because
+  // the final WorkItem directory does not exist yet the later leaf
+  // `assertNoSymlinkEscape(ownedRoot, worktreeDir)` realpaths nothing and misses the
+  // escape — letting `git worktree add` create the worktree outside the boundary.
+  assertNoSymlinkEscape(root, ownedRoot, "worktree root");
   mkdirSync(ownedRoot, { recursive: true });
-  const worktreeDir = resolveContainedWorktreePath(stateRoot, repoSlug, workItemId);
+  const worktreeDir = resolveContainedWorktreePath(root, repoSlug, workItemId);
   assertNoSymlinkEscape(ownedRoot, worktreeDir, "worktree directory");
 
   await worktreeAdd({
@@ -413,12 +429,20 @@ export async function cleanupWorktree(
   identity: WorktreeIdentity,
   mode: "merged" | "explicit-failed-hold",
 ): Promise<CleanupResult> {
-  const stateRoot = resolve(process.env.TISSUE_STATE_DIR ?? ".tissue");
+  const root = resolveWorktreeRoot(process.env);
   // Resolve the SAME canonical containment root creation used, from the relative
   // repository segment. A stale/tampered DB path can never authorize deletion
   // outside the controller-owned boundary: it must resolve inside the root and
   // pass the symlink-escape check.
-  const ownedRoot = resolveContainedWorktreeRoot(stateRoot, identity.repoSlug);
+  const ownedRoot = resolveContainedWorktreeRoot(root, identity.repoSlug);
+  // Validate the PHYSICAL ancestry of the repository-slug root against the resolved
+  // configured root BEFORE any deletion, symmetric with the create-side guard in
+  // createWorktree. The lexical check below cannot see an existing
+  // `<root>/<owner>-<repo>` symlink whose target lives outside the root: the leaf
+  // `assertNoSymlinkEscape(ownedRoot, ownedPath)` realpaths the symlinked `ownedRoot`
+  // as its root and would authorize removal of a real worktree that physically
+  // resolves outside the configured boundary.
+  assertNoSymlinkEscape(root, ownedRoot, "worktree root");
   const ownedPath = resolve(identity.worktreeDir);
   assertContainedPath(ownedRoot, ownedPath, "cleanup");
   assertNoSymlinkEscape(ownedRoot, ownedPath, "cleanup");

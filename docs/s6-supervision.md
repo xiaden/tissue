@@ -21,6 +21,21 @@ node /workspace/Tissue/src/cli.ts install-agents --force  # overwrite a divergen
 
 Startup and `tissue doctor` fail closed when either deployed definition is missing, invalid, violates the role tool profile, or has drifted from the checked-in source (deterministic SHA-256 content comparison). Working directory is irrelevant to all of it.
 
+## Plugin deployment and startup verification
+
+The moderation plugin follows the same global-directory boundary, but is deployed separately from the long-running Tissue service. The host-side one-shot writes only the Tissue-owned `tissue-moderation.ts` file into the resident's global plugin directory; it never deletes or rewrites sibling plugins, opens the Tissue/OpenCode database, or restarts OpenCode:
+
+```sh
+node /workspace/Tissue/src/cli.ts install-plugin          # idempotent
+node /workspace/Tissue/src/cli.ts install-plugin --force  # overwrite a divergent Tissue-owned file
+```
+
+The target is `TISSUE_OPENCODE_PLUGINS_DIR` when set (it must be absolute), otherwise `$XDG_CONFIG_HOME/opencode/plugins` or `$HOME/.config/opencode/plugins`. The running service treats this directory as read-only. Set `TISSUE_MODERATION_DIR` to the shared moderation state directory when a non-default location is required; deployment writes `deploy-record.json` there with the deployed SHA and restart epoch. The deployment workflow must clear the prior `plugin-loaded.json` beacon before writing the plugin and deploy record, and then the operator starts OpenCode. OpenCode's boot-bound plugin loader writes the beacon only after it loads the plugin; installing the file alone never proves load, and Tissue does not hot-load or restart the resident.
+
+Startup and the production managed-session gate verify the beacon fail-closed: it must be parseable, match the deployed SHA, and have `serverStartedAt` at or after the deploy record's `restartEpoch`. A missing or stale beacon, SHA mismatch, missing/unreadable plugin mount, or invalid deployed file keeps the plugin unloaded and prevents managed work. `tissue doctor` reports `plugin.loaded`, `reason`, `deployedSha256`, and the beacon when available; `doctor.ok` is false for an invalid/missing/drifted plugin or failed load verification. `tissue status` exposes the same credential-free plugin view. The separate `fired.attested` field is informational and never contributes to `doctor.ok`.
+
+The L14 re-probe harness is an opt-in resident-behavior check for every OpenCode version change: `TISSUE_L14_AUTHORIZED=1 node scripts/l14-reprobe.ts`. It creates exactly one scratch session and one tool invocation, records the `tool.execute.before` input shape and stable `ses_*` identity, then removes its temporary session/plugin. Without explicit authorization it records `unavailable` without contacting the resident; an unusable result stops the line, and no alternate inference is permitted.
+
 ## Stop and status
 
 Use the fixed service name and the host's s6 tools:

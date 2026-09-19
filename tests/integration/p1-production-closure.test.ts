@@ -140,13 +140,19 @@ test("target, checkout, and writable push capability are verified against the fo
   } finally { fake.cleanup(); tr.cleanup(); }
 });
 
+// Plan H (spec-first re-root): `resolveContainedWorktreeRoot`/`resolveContainedWorktreePath` take the
+// ALREADY-RESOLVED worktree root as their first argument (one canonical containment composition;
+// the resolver owns the `TISSUE_STATE_DIR ?? ".tissue"/worktrees` fallback). There is no second
+// `worktrees` segment appended — worktrees remain `<root>/<owner>-<repo>/<work-item-id>`.
 test("worktree containment rejects traversal/symlink escape and stays under the resolved root", () => {
   const state = mkdtempSync(join(tmpdir(), "tissue-p1-contain-"));
   try {
-    assert.throws(() => resolveContainedWorktreePath(state, "../evil", "wi-1"), /outside/i);
-    assert.throws(() => assertContainedPath(state, join(state, "..", "evil"), "cleanup"), /outside/i);
-    const dir = resolveContainedWorktreePath(state, "xiaden-nomarr", "wi-1");
-    assert.ok(dir.startsWith(join(state, "worktrees", "xiaden-nomarr")));
+    const root = join(state, "worktrees");
+    assert.throws(() => resolveContainedWorktreePath(root, "../evil", "wi-1"), /outside/i);
+    assert.throws(() => assertContainedPath(root, join(root, "..", "evil"), "cleanup"), /outside/i);
+    const dir = resolveContainedWorktreePath(root, "xiaden-nomarr", "wi-1");
+    assert.ok(dir.startsWith(join(root, "xiaden-nomarr")));
+    assert.equal(dir, join(root, "xiaden-nomarr", "wi-1"), "the resolved root must not be re-appended");
   } finally { rmSync(state, { recursive: true, force: true }); }
 });
 
@@ -354,6 +360,36 @@ test("config disable retains the row, runtime state, and history; re-add preserv
     assert.equal(after.created_at, createdAt);
     assert.equal(db.sql.get<{ count: number }>("SELECT COUNT(*) AS count FROM work_items WHERE id='wi-history-1'")?.count, 1);
   } finally { closeDb(db); rmSync(dir, { recursive: true, force: true }); }
+});
+
+// Plan H (spec-first re-root): when TISSUE_WORKTREE_ROOT is set, creation and cleanup resolve
+// that root while TISSUE_STATE_DIR remains the separate private-state domain (L7/L8, ADR-003).
+test("worktrees re-root to TISSUE_WORKTREE_ROOT when set; private state stays separate", async () => {
+  const tr = await createTempRepo();
+  const root = mkdtempSync(join(tmpdir(), "tissue-p1-wt-reroot-"));
+  const state = mkdtempSync(join(tmpdir(), "tissue-p1-wt-reroot-state-"));
+  const previousRoot = process.env.TISSUE_WORKTREE_ROOT;
+  const previousState = process.env.TISSUE_STATE_DIR;
+  try {
+    process.env.TISSUE_WORKTREE_ROOT = root;
+    process.env.TISSUE_STATE_DIR = state;
+    const identity = await createWorktree(repoConfig({ localDir: tr.clone }), "wi-reroot-1");
+    assert.equal(identity.repoSlug, "xiaden-nomarr");
+    assert.equal(identity.worktreeDir, join(root, "xiaden-nomarr", "wi-reroot-1"), "the worktree must live under TISSUE_WORKTREE_ROOT");
+    assert.ok(!identity.worktreeDir.startsWith(state), "the private state dir must not own the worktree");
+    const cleaned = await cleanupWorktree(identity, "merged");
+    assert.equal(cleaned.worktreeRemoved, true);
+    assert.equal(cleaned.branchDeleted, true);
+    assert.equal(existsSync(identity.worktreeDir), false);
+  } finally {
+    if (previousRoot === undefined) delete process.env.TISSUE_WORKTREE_ROOT;
+    else process.env.TISSUE_WORKTREE_ROOT = previousRoot;
+    if (previousState === undefined) delete process.env.TISSUE_STATE_DIR;
+    else process.env.TISSUE_STATE_DIR = previousState;
+    tr.cleanup();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
 });
 
 test("worktrees live under <state>/worktrees/<owner-name> and cleanup rejects any escape", async () => {

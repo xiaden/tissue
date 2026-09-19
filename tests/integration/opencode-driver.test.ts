@@ -26,6 +26,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { OpenCodeHttp, OpenCodeHttpError } from "../../src/integrations/opencode-http.ts";
 import { OpenCodeDriver } from "../../src/integrations/opencode-driver.ts";
 import { SessionDriverError } from "../../src/controller/session-driver.ts";
@@ -33,6 +37,12 @@ import { startPessimisticServer, type PessimisticOpenCodeServer } from "../helpe
 import { createTestDb, seedRepository } from "../helpers/db.ts";
 
 const DIR = "/workspace/nomarr";
+// Plan J: every real driver construction must supply a writable registry dir so
+// createRealSession can write the ses_* marker. The pessimistic fake server
+// reuses ses_1/ses_2 per instance, so each driver gets a fresh temp dir.
+function newRegistryDir(): string {
+  return mkdtempSync(join(tmpdir(), "tissue-opencode-driver-registry-"));
+}
 
 interface Harness {
   driver: OpenCodeDriver;
@@ -55,7 +65,8 @@ async function harness(serverOpts: Parameters<typeof startPessimisticServer>[0] 
     const repo = seedRepository(db);
     repoId = repo.id;
   }
-  const driver = new OpenCodeDriver({ http, ...(db ? { db } : {}) });
+  const registryDir = newRegistryDir();
+  const driver = new OpenCodeDriver({ http, ...(db ? { db } : {}), registryDir });
   const ref = await driver.createRealSession("triage", DIR, {
     repoId,
     directory: DIR,
@@ -69,6 +80,7 @@ async function harness(serverOpts: Parameters<typeof startPessimisticServer>[0] 
     cleanup: async () => {
       await server.close();
       dbCleanup?.();
+      rmSync(registryDir, { recursive: true, force: true });
     },
   };
 }
@@ -76,7 +88,7 @@ async function harness(serverOpts: Parameters<typeof startPessimisticServer>[0] 
 test("createRealSession returns only an OpenCode-created ses_... identity (refuses others)", async () => {
   const server = await startPessimisticServer({ sessionIdPrefix: "ses_" });
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   try {
     const ref = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
     assert.match(ref.sessionId, /^ses_[A-Za-z0-9]+$/, "identity must be ses_...");
@@ -89,7 +101,7 @@ test("createRealSession returns only an OpenCode-created ses_... identity (refus
 test("createRealSession rejects a non-ses_ server identity (real-session identity is only real)", async () => {
   const server = await startPessimisticServer({ sessionIdPrefix: "foo_" });
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   try {
     await assert.rejects(
       driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" }),
@@ -103,7 +115,7 @@ test("createRealSession rejects a non-ses_ server identity (real-session identit
 test("session created with ?directory= maps to that directory; projectID is server-assigned, never derived", async () => {
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   try {
     const ref = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
     const rec = server.sessionByDirectory(DIR);
@@ -138,7 +150,7 @@ test("getSessionStatus maps idle/busy/retry/missing and never confuses idle with
 test("busy and retry are reported NON-idle; a deleted session is missing", async () => {
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   const { sessionId } = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
   try {
     server.setBusy(sessionId);
@@ -157,7 +169,7 @@ test("busy and retry are reported NON-idle; a deleted session is missing", async
 test("RG-3 alignment: a busy prompt is accepted and persisted, never busy-rejected by default", async () => {
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   const { sessionId } = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
   try {
     server.setBusy(sessionId);
@@ -186,7 +198,7 @@ test("RG-3 alignment: 409 busy rejection is an explicit opt-in scenario, not the
   const server = await startPessimisticServer();
   server.promptWhileBusy = "http_409";
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   const { sessionId } = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
   try {
     server.setBusy(sessionId);
@@ -244,7 +256,7 @@ test("promptSession is a sync turn barrier and observeCompletion matches the par
 test("observeCompletion: a lone nonce user message (noReply-equivalent) is not completion", async () => {
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   const { sessionId } = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
   try {
     const nonce = `nonce-only-${Date.now()}`;
@@ -259,7 +271,7 @@ test("observeCompletion: a lone nonce user message (noReply-equivalent) is not c
 test("observeCompletion excludes summary=true / mode=compaction turns, then matches a later real turn", async () => {
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   const { sessionId } = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
   try {
     const nonce = `nonce-compaction-${Date.now()}`;
@@ -287,7 +299,7 @@ test("observeCompletion excludes summary=true / mode=compaction turns, then matc
 test("observeCompletion requires parentID = the nonce user message (a different parent is not completion)", async () => {
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   const { sessionId } = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
   try {
     const nonce = `nonce-parent-${Date.now()}`;
@@ -304,7 +316,7 @@ test("observeCompletion requires parentID = the nonce user message (a different 
 test("missing session (deleted) resolves to missing status and session_missing completion", async () => {
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   const { sessionId } = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
   try {
     server.deleteSession(sessionId);
@@ -359,7 +371,7 @@ test("mapping is persisted only in the Tissue opencode_sessions table", async ()
   const t = createTestDb();
   try {
     const repo = seedRepository(t.db);
-    const driver = new OpenCodeDriver({ http, db: t.db });
+    const driver = new OpenCodeDriver({ http, db: t.db, registryDir: newRegistryDir() });
     const ref = await driver.createRealSession("triage", DIR, {
       repoId: repo.id,
       directory: DIR,
@@ -412,7 +424,7 @@ test("the driver exposes no lifecycle-mutating Tissue tool surface to sessions",
 test("the fake server is pessimistic: prompts can succeed OR fail per scenario (never hard-coded)", async () => {
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
-  const driver = new OpenCodeDriver({ http });
+  const driver = new OpenCodeDriver({ http, registryDir: newRegistryDir() });
   const { sessionId } = await driver.createRealSession("triage", DIR, { repoId: "r1", directory: DIR, kind: "triage" });
   try {
     // Succeeds by default (fake CAN succeed).

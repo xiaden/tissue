@@ -34,9 +34,19 @@ import { recordTransition } from "../../src/domain/transitions.ts";
 import { applyEnvelope, type AgentEnvelope } from "../../src/domain/envelopes.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const REPO = "xiaden/nomarr";
 const CONFIG: TissueConfig = { pollIntervalSeconds: 300, maxConcurrentGlobal: 3, retentionDays: 30, agents: {}, repos: [] };
+// Plan J: the real driver writes ses_* markers; give it a writable temp registry.
+const REGISTRY_DIR = mkdtempSync(join(tmpdir(), "tissue-r19-registry-"));
+
+// Each test gets a clean marker namespace while preserving a writable registry root.
+function resetRegistry(): void {
+  for (const entry of readdirSync(REGISTRY_DIR)) rmSync(join(REGISTRY_DIR, entry), { force: true });
+}
 
 function snapshot(issueNumber: number, title: string, updatedAt = "2026-09-10T00:00:00.000Z") {
   return {
@@ -182,7 +192,8 @@ test("R19 pessimistic OpenCode busy/missing session states never become completi
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
   const t = createTestDb();
-  const driver = new OpenCodeDriver({ http, db: t.db });
+  resetRegistry();
+  const driver = new OpenCodeDriver({ http, db: t.db, registryDir: REGISTRY_DIR });
   try {
     seedRepository(t.db);
     insertWorkItem(t.db, { id: "wi-busy", repo_id: REPO, state: "RUNNING", base_branch: "main" });
@@ -232,7 +243,8 @@ test("R19 deleted resolution session: census is missing, reconcile holds FAILED_
   const server = await startPessimisticServer();
   const http = new OpenCodeHttp({ baseUrl: server.baseUrl() });
   const t = createTestDb();
-  const driver = new OpenCodeDriver({ http, db: t.db });
+  resetRegistry();
+  const driver = new OpenCodeDriver({ http, db: t.db, registryDir: REGISTRY_DIR });
   try {
     const repo = seedRepository(t.db);
     const wi = insertWorkItem(t.db, { id: "wi-census-loss", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
