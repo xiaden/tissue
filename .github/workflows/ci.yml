@@ -124,10 +124,18 @@ jobs:
           for service in tissue opencode-fixture; do
             id="$(docker compose -f compose.yml -f ci-compose.yml ps -q "$service")"
             test -n "$id"
-            status="$(docker inspect "$id" --format '{{.State.Status}}')"
-            health="$(docker inspect "$id" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}')"
-            printf '%s status=%s health=%s\n' "$service" "$status" "$health" | tee -a leg-3-boot.log
-            if [ "$status" != running ] || { [ "$health" != healthy ] && [ "$health" != none ]; }; then
+            ready=0
+            for attempt in $(seq 1 30); do
+              status="$(docker inspect "$id" --format '{{.State.Status}}')"
+              health="$(docker inspect "$id" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}')"
+              printf '%s attempt=%s status=%s health=%s\n' "$service" "$attempt" "$status" "$health" | tee -a leg-3-boot.log
+              if [ "$status" = running ] && { [ "$health" = healthy ] || [ "$health" = none ]; }; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" -ne 1 ]; then
               docker inspect "$id" >> leg-3-boot.log
               docker logs "$id" >> leg-3-boot.log 2>&1 || true
               exit 1
