@@ -14,7 +14,7 @@ import { openTissueDb, closeDb } from "./db/open.ts";
 import { GhClient } from "./integrations/gh-client.ts";
 import { createProductionAssembly } from "./runtime/entrypoint.ts";
 import { runDaemon, SseWakeHint } from "./runtime/daemon.ts";
-import { installAgentDefinitions } from "./runtime/resident.ts";
+import { installAgentDefinitions, installModerationPlugin } from "./runtime/resident.ts";
 import {
   OperationError,
   statusOperation,
@@ -45,6 +45,7 @@ export const COMMANDS = [
   "unpause",
   "cleanup",
   "install-agents",
+  "install-plugin",
   "doctor",
   "smoke",
 ] as const;
@@ -113,6 +114,13 @@ const hDoctor: Handler = async (ctx, _args) => {
  */
 const hInstallAgents: Handler = async (ctx, args) => {
   const result = installAgentDefinitions({ force: args.includes("--force") });
+  printJson(ctx, result);
+  return result.ok ? 0 : 1;
+};
+
+/** Host-side one-shot plugin deployment; operator must restart OpenCode to load it. */
+const hInstallPlugin: Handler = async (ctx, args) => {
+  const result = installModerationPlugin({ force: args.includes("--force") });
   printJson(ctx, result);
   return result.ok ? 0 : 1;
 };
@@ -203,6 +211,7 @@ const TABLE: CommandEntry[] = [
   { name: "unpause", usage: "unpause <owner/repo|work-item-id>", summary: "reset a paused repo/work", run: hUnpause },
   { name: "cleanup", usage: "cleanup <work-item-id>", summary: "release a failed-hold work item", run: hCleanup },
   { name: "install-agents", usage: "install-agents [--force]", summary: "deploy Tissue agents to the OpenCode global dir", run: hInstallAgents },
+  { name: "install-plugin", usage: "install-plugin [--force]", summary: "host-side plugin one-shot; restart OpenCode after deployment", run: hInstallPlugin },
   { name: "doctor", usage: "doctor", summary: "run environment self-checks", run: hDoctor },
   { name: "smoke", usage: "smoke", summary: "run a smoke self-check", run: hSmoke },
 ];

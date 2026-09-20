@@ -5,12 +5,21 @@ supervised reconcile daemon controller. The service is a `longrun` supervised
 by s6-svscan (already PID 1 on this host), stays resident, and is loopback-only
 by construction.
 
+> **Clarification (2026-09-18; current container packaging).** The non-goals below
+> apply to this host s6 A' service and remain unchanged. They do not describe the
+> separate Tissue container package: its internal health listener may bind
+> `0.0.0.0` for Docker-network-only access on `8787`, using Compose `expose` and
+> no host `ports` publication. This is a listener/health foundation, not a claim
+> of production cutover or release readiness. See
+> `artifacts/requirements/TISSUE-MIGRATION-REQUEST.md` L5/L6/L22/L23/L24,
+> `compose.yml`, and `artifacts/plans/pending/TASK-tissue-N-container-packaging.md`.
+
 ## Non-goals (D' is never co-built)
 
 - No child `opencode run` process launching per turn.
 - No durable `turn_in_flight` ledger.
 - No process-group reaping of leader processes.
-- No `0.0.0.0` / public binding anywhere.
+- No `0.0.0.0` / public binding in this host s6 A' service.
 
 The D' alternative shell is documented in the DD only; it is not a release implementation.
 

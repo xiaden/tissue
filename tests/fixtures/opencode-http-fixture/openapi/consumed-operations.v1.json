@@ -1,0 +1,12 @@
+[
+  { "method": "POST", "path": "/session" },
+  { "method": "GET", "path": "/session" },
+  { "method": "GET", "path": "/session/{sessionID}" },
+  { "method": "DELETE", "path": "/session/{sessionID}" },
+  { "method": "POST", "path": "/session/{sessionID}/abort" },
+  { "method": "GET", "path": "/session/status" },
+  { "method": "GET", "path": "/session/{sessionID}/message" },
+  { "method": "POST", "path": "/session/{sessionID}/message" },
+  { "method": "POST", "path": "/session/{sessionID}/prompt_async" },
+  { "method": "GET", "path": "/event" }
+]

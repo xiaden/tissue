@@ -22,13 +22,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   installAgentDefinitions,
+  installModerationPlugin,
   resolveOpenCodeGlobalAgentsDir,
   resolveSourceAgentsDir,
   validateTissueAgentDefinitions,
@@ -127,11 +128,32 @@ test("C: startup and doctor fail closed on missing or drifted deployed definitio
   const empty = mkdtempSync(join(tmpdir(), "tissue-empty-agents-"));
   const stateDir = mkdtempSync(join(tmpdir(), "tissue-doctor-"));
   const healthy = freshDeployedDir();
+  const pluginDir = mkdtempSync(join(tmpdir(), "tissue-doctor-plugin-"));
+  const moderationDir = mkdtempSync(join(tmpdir(), "tissue-doctor-moderation-"));
+  const pluginDeployment = installModerationPlugin({ pluginsDir: pluginDir, sourceDir: join(ROOT, "plugin"), moderationDir, restartEpoch: 6_000 });
+  assert.equal(pluginDeployment.ok, true, pluginDeployment.errors.join("; "));
+  writeFileSync(join(moderationDir, "plugin-loaded.json"), JSON.stringify({ kind: "loaded", pluginSha256: pluginDeployment.deployedSha256, serverStartedAt: 6_001 }));
   const tissue = createTestDb();
   const server = await startPessimisticServer();
   const logger = new JsonLogger(new CapturingSink().writeable());
   const config: TissueConfig = { pollIntervalSeconds: 60, maxConcurrentGlobal: 1, retentionDays: 30, agents: {}, repos: [] };
   const prior = process.env.TISSUE_OPENCODE_AGENTS_DIR;
+  const priorPluginsDir = process.env.TISSUE_OPENCODE_PLUGINS_DIR;
+  const priorModerationDir = process.env.TISSUE_MODERATION_DIR;
+  process.env.TISSUE_OPENCODE_PLUGINS_DIR = pluginDir;
+  process.env.TISSUE_MODERATION_DIR = moderationDir;
+  // Deterministic registry mount fixture: `doctor` now also asserts the managed-
+  // session registry mount (plan I, P3-S2), so point it at a real directory listed
+  // in an injected mount table instead of the container-only default path.
+  const registryRoot = mkdtempSync(join(tmpdir(), "tissue-doctor-registry-"));
+  const registryDir = join(registryRoot, "registry");
+  mkdirSync(registryDir, { recursive: true });
+  const registryMountInfo = join(registryRoot, "mountinfo");
+  writeFileSync(registryMountInfo, `40 20 0:100 / ${registryDir} rw,relatime - ext4 /dev/sda rw\n`, "utf8");
+  const priorRegistryDir = process.env.TISSUE_SESSION_REGISTRY_DIR;
+  const priorRegistryMountInfo = process.env.TISSUE_SESSION_REGISTRY_MOUNTINFO;
+  process.env.TISSUE_SESSION_REGISTRY_DIR = registryDir;
+  process.env.TISSUE_SESSION_REGISTRY_MOUNTINFO = registryMountInfo;
   try {
     // Missing: a definition the resident would need is simply not deployed.
     const missing = validateTissueAgentDefinitions({ agentsDir: empty, sourceDir: resolveSourceAgentsDir() });
@@ -179,11 +201,22 @@ test("C: startup and doctor fail closed on missing or drifted deployed definitio
   } finally {
     if (prior === undefined) delete process.env.TISSUE_OPENCODE_AGENTS_DIR;
     else process.env.TISSUE_OPENCODE_AGENTS_DIR = prior;
+    if (priorPluginsDir === undefined) delete process.env.TISSUE_OPENCODE_PLUGINS_DIR;
+    else process.env.TISSUE_OPENCODE_PLUGINS_DIR = priorPluginsDir;
+    if (priorModerationDir === undefined) delete process.env.TISSUE_MODERATION_DIR;
+    else process.env.TISSUE_MODERATION_DIR = priorModerationDir;
+    if (priorRegistryDir === undefined) delete process.env.TISSUE_SESSION_REGISTRY_DIR;
+    else process.env.TISSUE_SESSION_REGISTRY_DIR = priorRegistryDir;
+    if (priorRegistryMountInfo === undefined) delete process.env.TISSUE_SESSION_REGISTRY_MOUNTINFO;
+    else process.env.TISSUE_SESSION_REGISTRY_MOUNTINFO = priorRegistryMountInfo;
     tissue.cleanup();
     await server.close();
     rmSync(empty, { recursive: true, force: true });
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(healthy, { recursive: true, force: true });
+    rmSync(pluginDir, { recursive: true, force: true });
+    rmSync(moderationDir, { recursive: true, force: true });
+    rmSync(registryRoot, { recursive: true, force: true });
   }
 });
 
@@ -194,6 +227,22 @@ test("D: enabled work always addresses the dedicated agents, even when config om
   const logger = new JsonLogger(new CapturingSink().writeable());
   const stateRoot = join(process.cwd(), ".tissue", `e2e-agents-${process.pid}-${Date.now()}`);
   const deployed = freshDeployedDir();
+  // Plan M Phase 6: the real production gate requires a deployed plugin and a
+  // boot beacon newer than its deployment epoch; provision that contract rather
+  // than bypassing the fail-closed managedGate.
+  const moderationDir = mkdtempSync(join(tmpdir(), "tissue-p5-moderation-"));
+  const pluginDir = mkdtempSync(join(tmpdir(), "tissue-p5-plugin-"));
+  const priorModerationDir = process.env.TISSUE_MODERATION_DIR;
+  const pluginInstall = installModerationPlugin({ pluginsDir: pluginDir, moderationDir, restartEpoch: T0 });
+  assert.equal(pluginInstall.ok, true, pluginInstall.errors.join("; "));
+  writeFileSync(join(moderationDir, "plugin-loaded.json"), JSON.stringify({
+    kind: "loaded",
+    pluginSha256: pluginInstall.deployedSha256,
+    serverStartedAt: T0 + 1,
+  }));
+  process.env.TISSUE_MODERATION_DIR = moderationDir;
+  // Plan J: the real driver writes ses_* markers; supply a writable temp registry.
+  const registryDir = mkdtempSync(join(tmpdir(), "tissue-p5-registry-"));
   let clock = T0;
 
   const scenario: FakeGhScenario = {
@@ -251,13 +300,19 @@ test("D: enabled work always addresses the dedicated agents, even when config om
       logger,
       db: tissue.db,
       stateDir: stateRoot,
-      endpoint: server.baseUrl(),
-      agentsDir: deployed,
+       endpoint: server.baseUrl(),
+       agentsDir: deployed,
+       pluginsDir: pluginDir,
+       registryDir,
       gh: new GhClient({ binary: fake.binary }),
-      now: () => new Date(clock),
-    });
+       now: () => new Date(clock),
+     });
+     // The production predicate captures the resolved moderation directory; avoid
+     // leaking this fixture's process-global environment into concurrent tests.
+     if (priorModerationDir === undefined) delete process.env.TISSUE_MODERATION_DIR;
+     else process.env.TISSUE_MODERATION_DIR = priorModerationDir;
 
-    await assembly.reconcile();
+     await assembly.reconcile();
     assert.equal(listRepositories(tissue.db)[0]!.capability_state, "ready");
     const pass1 = await runNormalLoopPass(tissue.db, config, assembly.normalLoop);
     assert.deepEqual(pass1.errors, []);
@@ -286,8 +341,13 @@ test("D: enabled work always addresses the dedicated agents, even when config om
   } finally {
     if (priorStateDir === undefined) delete process.env.TISSUE_STATE_DIR;
     else process.env.TISSUE_STATE_DIR = priorStateDir;
-    rmSync(stateRoot, { recursive: true, force: true });
-    rmSync(deployed, { recursive: true, force: true });
+     rmSync(stateRoot, { recursive: true, force: true });
+     rmSync(deployed, { recursive: true, force: true });
+      rmSync(moderationDir, { recursive: true, force: true });
+      rmSync(pluginDir, { recursive: true, force: true });
+      rmSync(registryDir, { recursive: true, force: true });
+     if (priorModerationDir === undefined) delete process.env.TISSUE_MODERATION_DIR;
+     else process.env.TISSUE_MODERATION_DIR = priorModerationDir;
     await server.close();
     fake.cleanup();
     tissue.cleanup();

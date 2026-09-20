@@ -8,8 +8,9 @@
 
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { GhClient, GhError } from "../../src/integrations/gh-client.ts";
 import {
@@ -256,5 +257,34 @@ test("verifyRepository resolves the configured pushRemote (never hard-coded orig
     }
   } finally {
     tr.cleanup();
+  }
+});
+
+// P1-S5 (plan H, spec-first): when TISSUE_WORKTREE_ROOT is set, creation and cleanup
+// re-root there while TISSUE_STATE_DIR stays the separate private-state domain (ADR-003).
+test("createWorktree re-roots under TISSUE_WORKTREE_ROOT when set; private state stays separate", async () => {
+  const tr = await createTempRepo();
+  const root = mkdtempSync(join(tmpdir(), "tissue-wt-reroot-"));
+  const priorRoot = process.env.TISSUE_WORKTREE_ROOT;
+  process.env.TISSUE_WORKTREE_ROOT = root;
+  try {
+    const repo = repoConfig({ localDir: tr.clone });
+    const wid = "wi-rerooted-1";
+    const ident = await createWorktree(repo, wid);
+
+    assert.equal(ident.repoSlug, "xiaden-nomarr");
+    assert.equal(ident.worktreeDir, join(root, "xiaden-nomarr", wid), "the worktree must live under TISSUE_WORKTREE_ROOT");
+    assert.equal(ident.branch, `tissue/wi_${wid}`);
+    assert.ok(!ident.worktreeDir.startsWith(STATE_DIR), "the configured root must replace the state-rooted derivation");
+
+    const res = await cleanupWorktree(ident, "merged");
+    assert.equal(res.worktreeRemoved, true);
+    assert.equal(res.branchDeleted, true);
+    assert.equal(existsSync(ident.worktreeDir), false);
+  } finally {
+    if (priorRoot === undefined) delete process.env.TISSUE_WORKTREE_ROOT;
+    else process.env.TISSUE_WORKTREE_ROOT = priorRoot;
+    tr.cleanup();
+    rmSync(root, { recursive: true, force: true });
   }
 });

@@ -1,0 +1,15 @@
+artifacts/
+tests/
+.git/
+.gitignore
+node_modules/
+coverage/
+*.log
+tissue.db
+tissue.db-*
+state/
+worktrees/
+.tissue/
+tissue.yml
+compose.yml
+Dockerfile

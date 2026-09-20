@@ -16,6 +16,8 @@
 //   - Local paths must be absolute and free of NUL/control characters.
 
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { parse as parseYaml } from "yaml";
 
 import type {
@@ -126,11 +128,37 @@ function validateRepoIdentity(owner: string, name: string, path: string): void {
   }
 }
 
-function validateAbsolutePath(value: string, path: string): string {
+export function validateAbsolutePath(value: string, path: string): string {
   if (CONTROL_RE.test(value) || !ABSOLUTE_PATH_RE.test(value)) {
     throw new ConfigError(`${path}: must be an absolute path with no control characters`);
   }
   return value;
+}
+
+/**
+ * Resolve the absolute root for disposable linked worktrees.
+ *
+ * `TISSUE_WORKTREE_ROOT` is the single seam separating the SHARED worktree
+ * storage domain from the PRIVATE controller state root (`L7`; ADR-003). Linked
+ * git worktrees store absolute `gitdir` references and `worktrees.path` /
+ * `opencode_sessions.directory` are absolute and persisted, so the shared root
+ * must be a stable absolute path mounted identically into both containers.
+ *
+ * - Set ⇒ validated with the shared `validateAbsolutePath` rule (never a forked
+ *   check) and returned verbatim. The configured value is ALREADY the
+ *   `<...>/worktrees` level; the resolver does not append `worktrees` again.
+ * - Unset ⇒ `resolve(env.TISSUE_STATE_DIR ?? ".tissue", "worktrees")`, which is
+ *   BYTE-IDENTICAL to the derivation that preceded this seam (`L25`), so no
+ *   existing deployed worktree path changes meaning.
+ */
+export function resolveWorktreeRoot(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+): string {
+  const configured = env.TISSUE_WORKTREE_ROOT;
+  if (configured !== undefined) {
+    return validateAbsolutePath(configured, "TISSUE_WORKTREE_ROOT");
+  }
+  return resolve(env.TISSUE_STATE_DIR ?? ".tissue", "worktrees");
 }
 
 function validateRemote(value: string, path: string): string {

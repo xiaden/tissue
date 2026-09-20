@@ -3,9 +3,10 @@
 // M5 identifier-safe git subprocess client (R17/DD worktrees section). Every git
 // operation is a typed argv spawn (never a shell string). Only controller-
 // generated `tissue/wi_<opaque-id>` branches are ever created or deleted, and
-// worktree paths are the controller-owned disposable directories derived from
-// the Tissue state root (`TISSUE_STATE_DIR`)/worktrees. `.tissue/` context files are excluded from the
-// worktree so untrusted issue bodies are never staged by `git add -A`.
+// worktree paths are the controller-owned disposable directories under the
+// resolved worktree root (`TISSUE_WORKTREE_ROOT`, falling back to
+// `<TISSUE_STATE_DIR>`/worktrees). `.tissue/` context files are excluded from
+// the worktree so untrusted issue bodies are never staged by `git add -A`.
 //
 // `git` (real git 2.47.3) is invoked by name — it is not the unverified PATH gh
 // shim and carries no credential advisory. All untrusted GitHub text is DATA and
@@ -102,7 +103,7 @@ export async function localBranchExists(dir: string, branch: string): Promise<bo
 export interface WorktreeAddSpec {
   /** Main checkout (owns the repository) — absolute path. */
   mainDir: string;
-  /** Disposable linked-worktree path under `<TISSUE_STATE_DIR>/worktrees`. */
+  /** Disposable linked-worktree path under the resolved worktree root. */
   worktreeDir: string;
   /** Controller-generated `tissue/wi_<opaque>` branch. */
   branch: string;

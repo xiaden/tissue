@@ -4,11 +4,15 @@
 
 The release package contains one s6-rc `longrun` for the A′ supervised reconcile daemon. It uses the existing host supervisor, one separate Tissue SQLite/WAL database, loopback-only local surfaces, typed `/usr/bin/gh`/git subprocesses, and real durable OpenCode-created sessions. D′ is documentation-only and is not co-built.
 
-## Persistence and production topology (current source)
+> **SUPERSEDED (2026-09-18; current container packaging).** The A′ statements below describe the historical/host s6 release shape and must not be read as the complete current deployment topology. The independently packaged Tissue container now has a Docker-network-only `8787` listener and may bind its internal health listener to `0.0.0.0`; Compose uses `expose`, never host `ports`. This establishes the listener/health foundation only. It does **not** claim production cutover or release readiness. The host s6 A′ service remains loopback-only and resident-only. See `artifacts/requirements/TISSUE-MIGRATION-REQUEST.md` (L5/L6/L22/L23/L24), `artifacts/plans/pending/TASK-tissue-N-container-packaging.md` (Contracts), and `compose.yml`.
+
+## Persistence and topology
+
+### Historical A′ host topology
 
 - Production migrations are exactly one: `{ version: 1, name: "initial_schema" }` (`SCHEMA_VERSION = 1`). There is no `owned_serves` table and no owned-serve/legacy-serve lifecycle. There are no forward migrations, compatibility shims, legacy-column support, or upgrade paths.
 - Reconciliation is resident-only: one supervised Tissue daemon (`deploy/s6-rc/tissue`) connects to the pre-existing resident OpenCode endpoint via `TISSUE_OPENCODE_URL` and never starts, supervises, reaps, or restarts a serve.
-- Disposable worktrees live under `<TISSUE_STATE_DIR>/worktrees/<owner>-<name>/<work-item-id>`; there is no configurable or absolute worktree root.
+- Disposable worktrees use the absolute `TISSUE_WORKTREE_ROOT` environment override when set, with layout `<TISSUE_WORKTREE_ROOT>/<owner>-<name>/<work-item-id>`; when unset, the root falls back byte-identically to `<TISSUE_STATE_DIR>/worktrees` (or `.tissue/worktrees`).
 
 ## Prohibited infrastructure audit
 
@@ -29,7 +33,9 @@ The release package contains one s6-rc `longrun` for the A′ supervised reconci
 
 The Tissue release package still ships no Actions runner: the A′ runtime is the single s6-rc `longrun` described above. Separately, this repository now uses GitHub Actions purely as a development-time quality gate:
 
-- `.github/workflows/ci.yml` runs the existing deterministic gate (`npm run typecheck`, `npm run lint`, `npm test`) on pushes and pull requests to `main`; its `verify` job is the required status check on the protected branch.
+- `.github/workflows/ci.yml` runs the deterministic gate (`npm run typecheck`, `npm run lint`, `npm test`) in its `verify` job on pushes and pull requests to `main`; `verify` remains the required status check on the protected branch.
+- The same workflow defines a GitHub-hosted `container` job with eight individually named Docker/Compose legs: build, Compose config, boot, `tissue-net` membership, registry RW/RO and mount assertions, loud registry-mount failure handling, healthy `tissue doctor`, and deterministic fixture HTTP-driver smoke. The fixture is dependency-free and exercises the Tissue/OpenCode HTTP-driver boundary without making a real-runtime compatibility claim. Real OpenCode compatibility is a separate, workflow-dispatch-only `opencode-compat` job requiring the authorized `OPENCODE_COMPAT_VERSION=1.18.31` and an operator-provided command; it is not part of the container legs. Neither job defines the production resident or claims resident plugin load or `fired`.
+- The container job is an execution venue for development-time evidence, not release-runtime infrastructure. No hosted run or per-leg CI result is recorded here; the job is not documented as a required branch check. Hosted evidence is fail-closed: an authorized operator must record the GitHub run ID, all eight individually named container-leg outcomes (build, Compose config, boot, network membership, registry/mount assertions, loud registry-mount failure, healthy `tissue doctor`, and deterministic fixture smoke), and the uploaded `leg-*.log` artifact reference. The opt-in `opencode-compat` job has separate evidence requirements: retain its run ID plus the authorized command/version evidence, and do not infer real compatibility from fixture-leg output. Missing or unsuccessful evidence leaves the corresponding claim blocked/escalated. Leg 3 follows the container topology, and Leg 5 follows the registry/mount contracts. Production cutover, release readiness, and owner-side resident service/mount decisions remain outside this workflow.
 - `.github/workflows/codeql.yml` runs CodeQL code scanning for JavaScript/TypeScript on `main` and on a weekly schedule.
 - `.github/dependabot.yml` keeps npm dependencies and SHA-pinned actions current.
 

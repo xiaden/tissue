@@ -7,11 +7,12 @@
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import YAML from "yaml";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 
 const SCAN_DIRS = ["src", "tests", "scripts", "deploy", "agents"];
-const SCAN_FILES = ["package.json", "tsconfig.json", ".gitignore"];
+const SCAN_FILES = ["package.json", "tsconfig.json", ".gitignore", "compose.yml"];
 
 const TEXT_EXTENSIONS = new Set([
   ".ts", ".js", ".mjs", ".cjs", ".json", ".md", ".yml", ".yaml", ".gitignore",
@@ -44,11 +45,45 @@ function collectFiles(dir: string, out: string[]): void {
 
 const problems: string[] = [];
 
-function fail(rel: string, message: string): void {
+/** Records a lint violation for the file currently being scanned. */
+export function fail(rel: string, message: string): void {
   problems.push(`${rel}: ${message}`);
 }
 
-function check(rel: string, content: string): void {
+function composeHasWildcardBind(value: unknown): boolean {
+  if (typeof value === "string") return value.includes("0.0.0.0");
+  if (Array.isArray(value)) return value.some(composeHasWildcardBind);
+  if (value !== null && typeof value === "object") return Object.values(value).some(composeHasWildcardBind);
+  return false;
+}
+
+function checkCompose(rel: string, content: string): void {
+  let document: unknown;
+  try {
+    document = YAML.parse(content);
+  } catch {
+    fail(rel, "invalid Compose YAML");
+    return;
+  }
+  if (document === null || typeof document !== "object") return;
+  const services = (document as { services?: unknown }).services;
+  if (services === null || typeof services !== "object" || Array.isArray(services)) return;
+  for (const [serviceName, rawService] of Object.entries(services)) {
+    if (rawService === null || typeof rawService !== "object" || Array.isArray(rawService)) continue;
+    const service = rawService as { expose?: unknown; ports?: unknown };
+    const hasPorts = service.ports !== undefined;
+    if (composeHasWildcardBind(rawService) && hasPorts) fail(rel, `service '${serviceName}': wildcard bind requires no ports`);
+    if (serviceName === "tissue") {
+      if (service.expose === undefined) fail(rel, "service 'tissue': expose is required");
+      if (hasPorts) fail(rel, "service 'tissue': ports are forbidden");
+    }
+  }
+}
+
+/** Checks source or Compose text and returns violations found in this invocation. */
+export function check(rel: string, content: string): string[] {
+  const start = problems.length;
+  if (rel === "compose.yml") checkCompose(rel, content);
   if (/console\.(log|warn|error|info)\(/.test(content)) {
     // Only enforced under src/ (routing through the structured logger), and the
     // lint script itself is exempt because it is an operational harness.
@@ -58,9 +93,11 @@ function check(rel: string, content: string): void {
     if (/[ \t]+$/.test(line)) fail(rel, `trailing whitespace on line ${idx + 1}`);
     if (/\t/.test(line)) fail(rel, `tab character on line ${idx + 1}`);
   });
+  return problems.slice(start);
 }
 
-function secretScan(rel: string, content: string): void {
+/** Rejects tracked content matching credential or private-key patterns. */
+export function secretScan(rel: string, content: string): void {
   // Credential-value leakage guards: real GitHub/generic token shapes and
   // private-key markers must never appear in tracked config/templates/code.
   const tokenPatterns = [
@@ -73,7 +110,8 @@ function secretScan(rel: string, content: string): void {
   }
 }
 
-function s6TemplateGuards(): void {
+/** Enforces the host s6 template's loopback-only service invariants. */
+export function s6TemplateGuards(): void {
   const runPath = join(ROOT, "deploy", "s6-rc", "tissue", "run");
   const typePath = join(ROOT, "deploy", "s6-rc", "tissue", "type");
   try {
