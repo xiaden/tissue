@@ -1,70 +1,422 @@
-name: Tissue - Build and Push to GHCR
-run-name: ${{ github.ref_name }}
+name: Tissue - Build and Publish to GHCR
+
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('manual {0} -> {1}', github.ref_name, inputs.channel)
+      || format('release {0}', github.ref_name) }}
 
 on:
   workflow_dispatch:
+    inputs:
+      channel:
+        description: "Optional non-release alias to promote"
+        required: true
+        type: choice
+        default: none
+        options:
+          - none
+          - preview
+
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+# Default deny. Individual jobs opt into additional permissions.
+permissions:
+  contents: read
 
 concurrency:
-  group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  # Do not permit concurrent mutation of aliases for the same ref.
+  # Once publication begins, allow it to finish rather than cancelling
+  # halfway through registry/attestation operations.
+  group: tissue-publish-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   GHCR_IMAGE: ghcr.io/xiaden/tissue
 
 jobs:
-  build-and-push:
+  policy:
+    name: release-policy
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: read
+      checks: read
+
+    outputs:
+      image: ${{ steps.policy.outputs.image }}
+      sha_tag: ${{ steps.policy.outputs.sha_tag }}
+      aliases: ${{ steps.policy.outputs.aliases }}
+      version: ${{ steps.policy.outputs.version }}
+      release_kind: ${{ steps.policy.outputs.release_kind }}
+
+    steps:
+      - name: Classify publication
+        id: policy
+        shell: bash
+        env:
+          IMAGE: ${{ env.GHCR_IMAGE }}
+          MANUAL_CHANNEL: ${{ inputs.channel || 'none' }}
+        run: |
+          set -euo pipefail
+
+          image="$IMAGE"
+          sha_tag="${image}:sha-${GITHUB_SHA}"
+
+          aliases=()
+          version="sha-${GITHUB_SHA}"
+          release_kind="immutable"
+
+          # ---------------------------------------------------------------
+          # AUTOMATIC RELEASE
+          #
+          # Only an actual tag PUSH can acquire release semantics.
+          #
+          # workflow_dispatch on a tag must NOT enter this branch.
+          # ---------------------------------------------------------------
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+
+            # Stable vX.Y.Z
+            if [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              major="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              patch="${BASH_REMATCH[3]}"
+
+              version="${major}.${minor}.${patch}"
+              release_kind="stable"
+
+              aliases+=("${image}:${tag}")
+              aliases+=("${image}:${version}")
+              aliases+=("${image}:${major}.${minor}")
+              aliases+=("${image}:latest")
+
+            # Prerelease vX.Y.Z-something
+            elif [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-([0-9A-Za-z][0-9A-Za-z.-]*)$ ]]; then
+              version="${tag#v}"
+              release_kind="prerelease"
+
+              aliases+=("${image}:${tag}")
+              aliases+=("${image}:${version}")
+
+            else
+              echo "::error::Unsupported release tag '${tag}'."
+              echo "::error::Expected vX.Y.Z or vX.Y.Z-prerelease."
+              exit 1
+            fi
+
+          # ---------------------------------------------------------------
+          # MANUAL BUILD
+          # ---------------------------------------------------------------
+
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            release_kind="manual"
+
+            case "$MANUAL_CHANNEL" in
+              none)
+                ;;
+
+              preview)
+                aliases+=("${image}:preview")
+                ;;
+
+              *)
+                echo "::error::Illegal manual channel '${MANUAL_CHANNEL}'."
+                exit 1
+                ;;
+            esac
+
+          else
+            echo "::error::Unsupported publication event '${GITHUB_EVENT_NAME}'."
+            exit 1
+          fi
+
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_kind=${release_kind}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "aliases<<EOF"
+            printf '%s\n' "${aliases[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Tissue publication policy"
+            echo
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| Event | \`${GITHUB_EVENT_NAME}\` |"
+            echo "| Ref | \`${GITHUB_REF}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Image | \`${image}\` |"
+            echo "| Immutable tag | \`${sha_tag}\` |"
+            echo "| Kind | \`${release_kind}\` |"
+            echo
+            echo "### Planned aliases"
+            echo
+
+            if (( ${#aliases[@]} == 0 )); then
+              echo "_None — immutable image only._"
+            else
+              for alias in "${aliases[@]}"; do
+                echo "- \`${alias}\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require successful Tissue CI
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Evaluate every relevant CI signal before release promotion. The
+          # protected branch requires verify; container and the matrix-qualified
+          # CodeQL check are additional fail-closed release checks.
+          REQUIRED_CHECKS=(
+            "verify"
+            "container"
+            "analyze (javascript-typescript)"
+          )
+
+          checks_json="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?filter=all&per_page=100"
+          )"
+
+          failed=0
+
+          for required in "${REQUIRED_CHECKS[@]}"; do
+            state="$(
+              jq -r \
+                --arg name "$required" \
+                '
+                  [
+                    .check_runs[]
+                    | select(.name == $name)
+                  ]
+                  | if length == 0 then
+                      "missing"
+                    else
+                      (sort_by(.started_at // .completed_at // "") | last) as $latest
+                      | if $latest.status != "completed" then
+                          "pending"
+                        elif $latest.conclusion == "success" then
+                          "success"
+                        elif $latest.conclusion == "cancelled" then
+                          "cancelled"
+                        else
+                          "failed"
+                        end
+                    end
+                ' \
+                <<< "$checks_json"
+            )"
+
+            case "$state" in
+              success)
+                echo "✓ ${required}"
+                ;;
+
+              missing)
+                echo "::error::Required check '${required}' is missing for ${GITHUB_SHA}."
+                failed=1
+                ;;
+
+              pending)
+                echo "::error::Required check '${required}' is not complete for ${GITHUB_SHA}."
+                failed=1
+                ;;
+
+              failed|cancelled)
+                echo "::error::Required check '${required}' has not succeeded for ${GITHUB_SHA} (state: ${state})."
+                failed=1
+                ;;
+
+              *)
+                echo "::error::Unknown state '${state}' for '${required}'."
+                failed=1
+                ;;
+            esac
+          done
+
+          (( failed == 0 ))
+
+  build:
+    name: build-immutable-image
+    needs: policy
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Login to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+      - name: Build and push immutable image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          images: |
-            ${{ env.GHCR_IMAGE }}
-          flavor: |
-            latest=false
-          tags: |
-            type=raw,value=latest
-            type=semver,pattern={{version}}
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+
+          push: true
+          pull: true
+
+          # Build exactly one runtime identity.
+          tags: ${{ needs.policy.outputs.sha_tag }}
+
           labels: |
             org.opencontainers.image.title=Tissue
             org.opencontainers.image.description=Tissue (Triaged Issue Execution) autonomous GitHub maintenance controller
-            org.opencontainers.image.source=https://github.com/xiaden/tissue
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.policy.outputs.version }}
 
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: true
-          sbom: true
-          outputs: >-
-            type=image,name=${{ env.GHCR_IMAGE }},annotation-index.org.opencontainers.image.description=Tissue (Triaged Issue Execution) autonomous GitHub maintenance controller
           cache-from: |
             type=gha
             type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
+
+          cache-to: |
+            type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
+
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest image provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ env.GHCR_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+          # xiaden/tissue is user-owned rather than organization-owned.
+          # Avoid requesting an organization artifact-storage record.
+          create-storage-record: false
+
+      - name: Verify published attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ env.GHCR_IMAGE }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          gh attestation verify \
+            "oci://${IMAGE}@${DIGEST}" \
+            --repo "${GITHUB_REPOSITORY}"
+
+      - name: Record immutable artifact
+        shell: bash
+        env:
+          IMAGE: ${{ env.GHCR_IMAGE }}
+          SHA_TAG: ${{ needs.policy.outputs.sha_tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo
+            echo "## Immutable Tissue image"
+            echo
+            echo "- Tag: \`${SHA_TAG}\`"
+            echo "- Digest: \`${IMAGE}@${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: promote-image
+    needs:
+      - policy
+      - build
+
+    if: needs.policy.outputs.aliases != ''
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote immutable digest
+        shell: bash
+        env:
+          IMAGE: ${{ env.GHCR_IMAGE }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          ALIASES: ${{ needs.policy.outputs.aliases }}
+        run: |
+          set -euo pipefail
+
+          source="${IMAGE}@${DIGEST}"
+
+          while IFS= read -r alias; do
+            [[ -z "$alias" ]] && continue
+
+            echo "Promoting ${source} -> ${alias}"
+
+            docker buildx imagetools create \
+              --tag "$alias" \
+              "$source"
+          done <<< "$ALIASES"
+
+      - name: Record promoted aliases
+        shell: bash
+        env:
+          IMAGE: ${{ env.GHCR_IMAGE }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          ALIASES: ${{ needs.policy.outputs.aliases }}
+        run: |
+          {
+            echo
+            echo "## Promoted Tissue aliases"
+            echo
+            echo "All aliases reference:"
+            echo
+            echo "\`${IMAGE}@${DIGEST}\`"
+            echo
+
+            while IFS= read -r alias; do
+              [[ -z "$alias" ]] && continue
+              echo "- \`${alias}\`"
+            done <<< "$ALIASES"
+          } >> "$GITHUB_STEP_SUMMARY"
