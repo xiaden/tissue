@@ -1,27 +1,38 @@
 # Tissue
 
-Tissue (Triaged Issue Execution) is a local, autonomous GitHub maintenance controller. It uses a durable, separate Tissue SQLite database and real OpenCode-created `ses_...` sessions; it does not add a dashboard, webhook, external queue, or second database.
+Tissue (Triaged Issue Execution) is an independent controller for autonomous GitHub maintenance. It polls configured repositories, stores durable controller state in its own SQLite database, and uses an already-running resident OpenCode service for triage and resolution sessions. Tissue does not start, supervise, restart, or reap OpenCode.
 
-## Setup
+## Requirements and setup
 
-Requirements: Node.js 26+, a local checkout, and authenticated `/usr/bin/gh` when repository operations are enabled.
+- Node.js 26 or newer
+- A local checkout of this repository
+- `/usr/bin/gh` with suitable authentication when repository operations are enabled
+- An independently running OpenCode service reachable through an approved private endpoint
 
 ```sh
 npm ci
 cp tissue.example.yml tissue.yml
-# edit tissue.yml with monitored repositories and absolute local paths
+# Edit tissue.yml and configure the resident endpoint/environment.
 npm run typecheck
 npm run lint
 npm test
 ```
 
-Configuration is intentionally small YAML: repository owner/name/path, polling and capacity defaults, retention, and optional agent model settings. Secrets, policy DSL, credential-bearing URLs, and unsafe identifiers are rejected. See [onboarding and configuration](docs/onboarding-and-config.md).
+The YAML file contains scalar polling, capacity, retention, agent/model, and repository settings. Secret material, credential-bearing URLs, and unsafe identifiers are rejected. See [onboarding and configuration](docs/onboarding-and-config.md).
 
-## Continuous integration
+## Runtime boundaries
 
-The deterministic gate (`npm run typecheck`, `npm run lint`, `npm test`) runs in the `verify` job on CI pushes and pull requests to `main` (`.github/workflows/ci.yml`). The same workflow defines a GitHub-hosted `container` job with eight named Docker/Compose legs: image build, Compose validation and boot, network membership, registry/mount assertions, loud registry-failure handling, healthy `tissue doctor`, and deterministic fixture HTTP-driver smoke. Leg 8 exercises the Tissue/OpenCode HTTP-driver boundary through the checked-in dependency-free fixture; it makes no real-runtime compatibility claim. Real OpenCode compatibility is owned by a separate, workflow-dispatch-only `opencode-compat` job that requires the authorized `OPENCODE_COMPAT_VERSION=1.18.31` and an operator-provided command. Neither job defines the production resident or claims resident plugin load or `fired`. No hosted-run evidence is recorded here, and the container job is not stated as a required branch check. Hosted evidence is fail-closed: an authorized operator must record the GitHub run ID, the outcome of each container leg (Leg 1 Docker build, Leg 2 Compose config, Leg 3 boot, Leg 4 `tissue-net` membership, Leg 5 registry RW/RO and mounts, Leg 6 loud registry-mount failure, Leg 7 healthy `tissue doctor`, and Leg 8 deterministic fixture smoke), and the uploaded `leg-*.log` artifact reference. For an opt-in compatibility run, the operator must separately retain the run ID and the command/version evidence; absence of that evidence is not a compatibility pass. `main` is protected: it requires a pull request and a passing `verify` check, and blocks force pushes and deletions. CodeQL code scanning runs on `main` and on a weekly schedule. See [infrastructure audit](docs/infrastructure-audit.md).
+Tissue has three separate storage boundaries:
 
-## CLI and supervision
+1. `TISSUE_STATE_DIR` contains Tissue's private database, WAL, routing state, and logs.
+2. `TISSUE_WORKTREE_ROOT` contains monitored checkouts and Tissue-created worktrees. These paths are shared with OpenCode at identical absolute paths. If unset, it falls back to `${TISSUE_STATE_DIR}/worktrees` (or `.tissue/worktrees`).
+3. `TISSUE_SESSION_REGISTRY_DIR` contains one empty `ses_*` marker for each managed session. Tissue writes this registry and OpenCode reads it. A marker means `MANAGED`; an absent or unreadable marker means `UNMANAGED` and the moderation plugin is inert. There is no third readiness state or readiness sentinel.
+
+Startup requires the registry directory to be writable and to be a real persisted mount. It removes markers that have no durable OpenCode session row before entering the daemon loop. Tissue never prompts or resumes a session without its marker.
+
+Agent and plugin installation is separate from the long-running service. `tissue install-agents` and `tissue install-plugin` write the resident OpenCode global directories; the daemon reads those mounts read-only. A plugin file is not considered loaded until OpenCode writes a matching load beacon after boot. Installation does not restart OpenCode.
+
+## CLI
 
 ```sh
 tissue status
@@ -31,12 +42,25 @@ tissue reconcile
 tissue enqueue OWNER/REPO#NUMBER
 tissue inspect OWNER/REPO
 tissue history WORK_ITEM_ID
+tissue pause TARGET
+tissue resume TARGET
+tissue cleanup WORK_ITEM_ID
+tissue install-agents [--force]
+tissue install-plugin [--force]
 tissue doctor
 tissue smoke
 ```
 
-`tissue daemon` is the A-prime resident loop; `tissue tick`/`reconcile` run one shared pass. A-prime is the only implementation target and the s6 package is loopback-only. D-prime is documented as a retained alternative, not co-built. See [CLI and JSONL](docs/cli-and-jsonl.md), [operations runbook](docs/operations-runbook.md), and [s6 supervision](docs/s6-supervision.md).
+`daemon` runs the resident reconcile loop. `tick` and `reconcile` run one pass. `status`, `inspect`, and `history` expose durable controller state; `cleanup` is human-only for `FAILED_HOLD` work. See [CLI and JSONL](docs/cli-and-jsonl.md).
 
-## Release and evidence
+## Container and host supervision
 
-Release records are non-promotional. Current deterministic evidence and superseded historical counts are documented in [release inputs](artifacts/designs/process/tissue-p4-release-inputs.md), [R1–R22 traceability](artifacts/designs/process/tissue-p4-traceability.md), [infrastructure audit](docs/infrastructure-audit.md), [release artifacts](artifacts/release/tissue-release-artifacts.md), and the [Plan E final report](artifacts/release/tissue-plan-e-final-report.md). Real RG-1/RG-3/RG-4/RG-5/RG-6 remain blocked without accepted current evidence; RG-2 remains deterministic-only and RG-5 supporting-only. No gate waiver, service restart, or promotion is implied.
+`compose.yml` runs Tissue as an independent container on `tissue-net`, exposes its credential-free health listener on port `8787` to that Docker network, and publishes no host port. The resident OpenCode and any proxy remain separate services and failure domains. The container health check uses `GET /`; it does not supervise or restart OpenCode. See [operations runbook](docs/operations-runbook.md).
+
+The host package under `deploy/s6-rc/tissue` is an s6 `longrun` for the same resident daemon. It consumes protected environment variables, uses the existing resident OpenCode endpoint, and does not manage OpenCode's lifecycle. See [s6 supervision](docs/s6-supervision.md) and [the s6 package README](deploy/s6-rc/README.md).
+
+## CI and compatibility boundaries
+
+The CI workflow runs deterministic typecheck, lint, and test verification. Its container job checks image/Compose topology, network membership, shared mounts, registry failure behavior, `tissue doctor`, and a dependency-free HTTP-driver fixture. Fixture results are not evidence of compatibility with real OpenCode.
+
+A separate workflow-dispatch-only `opencode-compat` job is opt-in and requires the declared OpenCode baseline `1.18.31` plus an operator-provided command. No real-runtime compatibility or production deployment claim is made by this repository. See [infrastructure audit](docs/infrastructure-audit.md).

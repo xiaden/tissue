@@ -1,33 +1,53 @@
 # Onboarding and configuration
 
-Tissue is configured by a small scalar YAML file (`TISSUE_CONFIG`, default `./tissue.yml`). Copy `tissue.example.yml`, decide every repository identity, and record the decision before adding a real repository. T8 (e) remains `NEEDS_DECISION` for `coaxk/subarr` versus measured `xiaden/subarr`; the template intentionally has `repos: []`.
+Tissue reads a small YAML configuration file selected by `TISSUE_CONFIG` (default `./tissue.yml`). Start with `tissue.example.yml`, configure the repository list and resident endpoint in the environment, then run the local checks before enabling the daemon.
 
-## Defaults and baseline
+## YAML settings
 
-`pollIntervalSeconds` defaults to 300, `maxConcurrentGlobal` to 3, and `retentionDays` to 90. Each repository defaults to one active WorkItem (`maxConcurrentPerRepo: 1`), `main` as base branch, and no auto-merge. `baselineBefore` excludes older issues; only `tissue enqueue owner/repo#number` admits one explicitly. YAML is scalar policy, never a policy DSL, and rejects secret material.
+Top-level keys are:
 
-Each repository must name owner, repository, and an absolute local checkout. Production worktrees use the shared `TISSUE_WORKTREE_ROOT` environment scalar when it is set; its value must be an absolute path and is used as the root for `<owner>-<name>/<work-item-id>`. When unset, the root falls back byte-identically to `${TISSUE_STATE_DIR}/worktrees` (or `.tissue/worktrees` when `TISSUE_STATE_DIR` is unset). Worktree creation, drift checks, and cleanup preserve containment and symlink-escape checks against that resolved root. A distinct writable fork is configured with `pushOwner`/`pushName`/`pushRemote` (the named git remote, for example `fork`); the target repository does not need push permission. Before enabling it, the owner must complete authenticated `/usr/bin/gh` Issues/protection capability audit (T8 (j)); reconcile persists the readiness result and dispatch is refused while `capability_state !== "ready"`. Missing capability is surfaced, never treated as healthy. Remote URLs must not contain credentials.
+- `pollIntervalSeconds` — polling interval; defaults to `300` and must be at least `10`.
+- `maxConcurrentGlobal` — global active-work limit; defaults to `3` and must be at least `1`.
+- `retentionDays` — durable-history retention; defaults to `90` and must be at least `1`.
+- `agents.triage` and `agents.resolution` — optional dedicated agent names and model values. Names default to `tissue-triage` and `tissue-resolve`.
+- `repos` — repository configuration entries; the example leaves this empty until an operator chooses repositories.
 
-## Agent/model split and boundaries
+Each repository entry supplies owner, name, local checkout, enablement, polling/capacity overrides, base branch, labels, baseline, merge policy, and optional push-fork fields. `remote` URLs must not contain credentials. A push fork may use `pushOwner`, `pushName`, and `pushRemote`; the target repository need not grant push permission. Configuration is scalar data, not a policy language, and unknown keys or secret-shaped values are rejected.
 
-Triage and resolution roles are separate (`tissue-triage` and `tissue-resolve`), but the concrete model split remains T8 (f) `NEEDS_DECISION`. Agents receive bounded, marked-untrusted digests and typed envelopes. The controller owns polling, persistence, deduplication, queue/leases, session/worktree/PR identity, routing, retries, protections, and cleanup. Agents own semantic triage and engineering reasoning. No lifecycle-mutating Tissue tool is exposed to an agent.
+## Environment
 
-## Sessions, retention, and export
+- `TISSUE_CONFIG` — YAML path, default `./tissue.yml`.
+- `TISSUE_STATE_DIR` — private Tissue state root, default `.tissue`; the database is `${TISSUE_STATE_DIR}/tissue.db`.
+- `TISSUE_WORKTREE_ROOT` — absolute shared worktree root. If unset, Tissue uses `${TISSUE_STATE_DIR}/worktrees`.
+- `TISSUE_SESSION_REGISTRY_DIR` — absolute persisted registry path, default `/tissue-session-registry`. Relative paths and `/run` paths are rejected.
+- `TISSUE_SESSION_REGISTRY_MOUNTINFO` — optional diagnostic mount-table override for `status` and `doctor`; production normally leaves it unset and reports whether it was overridden.
+- `TISSUE_OPENCODE_URL` — required HTTP(S) URL for the already-running resident OpenCode service. Credentials must not be embedded in the URL.
+- `TISSUE_OPENCODE_ALLOWED_ORIGINS` — optional exact-origin allowlist; the configured origin must match one entry exactly when set.
+- `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` — optional credentials supplied separately from the URL.
+- `TISSUE_OPENCODE_AGENTS_DIR` — resident global agent directory override.
+- `TISSUE_OPENCODE_PLUGINS_DIR` — resident global plugin directory override; it must be absolute.
+- `TISSUE_MODERATION_DIR` — moderation deployment records and load beacon directory.
+- `TISSUE_HTTP_PORT` — internal health listener port, default `8787`.
 
-Only OpenCode-created durable `ses_...` sessions count. Triage sessions are per repository where supported; active WorkItems have exactly one resolution session in the linked worktree. Sessions remain UX-visible and `RETAINED` after merge. Issue, WorkItem, PR, transitions, effects, logs, session mapping, and transcript history remain queryable; only disposable worktrees/local branches are cleaned. Export is backup/introspection, not core retention. Logs are not sessions.
+Without an explicit allowlist, the resident endpoint must resolve to loopback or a private address. With an allowlist, the origin must exactly match an allowlist entry. Wildcard binds, public hosts, non-HTTP(S) schemes, and embedded credentials are rejected before credentials are attached. In Compose, the deliberate exact-origin value is `http://opencode:4096` on `tissue-net`.
 
-## Credentials and safety
+## Storage boundaries
 
-Use the validated `/usr/bin/gh` binary and authenticated host credentials; never print tokens, read credential files into logs, embed credentials in URLs, or trust an unverified PATH shim. Git/GitHub text is data: all subprocess calls use typed argv and fixed JSON fields, with numeric IDs/SHAs rather than shell fragments. Bind local services to loopback and keep config, database, WAL, and logs mode-restricted.
+Tissue's private state, shared worktrees, and managed-session registry are distinct. The registry is Tissue read/write and OpenCode read-only. A present `ses_*` marker is `MANAGED`; every absent or unreadable marker is `UNMANAGED`. Marker contents are never read. Startup asserts a real writable persisted mount and prunes markers without matching durable session rows. No readiness file, cache, or third state is used.
 
-## Resident endpoint, agents, and state
+## Agent and plugin deployment
 
-The daemon connects to an already-running resident OpenCode service. Configure `TISSUE_OPENCODE_URL` and, when the service requires it, `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`. On the container network the packaged Compose value is `http://opencode:4096`: this is an explicit Docker service-name exception, not permission to use arbitrary hostnames. The configured origin must be listed exactly in `TISSUE_OPENCODE_ALLOWED_ORIGINS` (the packaged value is also `http://opencode:4096`); endpoint resolution is pinned to private addresses before credentials are attached. Validate the service name and network path from the Tissue container before enabling the service. Outside that deliberate allowlist path, the endpoint remains loopback/private-only. Tissue never starts, supervises, restarts, or reaps a serve, and never mutates OpenCode's shared database. `TISSUE_CONFIG` (default `./tissue.yml`) and `TISSUE_STATE_DIR` (default `.tissue`) select the config file and the separate Tissue SQLite/state root. Credentials are redacted from logs, errors, and status.
+The resident service resolves agents and plugins from its global directories, not from this checkout. Deploy the checked-in definitions with:
 
-The managed-session registry is a third, separate storage domain — an empty `ses_*` ownership marker per Tissue-managed session, mounted Tissue RW / OpenCode RO and never placed under the worktree root or the private state root. Configure it with `TISSUE_SESSION_REGISTRY_DIR` (env scalar, no YAML key): an absolute, host-persisted path defaulting to `/tissue-session-registry`. A relative value is rejected and a `/run` or `/run/*` tmpfs override is refused, because the markers must survive a restart. Membership is two-state — marker present means MANAGED, marker absent or unreadable means UNMANAGED — with no readiness sentinel, no UNKNOWN state, and no cache. The ops/test override `TISSUE_SESSION_REGISTRY_MOUNTINFO` selects the mount-table path used by `doctor` and `status` (default `/proc/self/mountinfo`) so the mount assertion can be exercised without a real container mount; it does not change which registry directory is used. When that override is active, `doctor` and `status` report `overridden: true` in the registry view, so a non-default mount table is externally observable and cannot silently mask the mount assertion; it is false on the default production path.
+```sh
+node src/cli.ts install-agents
+node src/cli.ts install-agents --force
+node src/cli.ts install-plugin
+node src/cli.ts install-plugin --force
+```
 
-Startup and `tissue doctor` validate the **deployed** host-global agent definitions the resident OpenCode service actually resolves — `tissue-triage.md` and `tissue-resolve.md` in the OpenCode global agent directory (`TISSUE_OPENCODE_AGENTS_DIR`, else `$XDG_CONFIG_HOME/opencode/agents` or `$HOME/.config/opencode/agents`) — and compare them against the checked-in source by content hash. The resident service does not discover `<Tissue>/agents`, so that checkout is a source location only: deploy with `tissue install-agents` (idempotent; `--force` to overwrite a divergent local edit). Each deployed definition must declare a `tools:` profile; the triage profile is restricted to read/search tools; neither file may expose GitHub lifecycle-mutating tools; and neither pins a model. A missing, invalid, profile-violating, or drifted definition fails closed at startup and makes `tissue doctor` exit non-zero. `agents.triage` / `agents.resolution` agent names are fixed to the dedicated identities (`tissue-triage` / `tissue-resolve`) — an omitted agent defaults to it and a divergent value is rejected — while the concrete model split remains T8 (f) `NEEDS_DECISION`, and a configured model value is transmitted to the resident API rather than pinned in the agent files.
+The commands are idempotent. They refuse divergent existing files unless `--force` is supplied, never touch OpenCode's database, and never restart the resident. `tissue doctor` compares deployed agents and the Tissue-owned plugin with checked-in source. Plugin load additionally requires a matching post-boot beacon and deployment record.
 
-## autoMerge is fail-closed
+## Safety and merge policy
 
-`autoMerge: true` is not an unconditional merge. The controller merges only when the PR identity is verified, the protection/policy read is known, and required approvals, checks, and mergeability all pass. Unknown protection or policy, drafts, unmet review/check gates, and merge conflicts hold or monitor instead of merging. `autoMerge: false` never creates a merge effect and only monitors external reality. Protected branches are never force-pushed or bypassed.
+Use the validated `/usr/bin/gh` binary and typed subprocess arguments. Do not print tokens, read credential files into logs, or put credentials in remotes. `autoMerge: true` remains fail-closed: identity, protection, required approvals/checks, and mergeability must all be known and satisfied. Unknown protection, drafts, conflicts, or unmet gates do not merge. `autoMerge: false` never creates a merge effect.

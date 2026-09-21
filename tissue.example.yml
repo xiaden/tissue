@@ -1,28 +1,23 @@
-# Tissue — sample configuration template
+# Tissue sample configuration.
+# Copy this file to tissue.yml and configure repositories before enabling the daemon.
+# Tissue connects to an already-running resident OpenCode service through the
+# TISSUE_OPENCODE_URL environment variable; it never starts or manages OpenCode.
 #
-# Production topology: one supervised Tissue daemon connected to the already-running
-# resident OpenCode service via TISSUE_OPENCODE_URL. Tissue never starts or manages
-# an OpenCode serve. Disposable worktrees use the shared TISSUE_WORKTREE_ROOT
-# environment scalar when set, or fall back to TISSUE_STATE_DIR/worktrees.
-#
-# The managed-session registry is a separate storage domain holding one empty ses_*
-# ownership marker per Tissue-managed session, mounted Tissue RW / OpenCode RO. Configure
-# it with the TISSUE_SESSION_REGISTRY_DIR environment scalar: an absolute, host-persisted
-# path, default /tissue-session-registry. A relative value is rejected and a /run tmpfs
-# override is refused. There is intentionally no YAML key. TISSUE_SESSION_REGISTRY_MOUNTINFO
-# is a test/ops override for the mount-table path doctor/status read (default
-# /proc/self/mountinfo) — production must not set it; doctor/status reports
-# overridden: true when it is.
-#
-# Copy to tissue.yml and replace placeholders only after recording onboarding/model
-# choices in artifacts/designs/process/tissue-t8-register.md.
+# Environment storage boundaries:
+# - TISSUE_STATE_DIR: private Tissue database/WAL and controller state.
+# - TISSUE_WORKTREE_ROOT: absolute worktree root shared with OpenCode; when unset,
+#   worktrees are placed below ${TISSUE_STATE_DIR}/worktrees.
+# - TISSUE_SESSION_REGISTRY_DIR: absolute persisted registry path, default
+#   /tissue-session-registry. The registry is Tissue RW/OpenCode RO and contains
+#   one empty ses_* marker per managed session. There is no YAML key for it.
+# - TISSUE_CONFIG: this file path, default ./tissue.yml.
 
 pollIntervalSeconds: 300
 maxConcurrentGlobal: 3
 retentionDays: 90
 
-# Optional role settings. The agent/model values are operator configuration and are
-# transmitted to the resident OpenCode API; leave unset to use service defaults.
+# Optional role settings. Names default to the dedicated Tissue agents. Model
+# values are sent to the resident API and are not pinned in the agent files.
 # agents:
 #   triage:
 #     agent: tissue-triage
@@ -31,23 +26,18 @@ retentionDays: 90
 #     agent: tissue-resolve
 #     model: provider/model
 
-# A repository may use a different writable push fork from its PR target. The
-# target does NOT need push permission; the writable fork is named here, and
-# `pushRemote` is the local git remote that points at it (for example `fork`).
+# A repository may use a separate writable push fork. `pushRemote` is the local
+# git remote that points to that fork. Remote URLs must not contain credentials.
 # repos:
-#   - owner: coaxk
-#     name: subarr
-#     targetOwner: coaxk
-#     targetName: subarr
-#     pushOwner: xiaden
-#     pushName: subarr
+#   - owner: example
+#     name: project
+#     targetOwner: example
+#     targetName: project
+#     pushOwner: example-fork
+#     pushName: project
 #     pushRemote: fork
-#     remote: https://github.com/coaxk/subarr.git
-#     localDir: /workspace/subarr
-#     # Worktrees use TISSUE_WORKTREE_ROOT when set (an absolute shared root), with
-#     # <owner>-<name>/<work-item-id> appended. If unset, the root falls back to
-#     # ${TISSUE_STATE_DIR}/worktrees. Configure this with the environment scalar;
-#     # there is intentionally no YAML key.
+#     remote: https://github.com/example/project.git
+#     localDir: /workspace/project
 #     enabled: true
 #     pollIntervalSeconds: 300
 #     maxConcurrentPerRepo: 1

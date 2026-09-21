@@ -34,8 +34,8 @@ test("sample config exists, loads empty, and canonicalizes no monitored owner or
 
   // The template may show a commented fork/target example, but must not load
   // either candidate or pin a concrete model into the empty configuration.
-  assert.match(sample, /owner:\s*coaxk/i);
-  assert.match(sample, /pushOwner:\s*xiaden/i);
+  assert.match(sample, /owner:\s*example/i);
+  assert.match(sample, /pushOwner:\s*example-fork/i);
   assert.doesNotMatch(sample, /^\s*owner:\s*coaxk\s*$/m);
   assert.doesNotMatch(sample, /^\s*owner:\s*xiaden\s*$/m);
   assert.doesNotMatch(sample, /^\s*name:\s*subarr\s*$/m);

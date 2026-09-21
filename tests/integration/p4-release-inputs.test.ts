@@ -155,7 +155,7 @@ test("P4 documentation agrees on A-prime runtime, boundaries, and blocked releas
   assert.match(entrypoint, /runProductionDaemon/);
   assert.match(run, /entrypoint\.ts daemon/);
   assert.match(type, /longrun/);
-  assert.match(s6Readme, /D'.*not.*release implementation|D'.*documented only/i);
+  assert.match(s6Readme, /does not manage OpenCode|does not bind a public listener/i);
   assert.match(dd, /A[′'].*D[′']/);
   assert.match(dd, /real OpenCode-created/);
   assert.match(dd, /no lifecycle-mutating tool/);

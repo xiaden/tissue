@@ -1,43 +1,63 @@
 # Tissue operational runbook
 
-## Container startup and internal health
+## Boundaries
 
-The packaged deployment runs Tissue as an independent `tissue` container on the user-defined `tissue-net` network. It exposes port `8787` to that Docker network only; there is no host `ports:` publication. NPM reaches the service by the Docker service name, while OpenCode remains a separate failure domain. Tissue does not use `depends_on`, so stopping or restarting one service does not implicitly restart the other.
+Tissue is an independent controller. Its private database, WAL, routing state, and logs live under `TISSUE_STATE_DIR`. Monitored checkouts and created worktrees live under the separately configured `TISSUE_WORKTREE_ROOT` and are shared with OpenCode at identical absolute paths. The resident OpenCode service is a separate failure domain and Tissue never starts, supervises, restarts, or reaps it.
 
-The container entry sequence is ordered: `container/prepare-volumes.sh` prepares the contracted state, worktree, registry, moderation, plugin, and agent directories for UID/GID `1000:1000`; `container/entrypoint.sh` then invokes the Node daemon. Node asserts the registry is a real writable persistent mount and prunes markers without a durable session row before assembling transports or entering the reconcile loop. A failed assertion is logged and exits non-zero. The long-running Tissue service has read-only moderation/plugin/agent mounts; the `tissue-deploy` profile is the separate writer for deployment artifacts.
+The managed-session registry is a third persisted domain, mounted Tissue read/write and OpenCode read-only. A present `ses_*` marker means `MANAGED`; an absent or unreadable marker means `UNMANAGED` and the plugin is inert. There is no readiness sentinel, cache, or third state. Tissue must not prompt or resume without a marker.
 
-The internal health listener is credential-free and serves `GET /` on port `8787`. Its liveness result reflects Tissue DB/process progress only. The response also reports informational readiness, folded from registry-directory availability and resident reachability; resident failure does not make Tissue liveness false or supervise either service. A closed DB returns HTTP 503 while the listener remains available. Unknown paths and methods return 404. The Compose healthcheck must probe the implemented `GET /` endpoint, not `/health`; operators should treat any `/health` probe as stale configuration.
+Plugin and agent deployment is separate from the service. The deployment commands write global OpenCode directories; the long-running daemon reads them read-only. OpenCode must boot and write a matching plugin load beacon before the plugin is considered loaded.
 
-## Startup, reconcile, and authentication
+## Container startup and health
 
-1. Confirm the s6 service state with `s6-svstat` and do not restart a resident service merely to probe it.
-2. Deploy the dedicated agents with `tissue install-agents` (idempotent; `--force` only to replace a divergent local edit). The resident service reads the OpenCode GLOBAL agent directory, not `<Tissue>/agents`.
-3. Run `tissue doctor`; it reports the local Tissue database path/WAL setting, state directory, the registry mount state (resolved `dir`, `mountAsserted`, `writable`, `realMount`, `overridden`, `markerCount`, `prunedAtStartup`), deployed agent-definition validation (including source drift), the credential-free resident-endpoint status, and each configured repository's persisted readiness (`configManaged`, `capability`, `ready`, `reasons`). It exits non-zero when the deployed definitions are missing, invalid, or drifted, or when the registry mount assertion fails. It does not itself perform the authenticated `gh`/checkout/base-branch/Issues/protection audit.
-4. Run `tissue reconcile` once. Review the P0–P6 report and ERROR JSONL before enabling polling; reconciliation is the path that performs repository/capability checks when configured.
-5. Use `tissue status` for capacity, leases, sessions, inbox, PR/protection state, FAILED_HOLD, last reconcile, housekeeping, and WAL observability.
+The packaged `tissue` service runs on `tissue-net` and exposes port `8787` to that network only. It has no host `ports` publication and does not depend on OpenCode startup. `container/prepare-volumes.sh` creates the writable state, worktree, and registry directories. `container/entrypoint.sh` then starts the Node daemon.
 
-The authenticated `gh`, checkout/remotes, base branch, Issues, and protection capability audit is performed by `tissue reconcile` (its P3 phase) and persisted as each repository's `capability_state`, which `doctor` and `status` surface. Dispatch is refused while a repository is not `ready`. Authentication failures are surfaced and retried only under the typed integration policy. They are not converted to healthy or silently bypassed.
+On startup, Tissue asserts that the registry exists, is writable, and is a real persisted mount. It prunes markers without matching `opencode_sessions` rows before assembling the resident transport or entering the loop. A failed assertion logs an error and exits non-zero. The health check is `GET /` on port `8787`; it reports JSON liveness, readiness, and resident reachability. Liveness is based on the Tissue database/process. Readiness is informational and does not restart either service.
 
-On every container start the daemon runs an ordered registry pre-step strictly before it assembles transports or enters the reconcile loop: resolve the registry directory, assert the marker filesystem exists, is writable by Tissue, and is a real host-persisted mounted volume, then prune marker files whose `ses_*` id has no `opencode_sessions` row (the crash-after-marker-before-DB window), then continue. A failed mount assertion is loud and fatal: the daemon logs `registry.mount_assertion_failed` and exits non-zero, the assembly and loop are never reached, and `tissue doctor` reports `registry.mountAsserted: false` with `ok: false`. Success is logged as `registry.startup` with the resolved `dir`, `pruned`, and `markerCount`. Startup never globally invalidates the registry and never marks every DB session; marker contents are never read.
+## Start and preflight
 
-## SQLite/WAL and shared-store hygiene
+1. Confirm the resident OpenCode service is independently running and reachable through the configured private or exact-allowlisted origin. Do not restart it merely to probe it.
+2. Install the global agent definitions:
 
-Tissue owns only its separate `tissue.db`, opened with foreign keys, WAL, FULL synchronous, timeout, migrations, and short `BEGIN IMMEDIATE` writes. Never open, vacuum, delete, or migrate the OpenCode database. Status reports WAL path and size/growth; a growing WAL is an observability signal, not permission to delete it while the process is active. Shared OpenCode-store contention and ambient writers are RG-1 evidence questions, not claims inferred from local smoke.
+   ```sh
+   node src/cli.ts install-agents
+   ```
 
-## Inbox, idle, and OpenCode behavior
+   Use `--force` only to replace a reviewed divergent local edit.
+3. Install the Tissue-owned plugin through the deployment path:
 
-The durable inbox is globally ordered by `inbox.id`. Relay occurs only when the existing real session is observed idle, no delivery is in flight, and no controller turn is active. Human use is allowed; pending controller events wait for post-human idle. Busy/retry are non-idle. HTTP 204 and idle alone are not completion. Completion requires the nonce-bearing user message and a parent-linked assistant turn, excluding summary/compaction. Duplicate envelopes are audited no-ops. `noReply` has its own bounded observation window. A resolution session that is explicitly `missing` (deleted or otherwise absent) never yields an unbounded `busy_hold`: the PENDING bundle is left unclaimed (no `delivery_nonce`, no prompt) and the owning WorkItem is held `FAILED_HOLD` with its `session_missing` evidence preserved. Only `busy`/`retry` hold as `busy_hold`, and a transport failure while probing the session is not read as a lost session.
+   ```sh
+   node src/cli.ts install-plugin
+   ```
 
-SSE is a wake hint only. Heartbeat timeout, jittered reconnect, status resynchronization, and polling are correctness backstops. A wedge or missing qualifying turn is inspected and may become `FAILED_HOLD`; do not issue concurrent prompts or create a replacement session. Every `tissue reconcile`/`tick` pass is authoritative at its P2 session census: a `missing`/irrecoverably `wedged` resolution session moves the owning `RUNNING`/`WAITING` WorkItem to `FAILED_HOLD` (one `reconcile.session_recovered` warn per applied action) rather than leaving it dispatchable; an owner already `FAILED_HOLD` instead absorbs idempotent `session_loss_absorbed` evidence with no state change; an owner that is unknown or not holdable (not `RUNNING`/`WAITING`, e.g. a terminal or absent owner) records evidence-only `session_loss_observed` with `human_inspect` and no state change; a `missing`/`wedged` triage session releases the repository's session mapping so the existing triage durability contract re-creates or adopts one on the next flight; an `incomplete` resolution session retains its mapping as history (`ACTIVE -> RETAINED`). If the P2 census cannot be taken, P6 prompt-dependent resume is withheld (a `reconcile.p6_gated` warn) while leases, effects, cleanup, drift, and housekeeping still reconcile — a per-WorkItem `missing`/`wedged`/`incomplete` outcome does not gate P6.
+   Stop/start OpenCode according to the owner service procedure so it can load the new plugin; Tissue does not perform that lifecycle action.
+4. Run `tissue doctor`. It validates the deployed agents, plugin file and load beacon, registry mount, database, configured repositories, and redacted resident status. It exits non-zero for missing/drifted deployment or failed registry assertion.
+5. Run `tissue reconcile` once and review its JSONL output. This performs the authenticated repository capability checks and persists readiness.
+6. Run `tissue status` before enabling continuous polling.
 
-The resident-health gate also applies to the resident daemon normal loop, not only P6. `tissue daemon` seeds its health from the reconcile result and re-probes the resident endpoint at the start of every iteration: while the resident OpenCode service is unavailable the loop still polls/ingests, promotes `READY`→`QUEUED`, and executes effects, but performs no triage, claim/ensure-resolution, or relay and logs one `daemon.dependency_gated` warn per pass. Once the probe observes the service restored, the very next iteration resumes prompt-dependent work automatically — no daemon restart. The daemon keeps polling while unhealthy and never exits on unavailability. A failed probe (transport error) is treated as unhealthy, never surfaced as an exception.
+`status` does not perform the authenticated GitHub capability audit. It reports those fields as unprobed until reconciliation. Dispatch is refused while a configured repository is not ready.
 
-## Worktrees, PR races, and cleanup
+## Normal operation
 
-Before push/PR, verify expected worktree, controller branch, HEAD, WorkItem, protection, checks, reviews, and mergeability. Adopt externally merged/closed reality; never force-push or bypass protection. A `FAILED_HOLD` preserves branch/worktree/session/PR evidence until an explicit human `tissue cleanup <wi>`. A `RUNNING`/`WAITING` WorkItem is held this way when its resolution session is lost (`missing`/irrecoverably `wedged`) or when a pending delivery hits a `missing` session; a lost session for any other owner records evidence only (`session_loss_absorbed` when already `FAILED_HOLD`, otherwise `session_loss_observed` with `human_inspect`) and changes no state, so a stalled WorkItem is never left indefinitely dispatchable. Terminal leftover artifacts on completed/rejected/failed history trigger cleanup retry and human inspection; they do not rewrite history as FAILED_HOLD. Post-merge cleanup removes disposable worktree and local branch, while retaining all durable history and the real session.
+Use `tissue daemon` for the resident loop, or `tissue tick`/`tissue reconcile` for one pass. While OpenCode is unavailable, the daemon continues safe polling/ingest, promotes ready work, and executes effects, but withholds triage, resolution claims, and relay. It resumes those operations automatically after a successful health probe; it does not exit merely because the resident is unavailable.
 
-## Human approval and release evidence
+SSE is only a wake hint. Polling and reconciliation remain correctness backstops. Do not issue concurrent prompts or create replacement sessions. A missing or irrecoverably wedged resolution session holds the owning active work item in `FAILED_HOLD` with evidence. Use `tissue inspect <wi>` and only then the human-only `tissue cleanup <wi>` path. Cleanup never deletes a real session or edits OpenCode's database.
 
-The per-repository Issues/protection capability audit described by T8(j) is not complete merely because `doctor` succeeds; T8(j) remains `NEEDS_DECISION`, and release acceptance remains blocked.
+## Storage and recovery
 
-Required review or approval is `WAITING`; resume the same session after approval. Late gate failure follows the precommitted tightening ladder (single shared serve, then serialized prompt slots) before any architecture reconsideration. Deterministic fixtures, fake sessions, historical records, 204/idle behavior, and opt-in skips never satisfy a real gate. Current inventory and blocker files are non-promotional; `releasePromotable=false`.
+Tissue owns only its own `tissue.db`, opened with foreign keys, WAL, full synchronous mode, migrations, and short write transactions. Never open, vacuum, delete, or migrate the OpenCode database. A growing WAL is an observation signal, not permission to delete it while Tissue is active.
+
+After a crash or host reboot:
+
+```sh
+s6-svstat -o up,ready,down /run/service/tissue
+tissue doctor
+tissue reconcile
+tissue status
+```
+
+A stopped service is not evidence that a work item failed. Preserve `FAILED_HOLD` evidence until a human explicitly cleans it. Never kill a process using a mismatched start time and never improvise database or worktree repairs.
+
+## Worktrees and merges
+
+Before push/PR, verify worktree identity, branch, HEAD, work item, protection, checks, reviews, and mergeability. Never force-push or bypass protection. After merge, remove only disposable worktree/local-branch artifacts; retain durable history and real sessions. `autoMerge` is fail-closed and requires verified identity, known protection, required approvals/checks, and mergeability.
