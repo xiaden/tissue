@@ -1091,3 +1091,18 @@ test("reconcile: a stale triage census entry never releases a newer live session
     cleanup();
   }
 });
+
+
+test("reconcile: DEFERRED remains dependency-waiting and is excluded from drift scans", async () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db, { id: REPO_ID });
+    insertWorkItem(db, { id: "wi-deferred-reconcile", repo_id: REPO_ID, state: "DEFERRED", base_branch: "main" });
+    const scanner = fakeScanner({ branches: [worktreeBranchFor("wi-deferred-reconcile")], worktrees: [], prs: [] });
+    const result = await scanAndAdoptDrift(db, "wi-deferred-reconcile", scanner);
+    assert.equal(result.scanned, false);
+    assert.equal(getWorkItem(db, "wi-deferred-reconcile")?.state, "DEFERRED");
+  } finally {
+    cleanup();
+  }
+});

@@ -12,8 +12,11 @@ import assert from "node:assert/strict";
 import { GhClient } from "../../src/integrations/gh-client.ts";
 import { pollRepository, snapshotHash, type GhSnapshot } from "../../src/controller/poll.ts";
 import { ingestRepositorySnapshot } from "../../src/controller/ingest.ts";
+import { createTrustedGithubPolicy } from "../../src/controller/trust.ts";
 import { enqueueIssue } from "../../src/controller/enqueue.ts";
 import {
+  envelopeForRow,
+  getInboxById,
   getIssueByRepoNumber,
   getPollWatermark,
   getSideEffectFull,
@@ -388,6 +391,119 @@ test("same-session ordered inbox routing: deterministic comment dedup keyed by c
       }),
     );
     assert.equal(edited.inboxInserted, 1);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("real ingest projects trusted comments with policy-bound actor provenance and body preview", () => {
+  const t = createTestDb();
+  try {
+    const repo = seedRepository(t.db);
+    const policy = createTrustedGithubPolicy({ security: { trustedGithubUsers: ["Alice"] } });
+    const comment = {
+      target: "issue" as const,
+      number: 7,
+      commentId: "C_TRUSTED",
+      author: "Alice",
+      createdAt: "2026-09-09T00:00:00.000Z",
+      bodyPreview: "please fix this safely",
+      bodyHash: "trusted-hash",
+    };
+
+    const result = ingestRepositorySnapshot(
+      t.db,
+      snapshot({ issues: [issue(7, "2026-09-09T00:00:00.000Z")], comments: [comment] }),
+      { policy },
+    );
+
+    assert.equal(result.commentsSeen, 1);
+    const row = listNullWorkItemInboxByIssue(t.db, `issue-${repo.id}-7`).find((candidate) => candidate.kind === "issue_comment");
+    assert.ok(row);
+    assert.deepEqual(JSON.parse(row.payload_json), {
+      target: "issue",
+      number: 7,
+      comment_id: "C_TRUSTED",
+      author: "Alice",
+      body_preview: "please fix this safely",
+    });
+    assert.equal(row.quarantine_json, null);
+    assert.deepEqual(envelopeForRow(row), {
+      repository: repo.id,
+      sourceKind: "issue_comment",
+      objectId: "7",
+      contentId: "C_TRUSTED",
+      observedVersion: "trusted-hash",
+      contentHash: "trusted-hash",
+      authoritativeAt: "2026-09-09T00:00:00.000Z",
+      policyRevision: policy.revision,
+      actor: { present: true, rawLogin: "Alice", normalizedLogin: "alice", presence: "PRESENT" },
+      decision: "TRUSTED",
+      reason: "TRUSTED",
+      deliveryClass: "TRUSTED_PROSE",
+    });
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("real ingest keeps denied comments body-free while persisting explicit policy denial", () => {
+  const t = createTestDb();
+  try {
+    const repo = seedRepository(t.db);
+    const policy = createTrustedGithubPolicy({ security: { trustedGithubUsers: ["Alice"] } });
+    const comment = {
+      target: "issue" as const,
+      number: 8,
+      commentId: "C_DENIED",
+      author: " malformed ",
+      createdAt: "2026-09-09T00:00:00.000Z",
+      bodyPreview: "secret denied prose",
+      bodyHash: "denied-hash",
+    };
+
+    ingestRepositorySnapshot(
+      t.db,
+      snapshot({ issues: [issue(8, "2026-09-09T00:00:00.000Z")], comments: [comment] }),
+      { policy },
+    );
+
+    const row = listNullWorkItemInboxByIssue(t.db, `issue-${repo.id}-8`).find((candidate) => candidate.kind === "issue_comment");
+    if (!row) assert.fail("denied comment inbox row was not persisted");
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    assert.deepEqual(payload, { target: "issue", number: 8, comment_id: "C_DENIED", denied: true });
+    for (const forbidden of ["body", "body_preview", "title", "digest", "quote", "derivedProse"]) {
+      assert.equal(forbidden in payload, false, `denied payload must omit ${forbidden}`);
+    }
+
+    assert.deepEqual(JSON.parse(row.quarantine_json ?? "null"), {
+      sourceKind: "issue_comment",
+      objectId: "8",
+      contentId: "C_DENIED",
+      observedVersion: "denied-hash",
+      contentHash: "denied-hash",
+      authoritativeAt: "2026-09-09T00:00:00.000Z",
+      actor: { present: true, rawLogin: " malformed ", normalizedLogin: null, presence: "MALFORMED" },
+      decision: "MALFORMED_ACTOR",
+      reason: "MALFORMED_ACTOR",
+      deliveryClass: "DENIED_PROSE",
+    });
+    const storedRow = getInboxById(t.db, row.id);
+    if (!storedRow) assert.fail("denied comment inbox row could not be reloaded");
+    assert.deepEqual(envelopeForRow(storedRow), {
+      repository: repo.id,
+      sourceKind: "issue_comment",
+      objectId: "8",
+      contentId: "C_DENIED",
+      observedVersion: "denied-hash",
+      contentHash: "denied-hash",
+      authoritativeAt: "2026-09-09T00:00:00.000Z",
+      policyRevision: policy.revision,
+      actor: { present: true, rawLogin: " malformed ", normalizedLogin: null, presence: "MALFORMED" },
+      decision: "MALFORMED_ACTOR",
+      reason: "MALFORMED_ACTOR",
+      deliveryClass: "DENIED_PROSE",
+    });
   } finally {
     t.cleanup();
   }

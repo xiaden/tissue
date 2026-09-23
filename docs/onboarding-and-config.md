@@ -6,11 +6,20 @@ Tissue reads a small YAML configuration file selected by `TISSUE_CONFIG` (defaul
 
 Top-level keys are:
 
+- `security.trustedGithubUsers` — optional list of GitHub logins whose current textual authorship may have prose included at an agent-visible retrieval/serialization boundary. This allowlist governs current GitHub-originating prose visibility, not generic GitHub action or control-content authorization. Each entry must be a valid GitHub login in the bounded ASCII grammar (1–39 characters, letters, digits, and interior hyphens); matching is ASCII case-insensitive. Do not pad entries with whitespace or rely on Unicode lookalikes.
 - `pollIntervalSeconds` — polling interval; defaults to `300` and must be at least `10`.
 - `maxConcurrentGlobal` — global active-work limit; defaults to `3` and must be at least `1`.
 - `retentionDays` — durable-history retention; defaults to `90` and must be at least `1`.
 - `agents.triage` and `agents.resolution` — optional dedicated agent names and model values. Names default to `tissue-triage` and `tissue-resolve`.
 - `repos` — repository configuration entries; the example leaves this empty until an operator chooses repositories.
+
+### Trusted GitHub users and fail-closed behavior
+
+`security.trustedGithubUsers` is the only trust allowlist. The loader is strict: `security` accepts only the `trustedGithubUsers` key, every list item must be a string, and one invalid or malformed login rejects the configuration rather than filtering it out. Unknown root or nested keys are also rejected. The configured list is normalized into a policy using ASCII case-folding only; Tissue does not trim values, perform Unicode folding, look up identities online, infer durable IDs, or assume rename continuity.
+
+If `security` is omitted, the list is empty, or the configuration cannot be used, `decideCurrentGithubProse` denies prose for that operation. It does not silently become a trust-all policy and does not create a `CONFIG_UNUSABLE` runtime record at this retrieval boundary. Objective facts remain separately classifiable.
+
+GitHub-originating prose may be retained by Tissue's existing operational storage, but stored content is untrusted until an agent-visible retrieval or serialization operation. Immediately before triage, relay, prompt, transcript/history serialization, or controller-generated prose delivery, the controller reads the current configuration, normalizes the stored author explicitly, and fails closed for missing, unknown, malformed, or unusable author/configuration data. Denied prose is omitted rather than summarized or copied into diagnostics; typed objective lifecycle/reconciliation fields remain available. Reactions, inline review comments/threads, and review-body delivery are unsupported residuals with no current production consumer and remain fail-closed. No startup-cached policy, persisted decision, policy revision, object ownership, or prior delivery authorizes a later operation. Objective state remains separately usable. See the pending [retrieval-time design handoff](../artifacts/designs/pending/trusted-github-actor-boundary/DD.md) and [configuration validation](../src/config/load.ts) for the design authority and existing loader boundary.
 
 Each repository entry supplies owner, name, local checkout, enablement, polling/capacity overrides, base branch, labels, baseline, merge policy, and optional push-fork fields. `remote` URLs must not contain credentials. A push fork may use `pushOwner`, `pushName`, and `pushRemote`; the target repository need not grant push permission. Configuration is scalar data, not a policy language, and unknown keys or secret-shaped values are rejected.
 

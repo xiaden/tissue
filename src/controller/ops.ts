@@ -153,12 +153,17 @@ export function statusOperation(ctx: OpsContext, opts?: RegistryOpsOptions): Rec
     let walBytes = 0;
     try { walBytes = statSync(wal).size; } catch { /* WAL may not exist yet. */ }
     const active = Object.entries(summary.workItems)
-      .filter(([state]) => ["QUEUED", "RUNNING", "WAITING", "PAUSED_WORK", "BLOCKED", "FAILED_HOLD"].includes(state))
+      .filter(([state]) => ["RUNNING", "WAITING", "AWAITING_DECISION"].includes(state))
       .reduce((n, [, count]) => n + Number(count), 0);
     return {
       ...summary,
       failedHold: summary.workItems.FAILED_HOLD ?? 0,
-      capacity: { globalLimit: ctx.config.maxConcurrentGlobal, active, available: Math.max(0, ctx.config.maxConcurrentGlobal - active) },
+      capacity: {
+        globalLimit: ctx.config.maxConcurrentGlobal,
+        active,
+        available: Math.max(0, ctx.config.maxConcurrentGlobal - active),
+        states: { awaitingDecision: "consumes", deferred: "exempt" },
+      },
       leases: { active: summary.activeLeases },
       sessions: listSessions(db),
       lastReconcile: listRecentTransitions(db, 100).find((t) => t.event === "reconcile") ?? null,
@@ -181,10 +186,19 @@ export function inspectOperation(ctx: OpsContext, scope?: string): Record<string
     const wi = scope && !repo ? getWorkItem(db, scope) : undefined;
     if (scope && !repo && !wi) throw new OperationError("NOT_FOUND", `unknown repository or work item '${scope}'`, 4);
     const workItems = wi ? [wi] : repo ? db.sql.all<WorkItemRow>("SELECT * FROM work_items WHERE repo_id = ? ORDER BY created_at", repo.id) : db.sql.all<WorkItemRow>("SELECT * FROM work_items ORDER BY created_at");
+    const dependencyRows = db.sql.all<{ dependent_work_item_id: string; dependency_issue_id: string | null; dependency_work_item_id: string | null; state: string }>("SELECT dependent_work_item_id, dependency_issue_id, dependency_work_item_id, state FROM work_item_dependencies WHERE state = 'ACTIVE'");
+    const dependencyByWorkItem = new Map(dependencyRows.map((row) => [row.dependent_work_item_id, { kind: row.dependency_issue_id !== null ? "issue" : "work_item", id: row.dependency_issue_id ?? row.dependency_work_item_id, state: row.state }]));
     return {
       scope: scope ?? null,
       repository: repo ?? null,
-      workItems: workItems.map((item) => ({ ...item, sessions: listSessions(db).filter((s) => s.work_item_id === item.id), worktrees: listWorktreesByWorkItem(db, item.id), pullRequests: listPullRequestsByWorkItem(db, item.id) })),
+      workItems: workItems.map((item) => ({
+        ...item,
+        capacity: item.state === "AWAITING_DECISION" ? "consumes" : item.state === "DEFERRED" ? "exempt" : "not_applicable",
+        dependency: dependencyByWorkItem.get(item.id) ?? null,
+        sessions: listSessions(db).filter((s) => s.work_item_id === item.id),
+        worktrees: listWorktreesByWorkItem(db, item.id),
+        pullRequests: listPullRequestsByWorkItem(db, item.id),
+      })),
       inbox: db.sql.all("SELECT state, COUNT(*) AS count FROM inbox GROUP BY state"),
       pullRequests: workItems.flatMap((item) => listPullRequestsByWorkItem(db, item.id)),
       checks: db.sql.all("SELECT effect_key, state, attempt FROM side_effects WHERE effect_key LIKE 'check:%' ORDER BY id DESC"),
@@ -194,11 +208,32 @@ export function inspectOperation(ctx: OpsContext, scope?: string): Record<string
 }
 
 export function historyOperation(ctx: OpsContext, scope?: string): Record<string, unknown> {
-  return withDb(ctx, (db) => ({
-    scope: scope ?? null,
-    transitions: scope ? db.sql.all("SELECT * FROM state_transitions WHERE entity_id = ? ORDER BY id DESC", scope) : listRecentTransitions(db, 100),
-    housekeeping: listHousekeepingActions(db, 100),
-  }));
+  return withDb(ctx, (db) => {
+    const workItems = db.sql.all<WorkItemRow>(
+      scope ? "SELECT * FROM work_items WHERE id = ?" : "SELECT * FROM work_items ORDER BY created_at",
+      ...(scope ? [scope] : []),
+    );
+    const dependencyRows = db.sql.all<{ dependent_work_item_id: string; dependency_issue_id: string | null; dependency_work_item_id: string | null; state: string }>(
+      "SELECT dependent_work_item_id, dependency_issue_id, dependency_work_item_id, state FROM work_item_dependencies WHERE state = 'ACTIVE'",
+    );
+    const dependencyByWorkItem = new Map(dependencyRows.map((row) => [row.dependent_work_item_id, {
+      kind: row.dependency_issue_id !== null ? "issue" : "work_item",
+      id: row.dependency_issue_id ?? row.dependency_work_item_id,
+      state: row.state,
+    }]));
+    const operationalWorkItems = workItems.map((item) => ({
+      ...item,
+      capacity: item.state === "AWAITING_DECISION" ? "consumes" : item.state === "DEFERRED" ? "exempt" : "not_applicable",
+      dependency: dependencyByWorkItem.get(item.id) ?? null,
+    }));
+    return {
+      scope: scope ?? null,
+      workItem: scope ? operationalWorkItems[0] ?? null : null,
+      workItems: operationalWorkItems,
+      transitions: scope ? db.sql.all("SELECT * FROM state_transitions WHERE entity_id = ? ORDER BY id DESC", scope) : listRecentTransitions(db, 100),
+      housekeeping: listHousekeepingActions(db, 100),
+    };
+  });
 }
 
 export function enqueueOperation(ctx: OpsContext, owner: string, name: string, number: number): Record<string, unknown> {

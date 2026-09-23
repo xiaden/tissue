@@ -477,6 +477,7 @@ test("P1-S6 markers survive a fresh process view over the same directory and the
 /** Minimal assembly surface touched by runProductionDaemon before the loop. */
 function fakeAssembly(): ProductionAssembly {
   return {
+    policy: { normalizedUsers: new Set(["trusted"]), revision: "test-policy", usable: true },
     transport: { eventStream: () => (async function* () {})() },
     reconcile: async () => ({}),
     normalLoop: {},

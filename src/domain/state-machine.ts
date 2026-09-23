@@ -16,9 +16,10 @@
 //               REJECTED. Duplicate/merged history remains; future edits and
 //               reopens create inbox events, never another WorkItem.
 //   - WorkItem: READY → QUEUED → RUNNING → WAITING → RUNNING → COMPLETED with
-//               PAUSED_WORK / BLOCKED / FAILED_HOLD / FAILED / REJECTED as
-//               alternatives. BLOCKED stores blocked_by; dependency completion
-//               atomically re-readies it. FAILED_HOLD preserves evidence until
+//               PAUSED_WORK / AWAITING_DECISION / DEFERRED / FAILED_HOLD /
+//               FAILED / REJECTED as alternatives. AWAITING_DECISION is an
+//               active human-wait state; DEFERRED waits for dependency completion
+//               before returning to READY. FAILED_HOLD preserves evidence until
 //               an explicit human `tissue cleanup <wi>`; only then FAILED.
 //               Terminal leftovers on COMPLETED/REJECTED/FAILED are cleanup
 //               failures and are NEVER relabelled FAILED_HOLD.
@@ -98,7 +99,8 @@ const workItemStates = [
   "WAITING",
   "COMPLETED",
   "PAUSED_WORK",
-  "BLOCKED",
+  "AWAITING_DECISION",
+  "DEFERRED",
   "FAILED_HOLD",
   "FAILED",
   "REJECTED",
@@ -120,13 +122,14 @@ const workItemTransitions: readonly TransitionRule[] = [
   { from: "RUNNING", to: "PAUSED_WORK", events: ["pause_work"] },
   { from: "WAITING", to: "PAUSED_WORK", events: ["pause_work"] },
   { from: "PAUSED_WORK", to: "QUEUED", events: ["resume_work"] },
-  // BLOCKED stores blocked_by; dependency completion atomically re-readies it.
-  { from: "READY", to: "BLOCKED", events: ["block"] },
-  { from: "QUEUED", to: "BLOCKED", events: ["block"] },
-  { from: "RUNNING", to: "BLOCKED", events: ["block"] },
-  { from: "WAITING", to: "BLOCKED", events: ["block"] },
-  { from: "PAUSED_WORK", to: "BLOCKED", events: ["block"] },
-  { from: "BLOCKED", to: "READY", events: ["unblock"] },
+  // Explicit human decision waiting remains active and capacity-consuming.
+  { from: "RUNNING", to: "AWAITING_DECISION", events: ["await_decision"] },
+  { from: "AWAITING_DECISION", to: "RUNNING", events: ["decision_received"] },
+  // Dependency waiting is capacity-exempt and returns to READY only when the
+  // dependency completion event is observed.
+  { from: "RUNNING", to: "DEFERRED", events: ["defer"] },
+  { from: "WAITING", to: "DEFERRED", events: ["defer"] },
+  { from: "DEFERRED", to: "READY", events: ["dependency_completed"] },
   // Repeated wedge/drift/rogue effects/irreconcilable identity → FAILED_HOLD.
   { from: "RUNNING", to: "FAILED_HOLD", events: ["wedge", "drift", "rogue_effect", "irreconcilable_identity"] },
   { from: "WAITING", to: "FAILED_HOLD", events: ["wedge", "drift", "rogue_effect", "irreconcilable_identity"] },
@@ -287,14 +290,16 @@ export const ISSUE_DISPOSITION_EVENT: Record<IssueTriageDisposition, string> = {
 
 /**
  * States in which a WorkItem is expected to own artifacts (branch/worktree/
- * session/PR). A FAILED_HOLD artifact is expected and cannot cascade to healthy
- * work; terminal states are never part of this set (no-terminal-relabel).
+ * session/PR). AWAITING_DECISION is active and retains its artifacts; a
+ * FAILED_HOLD artifact is expected and cannot cascade to healthy work. DEFERRED
+ * is dependency-waiting and capacity-exempt, so it does not retain expected
+ * artifacts. Terminal states are never part of this set (no-terminal-relabel).
  */
 export const ARTIFACT_OWNING_WORK_ITEM_STATES: ReadonlySet<string> = new Set([
   "QUEUED",
   "RUNNING",
   "WAITING",
+  "AWAITING_DECISION",
   "PAUSED_WORK",
   "FAILED_HOLD",
-  "BLOCKED",
 ]);

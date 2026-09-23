@@ -27,6 +27,7 @@ import {
 } from "../../src/runtime/daemon.ts";
 
 const CONFIG: TissueConfig = {
+  security: { trustedGithubUsers: ["trusted"] },
   pollIntervalSeconds: 300,
   maxConcurrentGlobal: 3,
   retentionDays: 90,
@@ -141,6 +142,19 @@ test("a failing phase is recorded and later phases still run", async () => {
     assert.equal(summary.errors[0]?.phase, `poll:${REPO_ID}`);
     assert.equal(effectsRan, 1);
     assert.equal(summary.effects, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("promoteReadyWorkItems never activates DEFERRED items", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    seedRepository(db);
+    insertWorkItem(db, { id: "wi-deferred", repo_id: REPO_ID, state: "DEFERRED", base_branch: "main" });
+    assert.equal(promoteReadyWorkItems(db), 0);
+    const state = db.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", "wi-deferred")?.state;
+    assert.equal(state, "DEFERRED");
   } finally {
     cleanup();
   }

@@ -32,7 +32,7 @@ import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
 import { startPessimisticServer } from "../helpers/pessimistic-opencode-server.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
 
-const CONFIG: TissueConfig = { pollIntervalSeconds: 60, maxConcurrentGlobal: 1, retentionDays: 30, agents: {}, repos: [] };
+const CONFIG: TissueConfig = { security: { trustedGithubUsers: ["trusted"] }, pollIntervalSeconds: 60, maxConcurrentGlobal: 1, retentionDays: 30, agents: {}, repos: [] };
 
 function agentFile(name: string, tools: Record<string, boolean>, extra: string[] = []): string {
   const lines = ["---", "mode: primary", "tools:", ...Object.entries(tools).map(([k, v]) => `  ${k}: ${v}`), ...extra, "---", "", "instructions", ""];

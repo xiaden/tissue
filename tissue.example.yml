@@ -16,6 +16,19 @@ pollIntervalSeconds: 300
 maxConcurrentGlobal: 3
 retentionDays: 90
 
+# Optional fail-closed allowlist for current textual GitHub authors whose prose
+# may cross an agent-visible retrieval/serialization boundary. This governs prose
+# visibility only, not generic GitHub action/control authorization. Every entry
+# must be a valid ASCII GitHub login; no whitespace padding or Unicode lookalikes.
+# An invalid entry rejects the whole configuration; omitting this block denies
+# prose at retrieval rather than enabling trust-all behavior. Objective lifecycle
+# facts remain available independently. Unsupported reactions, inline review
+# comments/threads, and review-body paths remain fail-closed.
+# security:
+#   trustedGithubUsers:
+#     - maintainer
+#     - release-bot
+
 # Optional role settings. Names default to the dedicated Tissue agents. Model
 # values are sent to the resident API and are not pinned in the agent files.
 # agents:

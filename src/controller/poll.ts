@@ -35,6 +35,8 @@ export interface RepoPollRef {
 
 export interface GhIssueSnapshot {
   number: number;
+  /** Raw author observation; null means the supported projection omitted it. */
+  author?: ActorProjection;
   /** Bounded title preview used by the triage digest (never an event payload). */
   title: string;
   state: string;
@@ -47,6 +49,8 @@ export interface GhIssueSnapshot {
 
 export interface GhPrSnapshot {
   number: number;
+  /** Raw author observation; null means the supported projection omitted it. */
+  author?: ActorProjection;
   state: string;
   headRefName: string;
   headRefOid: string;
@@ -73,8 +77,11 @@ export interface GhCheckSnapshot {
 export interface GhReviewSnapshot {
   prNumber: number;
   reviewId: string;
+  author?: ActorProjection;
   state: string;
   submittedAt: string;
+  /** Version of the review observation, including edit/state changes. */
+  observedVersion?: string;
 }
 
 export interface GhCommentSnapshot {
@@ -82,7 +89,9 @@ export interface GhCommentSnapshot {
   /** Issue or PR number the comment belongs to. */
   number: number;
   commentId: string;
-  author: string;
+  author: string | null;
+  authorPresence?: "PRESENT" | "MISSING" | "MALFORMED";
+  rawAuthor?: string | null;
   createdAt: string;
   /** Bounded, control-safe preview (full untrusted text never enters an event). */
   bodyPreview: string;
@@ -137,9 +146,15 @@ export function snapshotHash(value: unknown): string {
 
 // ---- snapshot parsing (fixed fields; tolerant of extra columns) -------------------
 
+export interface ActorProjection {
+  rawLogin: string | null;
+  presence: "PRESENT" | "MISSING" | "MALFORMED";
+}
+
 interface RawIssue {
   number?: unknown;
   title?: unknown;
+  author?: unknown;
   state?: unknown;
   updatedAt?: unknown;
   createdAt?: unknown;
@@ -148,6 +163,7 @@ interface RawIssue {
 
 interface RawPr {
   number?: unknown;
+  author?: unknown;
   state?: unknown;
   headRefName?: unknown;
   headRefOid?: unknown;
@@ -177,12 +193,22 @@ interface RawCheckRollupEntry {
 
 interface RawReview {
   id?: unknown;
+  author?: unknown;
   state?: unknown;
   submittedAt?: unknown;
 }
 
 function asString(v: unknown, fallback = ""): string {
   return typeof v === "string" ? v : fallback;
+}
+
+function actorOf(v: unknown): ActorProjection {
+  if (v === undefined) return { rawLogin: null, presence: "MISSING" };
+  if (v === null || typeof v !== "object") return { rawLogin: null, presence: "MALFORMED" };
+  const login = (v as { login?: unknown }).login;
+  if (typeof login !== "string") return { rawLogin: null, presence: "MALFORMED" };
+  if (login.length === 0 || login.length > 39) return { rawLogin: login.slice(0, 39), presence: "MALFORMED" };
+  return { rawLogin: login, presence: "PRESENT" };
 }
 
 function asNumber(v: unknown): number | null {
@@ -214,6 +240,7 @@ function parseIssues(raw: unknown): GhIssueSnapshot[] {
     const labels = labelsOf(item.labels);
     out.push({
       number,
+      author: actorOf(item.author),
       title,
       state,
       updatedAt,
@@ -235,6 +262,7 @@ function parsePrs(raw: unknown): GhPrSnapshot[] {
     const headRepoRecord = item.headRepository as { nameWithOwner?: unknown } | undefined;
     out.push({
       number,
+      author: actorOf(item.author),
       state: asString(item.state).toUpperCase(),
       headRefName: asString(item.headRefName),
       headRefOid: asString(item.headRefOid),
@@ -271,11 +299,16 @@ function parseReviews(raw: unknown, prNumber: number): GhReviewSnapshot[] {
   for (const item of reviews as RawReview[]) {
     const reviewId = asString(item.id);
     if (reviewId.length === 0) continue;
+    const author = actorOf(item.author);
+    const state = asString(item.state, "UNKNOWN").toUpperCase();
+    const submittedAt = asString(item.submittedAt);
     out.push({
       prNumber,
       reviewId,
-      state: asString(item.state, "UNKNOWN").toUpperCase(),
-      submittedAt: asString(item.submittedAt),
+      author,
+      state,
+      submittedAt,
+      observedVersion: snapshotHash({ reviewId, author, state, submittedAt }),
     });
   }
   return out;
@@ -288,14 +321,16 @@ function parseComments(raw: unknown, target: "issue" | "pr", number: number): Gh
   for (const item of comments as RawComment[]) {
     const commentId = asString(item.id);
     if (commentId.length === 0) continue;
-    const authorRecord = item.author as { login?: unknown } | undefined;
+    const author = actorOf(item.author);
     const createdAt = asString(item.createdAt);
     const body = asString(item.body).slice(0, 2000);
     out.push({
       target,
       number,
       commentId,
-      author: authorRecord && typeof authorRecord.login === "string" ? authorRecord.login : "",
+      author: author.rawLogin,
+      authorPresence: author.presence,
+      rawAuthor: author.rawLogin,
       createdAt,
       bodyPreview: body.slice(0, 400),
       bodyHash: snapshotHash({ commentId, body, createdAt }),

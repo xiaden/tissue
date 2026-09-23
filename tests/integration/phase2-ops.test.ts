@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openTissueDb, closeDb, runWrite } from "../../src/db/open.ts";
-import { upsertRepository, insertIssue, insertWorkItem, insertSession, insertWorktree, insertPullRequestIfAbsent } from "../../src/db/repositories.ts";
+import { upsertRepository, insertIssue, insertWorkItem, insertSession, insertWorktree, insertPullRequestIfAbsent, addWorkItemDependency, settleWorkItemDependency } from "../../src/db/repositories.ts";
 import { enqueueOperation, pauseOperation, resumeOperation, cleanupOperation, statusOperation, inspectOperation, historyOperation } from "../../src/controller/ops.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
@@ -101,6 +101,71 @@ test("cleanupOperation emits ERROR JSONL on successful explicit cleanup and leav
   } finally {
     closeDb(reopened);
   }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("ops expose distinct deferred and awaiting-decision capacity/dependency facts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tissue-phase2-states-"));
+  const config: TissueConfig = { pollIntervalSeconds: 60, maxConcurrentGlobal: 3, retentionDays: 30, agents: {}, repos: [] };
+  const logger = new JsonLogger(new CapturingSink().writeable(), "info", "phase2");
+  const db = openTissueDb(join(dir, "tissue.db"));
+  const repo = upsertRepository(db, { id: "repo-states", owner: "acme", name: "states", remote: "https://github.com/acme/states.git", local_dir: dir, baseline_at: "2026-01-01T00:00:00.000Z", poll_interval_seconds: 60, max_concurrent_per_repo: 1 });
+  const issue = insertIssue(db, { id: "issue-dependency", repo_id: repo.id, number: 99, title: "dependency", state: "READY", updated_at: new Date().toISOString() });
+  insertWorkItem(db, { id: "wi-await", repo_id: repo.id, state: "AWAITING_DECISION", base_branch: "main" });
+  insertWorkItem(db, { id: "wi-defer", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+  addWorkItemDependency(db, "wi-defer", { kind: "issue", id: issue.id });
+  closeDb(db);
+  const ctx = { config, stateDir: dir, logger };
+  const status = statusOperation(ctx) as { capacity: { active: number; states: { awaitingDecision: string; deferred: string } } };
+  assert.equal(status.capacity.active, 1);
+  assert.equal(status.capacity.states.awaitingDecision, "consumes");
+  assert.equal(status.capacity.states.deferred, "exempt");
+  const inspected = inspectOperation(ctx) as { workItems: Array<{ id: string; state: string; capacity: string; dependency: { kind: string; id: string } | null }> };
+  const deferred = inspected.workItems.find((item) => item.id === "wi-defer");
+  assert.equal(deferred?.state, "DEFERRED");
+  assert.equal(deferred?.capacity, "exempt");
+  assert.deepEqual(deferred?.dependency, { kind: "issue", id: issue.id, state: "ACTIVE" });
+  assert.equal(inspected.workItems.find((item) => item.id === "wi-await")?.capacity, "consumes");
+  const history = historyOperation(ctx, "wi-defer") as { workItem: { id: string; state: string; capacity: string; dependency: { kind: string; id: string; state: string } | null }; transitions: unknown[]; housekeeping: unknown[] };
+  assert.equal(history.workItem.id, "wi-defer");
+  assert.equal(history.workItem.state, "DEFERRED");
+  assert.equal(history.workItem.capacity, "exempt");
+  assert.deepEqual(history.workItem.dependency, { kind: "issue", id: issue.id, state: "ACTIVE" });
+  assert.ok(Array.isArray(history.transitions));
+  assert.ok(Array.isArray(history.housekeeping));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("unscoped history exposes current capacity and only active dependencies", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tissue-phase2-history-"));
+  const config: TissueConfig = { pollIntervalSeconds: 60, maxConcurrentGlobal: 3, retentionDays: 30, agents: {}, repos: [] };
+  const logger = new JsonLogger(new CapturingSink().writeable(), "info", "phase2");
+  const db = openTissueDb(join(dir, "tissue.db"));
+  const repo = upsertRepository(db, { id: "repo-history", owner: "acme", name: "history", remote: "https://github.com/acme/history.git", local_dir: dir, baseline_at: "2026-01-01T00:00:00.000Z", poll_interval_seconds: 60, max_concurrent_per_repo: 1 });
+  insertWorkItem(db, { id: "wi-awaiting", repo_id: repo.id, state: "AWAITING_DECISION", base_branch: "main" });
+  insertWorkItem(db, { id: "wi-deferred", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+  insertWorkItem(db, { id: "wi-ready", repo_id: repo.id, state: "READY", base_branch: "main" });
+  addWorkItemDependency(db, "wi-awaiting", { kind: "work_item", id: "wi-ready" });
+  const settled = addWorkItemDependency(db, "wi-deferred", { kind: "work_item", id: "wi-ready" });
+  settleWorkItemDependency(db, settled.id);
+  closeDb(db);
+
+  const history = historyOperation({ config, stateDir: dir, logger }) as {
+    scope: string | null;
+    workItem: unknown;
+    workItems: Array<{ id: string; state: string; capacity: string; dependency: { kind: string; id: string; state: string } | null }>;
+    transitions: unknown[];
+    housekeeping: unknown[];
+  };
+  assert.equal(history.scope, null);
+  assert.equal(history.workItem, null);
+  assert.deepEqual(history.workItems.map(({ id, state, capacity, dependency }) => ({ id, state, capacity, dependency })), [
+    { id: "wi-awaiting", state: "AWAITING_DECISION", capacity: "consumes", dependency: { kind: "work_item", id: "wi-ready", state: "ACTIVE" } },
+    { id: "wi-deferred", state: "DEFERRED", capacity: "exempt", dependency: null },
+    { id: "wi-ready", state: "READY", capacity: "not_applicable", dependency: null },
+  ]);
+  assert.ok(Array.isArray(history.transitions));
+  assert.ok(Array.isArray(history.housekeeping));
   rmSync(dir, { recursive: true, force: true });
 });
 

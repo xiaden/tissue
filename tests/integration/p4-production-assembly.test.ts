@@ -133,6 +133,7 @@ test("production assembly starts from config + empty DB and completes the lifecy
       priority: 0,
     };
     const config: TissueConfig = {
+      security: { trustedGithubUsers: ["trusted"] },
       pollIntervalSeconds: 300,
       maxConcurrentGlobal: 3,
       retentionDays: 90,

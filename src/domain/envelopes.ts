@@ -16,7 +16,7 @@
 // dispositions through the boundary.
 
 import type { WriteTx } from "../db/open.ts";
-import { getIssueById, getWorkItem, updateIssueState, setWorkItemState, listTransitions, appendTransition } from "../db/repositories.ts";
+import { getIssueById, getWorkItem, updateIssueState, setWorkItemState, listTransitions, appendTransition, addWorkItemDependency } from "../db/repositories.ts";
 import { recordTransition } from "./transitions.ts";
 import {
   ISSUE_TRIAGE_DISPOSITIONS,
@@ -47,7 +47,13 @@ export type ResolutionOutcome =
   | "completed"
   | "awaiting_review"
   | "needs_changes"
-  | "blocked";
+  | "awaiting_decision"
+  | "deferred";
+
+export interface ResolutionDependency {
+  kind: "issue" | "work_item";
+  id: string;
+}
 
 export interface ResolutionEnvelope {
   kind: "resolution";
@@ -56,8 +62,8 @@ export interface ResolutionEnvelope {
   work_item_id: string;
   /** Proposed lifecycle outcome (mapped onto legal WorkItem transitions). */
   outcome: ResolutionOutcome;
-  /** Dependency identifiers when outcome is blocked. */
-  blocked_by?: string;
+  /** Exactly one durable dependency target, required only for DEFERRED. */
+  dependency?: ResolutionDependency;
   /** Bounded rationale. */
   reason?: string;
 }
@@ -125,11 +131,22 @@ function validateTriageEnvelope(e: TriageEnvelope): void {
 function validateResolutionEnvelope(e: ResolutionEnvelope): void {
   validateIdentifier(e.envelope_id, "envelope_id");
   validateIdentifier(e.work_item_id, "work_item_id");
-  const outcomes: ResolutionOutcome[] = ["completed", "awaiting_review", "needs_changes", "blocked"];
+  const outcomes: ResolutionOutcome[] = ["completed", "awaiting_review", "needs_changes", "awaiting_decision", "deferred"];
   if (!outcomes.includes(e.outcome)) {
     throw new EnvelopeValidationError(`outcome: '${String(e.outcome)}' is not a resolution outcome`);
   }
-  if (e.blocked_by !== undefined) validateIdentifier(e.blocked_by, "blocked_by");
+  if (e.dependency !== undefined) {
+    if (!e.dependency || (e.dependency.kind !== "issue" && e.dependency.kind !== "work_item")) {
+      throw new EnvelopeValidationError("dependency: kind must be 'issue' or 'work_item'");
+    }
+    validateIdentifier(e.dependency.id, "dependency.id");
+  }
+  if (e.outcome === "deferred" && e.dependency === undefined) {
+    throw new EnvelopeValidationError("dependency: exactly one target is required for deferred outcome");
+  }
+  if (e.outcome !== "deferred" && e.dependency !== undefined) {
+    throw new EnvelopeValidationError("dependency: only deferred outcome may include a dependency");
+  }
   validateReason(e.reason);
 }
 
@@ -276,14 +293,16 @@ const RESOLUTION_OUTCOME_TO: Record<ResolutionOutcome, string> = {
   completed: "COMPLETED",
   awaiting_review: "WAITING",
   needs_changes: "RUNNING",
-  blocked: "BLOCKED",
+  awaiting_decision: "AWAITING_DECISION",
+  deferred: "DEFERRED",
 };
 
 const RESOLUTION_OUTCOME_EVENT: Record<ResolutionOutcome, string> = {
   completed: "completed",
   awaiting_review: "await_review",
   needs_changes: "resume",
-  blocked: "block",
+  awaiting_decision: "await_decision",
+  deferred: "defer",
 };
 
 export function applyResolutionEnvelope(tx: WriteTx, envelope: ResolutionEnvelope): ApplyResult {
@@ -311,9 +330,10 @@ export function applyResolutionEnvelope(tx: WriteTx, envelope: ResolutionEnvelop
     );
   }
 
-  setWorkItemState(tx, wi.id, targetState, {
-    blockedBy: envelope.outcome === "blocked" ? (envelope.blocked_by ?? null) : null,
-  });
+  if (envelope.outcome === "deferred") {
+    addWorkItemDependency(tx, wi.id, envelope.dependency!);
+  }
+  setWorkItemState(tx, wi.id, targetState);
   recordTransition(
     tx,
     { type: "work_item", id: wi.id },
@@ -323,7 +343,7 @@ export function applyResolutionEnvelope(tx: WriteTx, envelope: ResolutionEnvelop
     {
       envelope_id: envelope.envelope_id,
       outcome: envelope.outcome,
-      blocked_by: envelope.outcome === "blocked" ? (envelope.blocked_by ?? null) : null,
+      dependency: envelope.dependency ?? null,
       reason: envelope.reason ?? null,
     },
     "controller.applyEnvelope",

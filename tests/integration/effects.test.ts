@@ -26,12 +26,15 @@ import {
 import { argvPrMerge, GhClient, GhError } from "../../src/integrations/gh-client.ts";
 import { pushBranch, runGit } from "../../src/integrations/git-client.ts";
 import {
+  addWorkItemDependency,
   getSideEffectFull,
+  listTransitions,
   insertPullRequest,
   insertSideEffect,
   insertWorkItem,
 } from "../../src/db/repositories.ts";
 import { createTestDb, seedRepository } from "../helpers/db.ts";
+import { claimNextWorkItem } from "../../src/controller/queue.ts";
 import { createTempRepo } from "../helpers/git.ts";
 import { defaultNomarrMeta, readEffectLog, writeFakeGh } from "../helpers/fake-gh.ts";
 
@@ -288,6 +291,86 @@ test("merge adopts external reality: already MERGED / not found", async () => {
     const gone = seedEffect(t.db, "merge", { pr_number: 22, base_branch: "main", auto_merge: true, merge_policy_known: true }, "eff-gone");
     assert.equal((await executeVerifiedEffect(t.db, gone, tr)).status, "adopted");
     assert.equal(tr.calls.includes("mergePr"), false);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("verified merge releases deferred dependents atomically and deterministically", async () => {
+  const t = createTestDb();
+  try {
+    const repo = seedRepository(t.db);
+    insertWorkItem(t.db, { id: WI, repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    insertWorkItem(t.db, { id: "wi-release-a", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+    insertWorkItem(t.db, { id: "wi-release-b", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+    insertWorkItem(t.db, { id: "wi-paused", repo_id: repo.id, state: "PAUSED_WORK", base_branch: "main" });
+    const releaseA = addWorkItemDependency(t.db, "wi-release-a", { kind: "work_item", id: WI });
+    const releaseB = addWorkItemDependency(t.db, "wi-release-b", { kind: "work_item", id: WI });
+    const paused = addWorkItemDependency(t.db, "wi-paused", { kind: "work_item", id: WI });
+    t.db.sql.run("UPDATE work_item_dependencies SET created_at = ? WHERE id IN (?, ?, ?)", "2026-09-09T00:00:00.000Z", releaseA.id, releaseB.id, paused.id);
+    insertPullRequest(t.db, { id: "pr-release", work_item_id: WI, repo_id: repo.id, number: 21, head_ref: "tissue/wi_abc", state: "ACTIVE" });
+    const id = seedEffect(t.db, "merge", { pr_number: 21, base_branch: "main", auto_merge: true, merge_policy_known: true }, "eff-release");
+    const tr = new FakeTransport();
+    tr.prs.set(21, { ...openPr(21), state: "MERGED" });
+    assert.equal((await executeVerifiedEffect(t.db, id, tr)).status, "adopted");
+    assert.deepEqual(
+      ["wi-release-a", "wi-release-b"].map((dependent) => t.db.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", dependent)?.state),
+      ["READY", "READY"],
+    );
+    assert.equal(t.db.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", "wi-paused")?.state, "PAUSED_WORK");
+    assert.equal(t.db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM state_transitions WHERE event = 'dependency_completed'")?.c, 2);
+    assert.deepEqual(
+      [releaseA, releaseB, paused]
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map((relation) => t.db.sql.get<{ state: string }>("SELECT state FROM work_item_dependencies WHERE id = ?", relation.id)?.state),
+      ["SETTLED", "SETTLED", "SETTLED"],
+      "every active relation is settled, including preserved dependents",
+    );
+    assert.deepEqual(
+      t.db.sql
+        .all<{ entity_id: string }>(
+          "SELECT entity_id FROM state_transitions WHERE event = 'dependency_completed' ORDER BY id",
+        )
+        .map((transition) => transition.entity_id),
+      ["wi-release-a", "wi-release-b"].sort((a, b) => {
+        const relationA = [releaseA, releaseB].find((relation) => relation.dependent_work_item_id === a)!;
+        const relationB = [releaseA, releaseB].find((relation) => relation.dependent_work_item_id === b)!;
+        return relationA.id.localeCompare(relationB.id);
+      }),
+      "release audits follow created_at/id relation order",
+    );
+    assert.equal(claimNextWorkItem(t.db, new Date("2026-09-09T00:01:00.000Z")), null, "completion does not directly admit READY dependents");
+    assert.equal(t.db.sql.get<{ state: string }>("SELECT state FROM side_effects WHERE id = ?", id)?.state, "DONE");
+    assert.equal((await executeVerifiedEffect(t.db, id, tr)).status, "already_done");
+    assert.equal(t.db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM state_transitions WHERE event = 'dependency_completed'")?.c, 2);
+    assert.deepEqual(
+      [releaseA, releaseB, paused].map((relation) => t.db.sql.get<{ state: string }>("SELECT state FROM work_item_dependencies WHERE id = ?", relation.id)?.state),
+      ["SETTLED", "SETTLED", "SETTLED"],
+      "repeat execution does not resurrect settled relations",
+    );
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("verified merge rolls back completion and release together on audit failure", async () => {
+  const t = createTestDb();
+  try {
+    const repo = seedRepository(t.db);
+    insertWorkItem(t.db, { id: WI, repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    insertWorkItem(t.db, { id: "wi-invalid-release", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+    const relation = addWorkItemDependency(t.db, "wi-invalid-release", { kind: "work_item", id: WI });
+    t.db.sql.exec("CREATE TRIGGER fail_release_audit AFTER INSERT ON state_transitions WHEN NEW.entity_id = 'wi-invalid-release' BEGIN SELECT RAISE(ABORT, 'forced release audit failure'); END");
+    insertPullRequest(t.db, { id: "pr-rollback", work_item_id: WI, repo_id: repo.id, number: 21, head_ref: "tissue/wi_abc", state: "ACTIVE" });
+    const id = seedEffect(t.db, "merge", { pr_number: 21, base_branch: "main", auto_merge: true, merge_policy_known: true }, "eff-rollback");
+    const tr = new FakeTransport();
+    tr.prs.set(21, { ...openPr(21), state: "MERGED" });
+    assert.equal((await executeVerifiedEffect(t.db, id, tr)).status, "retry");
+    assert.equal(t.db.sql.get<{ state: string }>("SELECT state FROM side_effects WHERE id = ?", id)?.state, "FAILED");
+    assert.equal(t.db.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", WI)?.state, "RUNNING");
+    assert.equal(t.db.sql.get<{ state: string }>("SELECT state FROM pull_requests WHERE id = ?", "pr-rollback")?.state, "ACTIVE");
+    assert.equal(t.db.sql.get<{ state: string }>("SELECT state FROM work_item_dependencies WHERE id = ?", relation.id)?.state, "ACTIVE");
+    assert.equal(t.db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM state_transitions WHERE entity_id = ?", WI)?.c, 0);
   } finally {
     t.cleanup();
   }

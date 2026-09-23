@@ -20,6 +20,8 @@ import { resolve } from "node:path";
 
 import { parse as parseYaml } from "yaml";
 
+import { normalizeGithubLogin } from "../controller/trust.ts";
+
 import type {
   ModelSetting,
   RepositoryConfig,
@@ -300,10 +302,23 @@ export function parseConfig(yamlText: string, source = "<yaml>"): TissueConfig {
   const root = expectObject(doc, source);
   assertKnownKeys(
     root,
-    new Set(["pollIntervalSeconds", "maxConcurrentGlobal", "retentionDays", "agents", "repos"]),
+    new Set(["security", "pollIntervalSeconds", "maxConcurrentGlobal", "retentionDays", "agents", "repos"]),
     source,
   );
   walkRejectSecrets(root, source);
+
+  let security: TissueConfig["security"];
+  if (root.security !== undefined) {
+    const securityNode = expectObject(root.security, `${source}.security`);
+    assertKnownKeys(securityNode, new Set(["trustedGithubUsers"]), `${source}.security`);
+    const users = expectStringArray(securityNode.trustedGithubUsers, `${source}.security.trustedGithubUsers`);
+    for (const [index, login] of users.entries()) {
+      if (normalizeGithubLogin(login) === null) {
+        throw new ConfigError(`${source}.security.trustedGithubUsers[${index}]: invalid GitHub login`);
+      }
+    }
+    security = { trustedGithubUsers: [...users] };
+  }
 
   let pollIntervalSeconds = DEFAULT_POLL_INTERVAL_SECONDS;
   if (root.pollIntervalSeconds !== undefined) {
@@ -341,6 +356,7 @@ export function parseConfig(yamlText: string, source = "<yaml>"): TissueConfig {
   const repos = reposRaw.map((r, i) => parseRepository(r, i));
 
   return {
+    ...(security ? { security } : {}),
     pollIntervalSeconds,
     maxConcurrentGlobal,
     retentionDays,

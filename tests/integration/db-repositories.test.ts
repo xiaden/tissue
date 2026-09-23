@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 
 import {
   upsertRepository,
+  insertIssue,
   getRepository,
   getPollWatermark,
   setPollWatermark,
@@ -41,8 +42,114 @@ import {
   housekeepTerminalUnattachedInbox,
   housekeepingCounters,
   statusSummary,
+  envelopeForRow,
+  isLegacyUnprovable,
+  validateProvenanceEnvelope,
+  upsertIssueFromSnapshot,
+  insertPullRequest,
+  getPullRequestByRepoNumber,
+  getInboxById,
+  insertInboxEventIfAbsent,
+  addWorkItemDependency,
+  listDependentsForCompletedDependency,
+  settleWorkItemDependency,
 } from "../../src/db/repositories.ts";
+import { openTissueDb, closeDb, runWrite } from "../../src/db/open.ts";
 import { createTestDb, seedRepository, seedIssue } from "../helpers/db.ts";
+import type { ProvenanceEnvelope } from "../../src/controller/trust.ts";
+
+test("repository envelope reads preserve the canonical decision and detect legacy rows", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const row = seedIssue(db, seedRepository(db).id, { number: 91, state: "NEW" });
+    assert.equal(envelopeForRow(row), null);
+    assert.equal(isLegacyUnprovable(row), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("dependency mutations commit only through the caller-owned runWrite transaction", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    insertWorkItem(db, { id: "wi-tx-target", repo_id: repo.id, state: "COMPLETED", base_branch: "main" });
+    insertWorkItem(db, { id: "wi-tx-dependent", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+
+    assert.throws(
+      () => runWrite(db, (tx) => {
+        addWorkItemDependency(tx, "wi-tx-dependent", { kind: "work_item", id: "wi-tx-target" });
+        throw new Error("force dependency rollback");
+      }),
+      /force dependency rollback/,
+    );
+    assert.equal(
+      db.sql.get<{ count: number }>("SELECT COUNT(*) AS count FROM work_item_dependencies WHERE dependent_work_item_id = ?", "wi-tx-dependent")?.count,
+      0,
+      "a failed caller transaction must leave no dependency row",
+    );
+
+    const committed = runWrite(db, (tx) =>
+      addWorkItemDependency(tx, "wi-tx-dependent", { kind: "work_item", id: "wi-tx-target" }),
+    );
+    assert.equal(committed.dependency_work_item_id, "wi-tx-target");
+    assert.equal(
+      db.sql.get<{ count: number }>("SELECT COUNT(*) AS count FROM work_item_dependencies WHERE id = ?", committed.id)?.count,
+      1,
+      "a successful caller transaction must persist the dependency row",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("dependency repository validates IDs, orders dependents deterministically, settles rows, and reopens durably", () => {
+  const { db, path, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const issue = seedIssue(db, repo.id, { state: "READY" });
+    insertWorkItem(db, { id: "wi-dep-a", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+    insertWorkItem(db, { id: "wi-dep-b", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+    insertWorkItem(db, { id: "wi-dep-c", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+
+    assert.throws(
+      () => addWorkItemDependency(db, "wi-missing-dependent", { kind: "issue", id: issue.id }),
+      /dependent WorkItem 'wi-missing-dependent' was not found/,
+    );
+    assert.throws(
+      () => addWorkItemDependency(db, "wi-dep-a", { kind: "issue", id: "issue-missing" }),
+      /dependency 'issue-missing' was not found/,
+    );
+
+    const first = addWorkItemDependency(db, "wi-dep-a", { kind: "issue", id: issue.id });
+    const second = addWorkItemDependency(db, "wi-dep-b", { kind: "issue", id: issue.id });
+    const third = addWorkItemDependency(db, "wi-dep-c", { kind: "issue", id: issue.id });
+    db.sql.run("UPDATE work_item_dependencies SET created_at = ? WHERE id = ?", "2026-09-09T00:01:00.000Z", first.id);
+    db.sql.run("UPDATE work_item_dependencies SET created_at = ? WHERE id = ?", "2026-09-09T00:00:00.000Z", second.id);
+    db.sql.run("UPDATE work_item_dependencies SET created_at = ? WHERE id = ?", "2026-09-09T00:00:00.000Z", third.id);
+    const sameTimestampOrder = [second, third].sort((a, b) => a.id.localeCompare(b.id));
+    assert.deepEqual(
+      listDependentsForCompletedDependency(db, { kind: "issue", id: issue.id }).map((row) => row.dependent_work_item_id),
+      [...sameTimestampOrder.map((row) => row.dependent_work_item_id), first.dependent_work_item_id],
+    );
+    settleWorkItemDependency(db, first.id);
+    assert.deepEqual(
+      listDependentsForCompletedDependency(db, { kind: "issue", id: issue.id }).map((row) => row.dependent_work_item_id),
+      sameTimestampOrder.map((row) => row.dependent_work_item_id),
+    );
+    closeDb(db);
+    const reopened = openTissueDb(path);
+    try {
+      assert.equal(reopened.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM work_item_dependencies")?.c, 3);
+      assert.equal(reopened.sql.get<{ state: string }>("SELECT state FROM work_item_dependencies WHERE id = ?", first.id)?.state, "SETTLED");
+    } finally {
+      closeDb(reopened);
+      cleanup();
+    }
+  } finally {
+    // Reopen path performs explicit close and cleanup.
+  }
+});
 
 // ---- snapshots / watermarks -------------------------------------------------
 
@@ -347,6 +454,206 @@ test("statusSummary aggregates repositories, work items, inbox, leases, housekee
     assert.equal(s.sideEffectsPending, 1);
     assert.equal(s.activeLeases, 1);
     assert.equal(s.housekeeping.terminalMarked, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+
+test("repository envelope round-trips for issue, pull request, and inbox rows", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const envelope: ProvenanceEnvelope = {
+      repository: repo.id,
+      sourceKind: "github.issue",
+      objectId: "issue-42",
+      contentId: "comment-7",
+      observedVersion: "etag-1",
+      contentHash: "sha256:abc",
+      authoritativeAt: "2026-09-09T00:00:00.000Z",
+      policyRevision: "sha256:policy",
+      actor: { present: true, rawLogin: "Alice", normalizedLogin: "alice", presence: "PRESENT" },
+      decision: "TRUSTED",
+      reason: "TRUSTED",
+      deliveryClass: "TRUSTED_PROSE",
+    };
+    const issue = upsertIssueFromSnapshot(db, {
+      id: "issue-envelope",
+      repo_id: repo.id,
+      number: 42,
+      title: "title",
+      state: "NEW",
+      updated_at: envelope.authoritativeAt,
+      envelope,
+    });
+    assert.deepEqual(envelopeForRow(issue), envelope);
+    assert.equal(isLegacyUnprovable(issue), false);
+
+    insertWorkItem(db, { id: "wi-envelope", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    insertPullRequest(db, {
+      id: "pr-envelope",
+      work_item_id: "wi-envelope",
+      repo_id: repo.id,
+      number: 7,
+      head_ref: "tissue/envelope",
+      state: "ACTIVE",
+      envelope: { ...envelope, sourceKind: "github.pull_request", objectId: "pr-7" },
+    });
+    const pr = getPullRequestByRepoNumber(db, repo.id, 7)!;
+    assert.equal(envelopeForRow(pr)?.sourceKind, "github.pull_request");
+    assert.equal(envelopeForRow(pr)?.actor.normalizedLogin, "alice");
+
+    const inboxId = insertInboxEventIfAbsent(db, {
+      issue_id: issue.id,
+      event_key: "envelope-event",
+      kind: "issue.comment",
+      payload_json: "{}",
+      envelope: { ...envelope, sourceKind: "github.comment", objectId: "comment-7" },
+    }).id;
+    assert.deepEqual(envelopeForRow(getInboxById(db, inboxId)!), { ...envelope, sourceKind: "github.comment", objectId: "comment-7" });
+  } finally {
+    cleanup();
+  }
+});
+
+test("inbox round-trip uses persisted envelope repository instead of issue identity", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db, { id: "owner/issue-repo", owner: "owner", name: "issue-repo" });
+    const issue = seedIssue(db, repo.id, { number: 11 });
+    const envelope: ProvenanceEnvelope = {
+      repository: "authoritative/source-repo", sourceKind: "github.issue", objectId: "issue-11", contentId: null,
+      observedVersion: "v1", contentHash: null, authoritativeAt: "2026-09-09T00:00:00.000Z",
+      policyRevision: "p1", actor: { present: false, rawLogin: null, normalizedLogin: null, presence: "MISSING" },
+      decision: "MISSING_ACTOR", reason: "MISSING_ACTOR", deliveryClass: "DENIED_PROSE",
+    };
+    const id = insertInboxEvent(db, {
+      issue_id: issue.id, event_key: "authoritative-repository", kind: "issue_discovered", payload_json: "{}", envelope,
+    });
+
+    const stored = envelopeForRow(getInboxById(db, id)!);
+    assert.equal(stored?.repository, "authoritative/source-repo");
+    assert.notEqual(stored?.repository, repo.id);
+    assert.equal(db.sql.get<{ envelope_repository: string }>("SELECT envelope_repository FROM inbox WHERE id = ?", id)?.envelope_repository, "authoritative/source-repo");
+  } finally {
+    cleanup();
+  }
+});
+
+test("snapshot and idempotent inbox paths reject provenance mismatches", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const envelope: ProvenanceEnvelope = {
+      repository: repo.id, sourceKind: "github.issue", objectId: "issue-9", contentId: null,
+      observedVersion: "v1", contentHash: null, authoritativeAt: "2026-09-09T00:00:00.000Z",
+      policyRevision: "p1", actor: { present: false, rawLogin: null, normalizedLogin: null, presence: "MISSING" },
+      decision: "MISSING_ACTOR", reason: "MISSING_ACTOR", deliveryClass: "DENIED_PROSE",
+    };
+    upsertIssueFromSnapshot(db, { id: "issue-mismatch", repo_id: repo.id, number: 9, title: "x", state: "NEW", updated_at: envelope.authoritativeAt, envelope });
+    assert.throws(() => upsertIssueFromSnapshot(db, { id: "issue-mismatch-2", repo_id: repo.id, number: 9, title: "x", state: "NEW", updated_at: envelope.authoritativeAt, envelope: { ...envelope, decision: "TRUSTED", reason: "TRUSTED", deliveryClass: "TRUSTED_PROSE" } }), /provenance mismatch/);
+
+    insertInboxEventIfAbsent(db, { issue_id: "issue-mismatch", event_key: "mismatch-event", kind: "x", payload_json: "{}", envelope });
+    assert.throws(() => insertInboxEventIfAbsent(db, { issue_id: "issue-mismatch", event_key: "mismatch-event", kind: "x", payload_json: "{}", envelope: { ...envelope, policyRevision: "p2" } }), /provenance mismatch/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("provenance validation rejects unknown top-level and nested actor keys or partial envelopes", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const valid: ProvenanceEnvelope = {
+      repository: repo.id, sourceKind: "github.issue", objectId: "issue-schema", contentId: null,
+      observedVersion: "v1", contentHash: null, authoritativeAt: "2026-09-09T00:00:00.000Z",
+      policyRevision: "p1", actor: { present: false, rawLogin: null, normalizedLogin: null, presence: "MISSING" },
+      decision: "MISSING_ACTOR", reason: "MISSING_ACTOR", deliveryClass: "DENIED_PROSE",
+    };
+
+    assert.throws(() => validateProvenanceEnvelope({ ...valid, unexpected: "reject" } as never), /unknown key unexpected/);
+    assert.throws(() => validateProvenanceEnvelope({ ...valid, actor: { ...valid.actor, unexpected: true } } as never), /actor: invalid value/);
+    assert.throws(() => validateProvenanceEnvelope({ repository: repo.id } as never), /required provenance is missing/);
+    assert.throws(() => validateProvenanceEnvelope({ ...valid, actor: { present: false, presence: "MISSING" } } as never), /actor\.rawLogin: invalid value/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("pull request and inbox quarantine boundaries reject body-bearing metadata and persist identity-only metadata", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const issue = seedIssue(db, repo.id, { number: 110, state: "NEW" });
+    insertWorkItem(db, { id: "wi-quarantine", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+
+    for (const forbidden of ["body", "bodyPreview", "title", "digest", "quote", "derivedProse"]) {
+      assert.throws(
+        () => insertPullRequest(db, {
+          id: `pr-forbidden-${forbidden}`,
+          work_item_id: "wi-quarantine",
+          repo_id: repo.id,
+          number: 110 + forbidden.length,
+          head_ref: `tissue/${forbidden}`,
+          state: "ACTIVE",
+          quarantine_json: JSON.stringify({ [forbidden]: "secret" }),
+        }),
+        new RegExp(`forbidden field ${forbidden}`),
+      );
+      assert.throws(
+        () => insertInboxEvent(db, {
+          issue_id: issue.id,
+          event_key: `inbox-forbidden-${forbidden}`,
+          kind: "issue.comment",
+          payload_json: "{}",
+          quarantine_json: JSON.stringify({ [forbidden]: "secret" }),
+        }),
+        new RegExp(`forbidden field ${forbidden}`),
+      );
+    }
+
+    const identityOnly = JSON.stringify({ source: "github", objectId: "redacted-1", observedVersion: "v1" });
+    insertPullRequest(db, {
+      id: "pr-identity-only",
+      work_item_id: "wi-quarantine",
+      repo_id: repo.id,
+      number: 199,
+      head_ref: "tissue/identity-only",
+      state: "ACTIVE",
+      quarantine_json: identityOnly,
+    });
+    assert.equal(getPullRequestByRepoNumber(db, repo.id, 199)?.quarantine_json, identityOnly);
+
+    const inboxIdentityOnly = JSON.stringify({ source: "github", objectId: "redacted-inbox-1", observedVersion: "v1" });
+    const inboxId = insertInboxEvent(db, {
+      issue_id: issue.id,
+      event_key: "inbox-identity-only",
+      kind: "issue.comment",
+      payload_json: "{}",
+      quarantine_json: inboxIdentityOnly,
+    });
+    assert.equal(getInboxById(db, inboxId)?.quarantine_json, inboxIdentityOnly);
+  } finally {
+    cleanup();
+  }
+});
+
+test("repository envelope and quarantine boundaries reject malformed or body-bearing metadata", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const valid: ProvenanceEnvelope = {
+      repository: repo.id, sourceKind: "github.issue", objectId: "issue-10", contentId: null,
+      observedVersion: "v1", contentHash: null, authoritativeAt: "2026-09-09T00:00:00.000Z",
+      policyRevision: "p1", actor: { present: false, rawLogin: null, normalizedLogin: null, presence: "MISSING" },
+      decision: "MISSING_ACTOR", reason: "MISSING_ACTOR", deliveryClass: "DENIED_PROSE",
+    };
+    assert.throws(() => validateProvenanceEnvelope({ ...valid, policyRevision: "" }), /required provenance/);
+    assert.throws(() => validateProvenanceEnvelope({ ...valid, decision: "NOPE" as never }), /invalid value/);
+    for (const forbidden of ["body", "bodyPreview", "title", "digest", "quote", "derivedProse"]) {
+      assert.throws(() => insertIssue(db, { id: `forbidden-${forbidden}`, repo_id: repo.id, number: 100 + forbidden.length, title: "x", state: "NEW", updated_at: valid.authoritativeAt, envelope: valid, quarantine_json: JSON.stringify({ [forbidden]: "secret" }) }), new RegExp(`forbidden field ${forbidden}`));
+    }
   } finally {
     cleanup();
   }

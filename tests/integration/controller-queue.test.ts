@@ -2,7 +2,7 @@
 //
 // M4 durable claim tests: capacity (global 3 / per-repo 1), ordering (priority
 // then creation), commit-before-effects durability, and the guardrail that
-// PAUSED_WORK/BLOCKED/FAILED_HOLD do NOT occupy run slots.
+// DEFERRED dependency waiters do not occupy run slots or become claimable.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -11,14 +11,14 @@ import { createTestDb, seedRepository, type TestDb } from "../helpers/db.ts";
 import {
   insertWorkItem,
   getWorkItem,
-  setWorkItemState,
   listTransitions,
   listWorkItemsByRepo,
+  addWorkItemDependency,
   type WorkItemRow,
 } from "../../src/db/repositories.ts";
 import { claimNextWorkItem } from "../../src/controller/queue.ts";
 import { runWrite } from "../../src/db/open.ts";
-import { recordTransition } from "../../src/domain/transitions.ts";
+import { seedIssue } from "../helpers/db.ts";
 
 function seed(db: TestDb["db"], overrides: { id: string; priority?: number; state?: string }): WorkItemRow {
   return insertWorkItem(db, {
@@ -142,53 +142,42 @@ test("returns null when no candidate fits under repo capacity", () => {
   }
 });
 
-test("PAUSED_WORK / BLOCKED / FAILED_HOLD do not occupy a run slot", () => {
+test("DEFERRED dependency waiters are non-claimable and capacity-exempt", () => {
   const { db, cleanup } = createTestDb();
   try {
     seedRepository(db, { maxConcurrentPerRepo: 1 });
-    // Repo slot would look full if any of these counted as running capacity.
-    seed(db, { id: "wi-blocked", state: "BLOCKED" });
-    seed(db, { id: "wi-paused", state: "PAUSED_WORK" });
-    seed(db, { id: "wi-hold", state: "FAILED_HOLD" });
-    seed(db, { id: "wi-queued" });
+    const deferred = seed(db, { id: "wi-deferred", state: "DEFERRED" });
+    const issue = seedIssue(db, "xiaden/nomarr", { id: "issue-dependency", number: 9001 });
+
+    const relation = runWrite(db, (tx) =>
+      addWorkItemDependency(tx, deferred.id, { kind: "issue", id: issue.id }),
+    );
+    assert.equal(relation.dependent_work_item_id, deferred.id);
+    assert.equal(relation.dependency_issue_id, issue.id);
+    assert.equal(relation.dependency_work_item_id, null);
+    assert.equal(relation.state, "ACTIVE");
+
     const now = new Date("2026-09-09T12:00:00.000Z");
+    assert.equal(claimNextWorkItem(db, now), null, "a deferred-only queue must yield no claim");
+
+    const sibling = seed(db, { id: "wi-queued-sibling", state: "QUEUED" });
     const claim = claimNextWorkItem(db, now);
-    assert.ok(claim, "a QUEUED item behind only non-running states must be claimable");
-    assert.equal(claim.workItemId, "wi-queued");
+    assert.ok(claim, "a queued sibling remains claimable under the repo capacity limit");
+    assert.equal(claim.workItemId, sibling.id);
+    assert.equal(getWorkItem(db, deferred.id)!.state, "DEFERRED");
   } finally {
     cleanup();
   }
 });
 
-test("blocked_by dependency: a BLOCKED item holds no slot and is claimable again once re-ready (R9)", () => {
+test("AWAITING_DECISION consumes per-repository capacity", () => {
   const { db, cleanup } = createTestDb();
   try {
-    seedRepository(db, { maxConcurrentPerRepo: 2 });
-    const dep = seed(db, { id: "wi-dep" }); // the dependency being worked
-    const blocked = seed(db, { id: "wi-blocked", state: "BLOCKED" });
-    runWrite(db, (tx) =>
-      setWorkItemState(tx, blocked.id, "BLOCKED", { blockedBy: "wi-dep" }),
-    );
-    const now = new Date("2026-09-09T12:00:00.000Z");
-
-    // The BLOCKED item (blocked_by = wi-dep) does not occupy a run slot.
-    const claimDep = claimNextWorkItem(db, now);
-    assert.equal(claimDep?.workItemId, "wi-dep");
-
-    // Dependency completes; controller unblocks the dependent item via an
-    // audited BLOCKED -> READY -> QUEUED re-ready, making it claimable.
-    runWrite(db, (tx) => {
-      recordTransition(tx, { type: "work_item", id: dep.id }, "RUNNING", "COMPLETED", "completion", { blocked_by: null }, "test");
-      setWorkItemState(tx, dep.id, "COMPLETED", { leaseToken: null, leaseUntil: null });
-      recordTransition(tx, { type: "work_item", id: blocked.id }, "BLOCKED", "READY", "unblock", { blocked_by: null }, "controller.dispatch");
-      setWorkItemState(tx, blocked.id, "READY", { blockedBy: null });
-      recordTransition(tx, { type: "work_item", id: blocked.id }, "READY", "QUEUED", "enqueue", {}, "controller.dispatch");
-      setWorkItemState(tx, blocked.id, "QUEUED");
-    });
-
-    const claim = claimNextWorkItem(db, now);
-    assert.equal(claim?.workItemId, "wi-blocked", "re-readied item must become claimable");
-    assert.equal(getWorkItem(db, blocked.id)!.blocked_by, null);
+    seedRepository(db, { maxConcurrentPerRepo: 1 });
+    seed(db, { id: "wi-awaiting-decision", state: "AWAITING_DECISION" });
+    seed(db, { id: "wi-queued-behind" });
+    assert.equal(claimNextWorkItem(db, new Date("2026-09-09T12:00:00.000Z")), null);
+    assert.equal(getWorkItem(db, "wi-queued-behind")!.state, "QUEUED");
   } finally {
     cleanup();
   }

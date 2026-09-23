@@ -32,16 +32,22 @@ On startup, Tissue asserts that the registry exists, is writable, and is a real 
 
    Stop/start OpenCode according to the owner service procedure so it can load the new plugin; Tissue does not perform that lifecycle action.
 4. Run `tissue doctor`. It validates the deployed agents, plugin file and load beacon, registry mount, database, configured repositories, and redacted resident status. It exits non-zero for missing/drifted deployment or failed registry assertion.
-5. Run `tissue reconcile` once and review its JSONL output. This performs the authenticated repository capability checks and persists readiness.
+5. Run `tissue reconcile` once and review its phase summary and JSONL output. Reconcile runs one ordered P0-P6 pass: it opens/migrates the database, verifies repository and GitHub capability/readiness, probes and censuses resident OpenCode sessions and applies session-loss recovery, reconciles leases/effects/worktrees/branches/PRs, scans drift, performs terminal housekeeping, and attempts normal-loop recovery. Each phase is reported as `ok`, `fail`, or `skip`; operational phase failures do not throw away later safe reconciliation work. The command exits non-zero when any phase fails (skipped phases from an earlier prerequisite failure are not counted as failures). Repository readiness is persisted during P1.
+
+When resident OpenCode is unavailable or P2 cannot complete, P6 is gated: prompt-dependent resume is withheld, while OpenCode-independent repository/artifact/drift/housekeeping phases still run. Reconcile does not itself release `DEFERRED` work; dependency completion is the only release trigger. It also does not release a `FAILED_HOLD` item, which requires explicit human cleanup.
 6. Run `tissue status` before enabling continuous polling.
 
-`status` does not perform the authenticated GitHub capability audit. It reports those fields as unprobed until reconciliation. Dispatch is refused while a configured repository is not ready.
+`status` does not perform the authenticated GitHub capability audit. It reports those fields as unprobed until reconciliation. Its capacity view counts `RUNNING`, `WAITING`, and `AWAITING_DECISION` as active slots; `DEFERRED` is dependency-waiting and capacity-exempt. Dispatch is refused while a configured repository is not ready.
 
 ## Normal operation
 
-Use `tissue daemon` for the resident loop, or `tissue tick`/`tissue reconcile` for one pass. While OpenCode is unavailable, the daemon continues safe polling/ingest, promotes ready work, and executes effects, but withholds triage, resolution claims, and relay. It resumes those operations automatically after a successful health probe; it does not exit merely because the resident is unavailable.
+Use `tissue daemon` for the resident loop, or `tissue tick`/`tissue reconcile` for one pass. While OpenCode is unavailable, the daemon continues safe polling/ingest, promotes ready work, and executes effects, but withholds triage, resolution claims, and relay. It resumes those operations automatically after a successful health probe; it does not exit merely because the resident is unavailable. A successful reconcile pass establishes the repository capability/readiness view and may recover durable session/work-item mappings, but it never creates or replaces a lost OpenCode session.
 
 SSE is only a wake hint. Polling and reconciliation remain correctness backstops. Do not issue concurrent prompts or create replacement sessions. A missing or irrecoverably wedged resolution session holds the owning active work item in `FAILED_HOLD` with evidence. Use `tissue inspect <wi>` and only then the human-only `tissue cleanup <wi>` path. Cleanup never deletes a real session or edits OpenCode's database.
+
+### Changing the trusted prose allowlist
+
+`security.trustedGithubUsers` is evaluated from the current configuration at each agent-visible triage or relay retrieval/serialization boundary. After editing the file selected by `TISSUE_CONFIG`, the new allowlist applies to future deliveries immediately: no repolling and no daemon restart are required. This includes both pending inbox rows and rows resumed from `DELIVERING`; each path re-evaluates the current configuration before prose is included. Already-produced agent history is not rewritten. The setting controls visibility of current GitHub-originating prose only; it does not authorize GitHub actions or add transports.
 
 ## Storage and recovery
 

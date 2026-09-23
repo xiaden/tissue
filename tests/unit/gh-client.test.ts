@@ -18,6 +18,8 @@ import {
   GhError,
   argvIssueComment,
   argvIssueList,
+  argvPrList,
+  argvPrReviews,
   assertControllerBranch,
   classifyGhFailure,
   parseGhVersion,
@@ -164,6 +166,15 @@ second line with a token gho_ABCDEFGHIJKLMNOP but not executed`;
   } finally {
     fg.cleanup();
   }
+});
+
+test("supported projection argv includes bounded actor/version fields", () => {
+  const issue = argvIssueList({ owner: "xiaden", name: "nomarr", state: "open", limit: 50 });
+  const prs = argvPrList({ owner: "xiaden", name: "nomarr", state: "all", limit: 50 });
+  const reviews = argvPrReviews("xiaden", "nomarr", 7);
+  assert.match(issue.at(-1) ?? "", /author/);
+  assert.match(prs.at(-1) ?? "", /author/);
+  assert.deepEqual(reviews.slice(-2), ["--json", "number,reviews"]);
 });
 
 test("issue list/view/close argv are typed and identifier-safe", () => {

@@ -8,8 +8,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { createTestDb, seedRepository, seedIssue, type TestDb } from "../helpers/db.ts";
+import type { ProvenanceEnvelope } from "../../src/controller/trust.ts";
 import { ScriptedTriageDriver, readySuggestion, duplicateSuggestion } from "../helpers/session-driver.ts";
 import {
   getIssueById,
@@ -250,6 +254,98 @@ test("runTriagePass runs one flight per enabled repo and creates one triage sess
     assert.equal(driver.ensureCalls.length, 2, "one triage session per enabled repo");
   } finally {
     cleanup();
+  }
+});
+
+test("triage digest counts AWAITING_DECISION as active and DEFERRED as capacity-exempt", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = getRepositoryById(db, seedRepository(db).id)!;
+    const issue = seedIssue(db, repo.id, { number: 12, state: "TRIAGE_PENDING" });
+    insertWorkItem(db, { id: "wi-awaiting-decision", repo_id: repo.id, state: "AWAITING_DECISION", base_branch: "main" });
+    insertWorkItem(db, { id: "wi-deferred", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+    const digest = buildTriageDigest(db, repo, issue);
+    assert.equal(digest.repoCounts.running, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+function provenance(rawLogin: string | null): ProvenanceEnvelope {
+  return {
+    repository: "xiaden/nomarr",
+    sourceKind: "issue",
+    objectId: "11",
+    contentId: null,
+    observedVersion: "v1",
+    contentHash: "hash",
+    authoritativeAt: "2026-09-09T00:00:00.000Z",
+    policyRevision: "fixture",
+    actor: {
+      present: rawLogin !== null,
+      rawLogin,
+      normalizedLogin: rawLogin?.toLowerCase() ?? null,
+      presence: rawLogin === null ? "MISSING" : "PRESENT",
+    },
+    decision: "TRUSTED",
+    reason: "fixture",
+    deliveryClass: "TRUSTED_PROSE",
+  };
+}
+
+test("triage digest filters trusted, untrusted, and missing author prose while preserving objective fields", () => {
+  const directory = mkdtempSync(join(tmpdir(), "tissue-triage-provenance-"));
+  const configPath = join(directory, "tissue.yml");
+  writeFileSync(configPath, "security:\n  trustedGithubUsers: [TrustedUser]\n");
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const trusted = seedIssue(db, repo.id, { number: 21, title: "trusted-title", body_json: JSON.stringify("trusted-body"), envelope: provenance("TrustedUser") });
+    const denied = seedIssue(db, repo.id, { number: 22, title: "denied-title", body_json: JSON.stringify("denied-body"), envelope: provenance("Mallory") });
+    const missing = seedIssue(db, repo.id, { number: 23, title: "missing-title", body_json: JSON.stringify("missing-body"), envelope: null });
+
+    const trustedDigest = buildTriageDigest(db, repo, trusted, configPath);
+    const deniedDigest = buildTriageDigest(db, repo, denied, configPath);
+    const missingDigest = buildTriageDigest(db, repo, missing, configPath);
+
+    assert.equal(trustedDigest.titlePreview, "trusted-title");
+    assert.equal(trustedDigest.bodyPreview, "trusted-body");
+    for (const digest of [deniedDigest, missingDigest]) {
+      assert.equal(digest.titlePreview, "");
+      assert.equal(digest.bodyPreview, "");
+      assert.equal(digest.repoId, repo.id);
+      assert.equal(typeof digest.issueNumber, "number");
+    }
+    assert.equal(deniedDigest.issueNumber, 22);
+    assert.equal(missingDigest.issueNumber, 23);
+  } finally {
+    cleanup();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("triage digest re-evaluates changed config after ingestion without repolling", () => {
+  const directory = mkdtempSync(join(tmpdir(), "tissue-triage-config-"));
+  const configPath = join(directory, "tissue.yml");
+  const { db, cleanup } = createTestDb();
+  try {
+    writeFileSync(configPath, "security:\n  trustedGithubUsers: [TrustedUser]\n");
+    const repo = seedRepository(db);
+    const issue = seedIssue(db, repo.id, { number: 24, title: "config-sensitive-title", body_json: JSON.stringify("config-sensitive-body"), envelope: provenance("TrustedUser") });
+    const delivered = buildTriageDigest(db, repo, issue, configPath);
+    assert.equal(delivered.titlePreview, "config-sensitive-title");
+    assert.equal(delivered.bodyPreview, "config-sensitive-body");
+
+    writeFileSync(configPath, "security:\n  trustedGithubUsers: [DifferentUser]\n");
+    const omitted = buildTriageDigest(db, repo, issue, configPath);
+    assert.equal(omitted.titlePreview, "");
+    assert.equal(omitted.bodyPreview, "");
+    assert.equal(omitted.issueId, issue.id);
+    assert.equal(omitted.issueNumber, 24);
+    assert.equal(omitted.repoCounts.open, 1);
+  } finally {
+    cleanup();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

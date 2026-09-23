@@ -23,6 +23,7 @@
 
 import { TISSUE_RESOLVE_AGENT, TISSUE_TRIAGE_AGENT } from "../config/types.ts";
 import type { TissueConfig, RepositoryConfig, ProviderModel } from "../config/types.ts";
+
 import type { JsonLogger } from "../logging/jsonl.ts";
 import { runWrite } from "../db/open.ts";
 import type { TissueDb } from "../db/open.ts";
@@ -387,6 +388,8 @@ export interface DaemonRuntime {
   resolutionDriver: DaemonResolutionDriver;
   /** Injectable clock for deterministic production-assembly tests. */
   now?: () => Date;
+  /** Current configuration file used for retrieval-time prose decisions. */
+  configPath?: string;
 }
 
 /** Parse a configured `provider/model` value, failing closed (never auto-selecting a model). */
@@ -429,6 +432,7 @@ export function defaultNormalLoopIo(
         // Mandatory dedicated identity: never the resident OpenCode default agent.
         agent: triage?.agent ?? TISSUE_TRIAGE_AGENT,
         ...(triage?.model !== undefined ? { model: parseProviderModelOrThrow(triage.model) } : {}),
+        ...(runtime.configPath !== undefined ? { configPath: runtime.configPath } : {}),
         ...(repoRow
           ? {
               fetchIssueBody: (issue: { number: number }) =>
@@ -469,8 +473,9 @@ export function defaultNormalLoopIo(
         logger,
         // Same-session inbox deliveries reuse the dedicated resolution identity.
         agent: resolution?.agent ?? TISSUE_RESOLVE_AGENT,
-        ...(resolution?.model !== undefined ? { model: parseProviderModelOrThrow(resolution.model) } : {}),
-      });
+         ...(resolution?.model !== undefined ? { model: parseProviderModelOrThrow(resolution.model) } : {}),
+         ...(runtime.configPath !== undefined ? { configPath: runtime.configPath } : {}),
+       });
       return { status: result.status };
     },
     executeEffects: async (db, at) => {

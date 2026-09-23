@@ -9,8 +9,9 @@
 //
 // Capacity semantics (R8: default maxConcurrentGlobal=3, maxConcurrentPerRepo=1):
 //   - A claimed, in-flight WorkItem occupies one capacity slot. Slots are held by
-//     the RUNNING and WAITING states — an item that has been claimed (RUNNING) or
-//     is awaiting review/CI while retaining its session (WAITING).
+//     the RUNNING, WAITING, and AWAITING_DECISION states — an item that has been
+//     claimed, is awaiting review/CI, or is waiting for a human decision while
+//     retaining its session.
 //   - QUEUED is the set of items still waiting for a slot and therefore never
 //     counts toward capacity (counting it would deadlock a flood). PAUSED_WORK,
 //     BLOCKED and FAILED_HOLD do not hold a run slot: PAUSED_WORK re-enters the
@@ -62,7 +63,7 @@ export interface ClaimOptions {
 }
 
 /** States that occupy a capacity slot (claimed + retained in-flight). */
-const CAPACITY_HOLDING_STATES = ["RUNNING", "WAITING"] as const;
+const CAPACITY_HOLDING_STATES = ["RUNNING", "WAITING", "AWAITING_DECISION"] as const;
 const CAPACITY_HOLDING_PLACEHOLDERS = CAPACITY_HOLDING_STATES.map(() => "?").join(", ");
 
 interface CandidateRow {
@@ -144,7 +145,6 @@ export function claimNextWorkItem(
         setWorkItemState(tx, candidate.id, "RUNNING", {
           leaseToken,
           leaseUntil,
-          blockedBy: null,
         });
         recordTransition(
           tx,

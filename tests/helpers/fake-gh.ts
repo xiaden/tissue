@@ -182,7 +182,7 @@ if (args[0] === 'pr' && args[1] === 'create') {
     const headBranch = ci >= 0 ? rawHead.slice(ci + 1) : rawHead;
     const targetName = s.split('/')[1];
     const row = {
-      number: number, state: 'OPEN', headRefName: headBranch, headRefOid: sc.headSha || '',
+      number: number, state: 'OPEN', author: { login: sc.account || 'xiaden' }, headRefName: headBranch, headRefOid: sc.headSha || '',
       headRepositoryOwner: { login: headOwner },
       headRepository: { nameWithOwner: headOwner + '/' + targetName },
       updatedAt: sc.prCreateUpdatedAt || new Date().toISOString(), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',

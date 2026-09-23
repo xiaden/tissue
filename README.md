@@ -20,6 +20,32 @@ npm test
 
 The YAML file contains scalar polling, capacity, retention, agent/model, and repository settings. Secret material, credential-bearing URLs, and unsafe identifiers are rejected. See [onboarding and configuration](docs/onboarding-and-config.md).
 
+### GitHub prose delivery boundary
+
+GitHub-originating prose is untrusted until the controller reaches an agent-visible retrieval or serialization boundary. `decideCurrentGithubProse` in `src/controller/trust.ts` loads the current `security.trustedGithubUsers` configuration for each decision, applies strict ASCII login normalization without trimming malformed values, and returns only `TRUSTED` or `DENIED`; missing, unknown, malformed, or unusable authors/configuration fail closed. The decision is not cached or persisted as later delivery authority.
+
+Triage uses this boundary through `buildTriageDigest` in `src/controller/triage.ts`: trusted title/body previews may be included, while denied prose is omitted and typed issue identifiers, timestamps, and queue/repository counts remain available. Inbox relay uses `buildBundleText`/`relayOldestInbox` in `src/controller/inbox-relay.ts` to emit an allowlisted typed projection rather than whole `payload_json`; pending and resumed deliveries re-evaluate the current configuration. Runtime wiring in `src/runtime/daemon.ts` and `src/runtime/entrypoint.ts` supplies the configuration path to these seams.
+
+The existing managed-session moderation refusal remains an independent defense and is unchanged. Objective lifecycle and reconciliation facts remain usable independently of prose authorization. Reactions, inline review comments/threads, and review-body delivery have no current production consumer and remain explicit unsupported, fail-closed residuals; introducing a future consumer requires the same final current-config filter.
+
+## Resolution completion envelope
+
+Resolution agents return one JSON `ResolutionEnvelope` to the controller. The envelope is a proposal for one lifecycle transition of an existing WorkItem; agents do not create sessions, worktrees, pull requests, identities, or other controller state.
+
+```json
+{
+  "kind": "resolution",
+  "envelope_id": "unique-controller-assigned-id",
+  "work_item_id": "existing-work-item-id",
+  "outcome": "completed",
+  "reason": "bounded rationale"
+}
+```
+
+`outcome` must be one of `completed`, `awaiting_review`, `needs_changes`, `awaiting_decision`, or `deferred`. A `deferred` envelope must contain exactly one `dependency` object with `kind` set to `issue` or `work_item` and an identifier in `id`; every other outcome must omit `dependency`. `envelope_id`, `work_item_id`, and dependency identifiers are non-empty identifier-safe strings capped at 160 characters. `reason` is optional and capped at 2,000 characters.
+
+The controller parses the latest parent-linked assistant response, requires a JSON object whose `kind` is `resolution` and whose `work_item_id` matches the requested WorkItem, then validates the bounded contract. Applying a valid envelope requires that the WorkItem exists and that the proposed transition is legal. The controller maps outcomes to `COMPLETED`, `WAITING`, `RUNNING`, `AWAITING_DECISION`, and `DEFERRED`; `awaiting_decision` means the WorkItem is waiting for a human decision, while `deferred` means it is waiting on exactly one recorded issue or WorkItem dependency. Only verified completion of that dependency may release `DEFERRED`; restart, elapsed time, reconcile, or generic `BLOCKED` handling does not release it. A `completed` envelope records that the agent finished its repair turn; the WorkItem remains on the verified push, pull-request, protection, and merge effect path rather than being completed by envelope state application. Each applied transition is audited. Reapplying an already-applied envelope or an already-reached target state produces an auditable no-op rather than a second effect. See [the detailed public contract](CONTRACTS.md).
+
 ## Runtime boundaries
 
 Tissue has three separate storage boundaries:

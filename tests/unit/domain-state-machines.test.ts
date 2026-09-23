@@ -114,8 +114,8 @@ test("terminal WorkItem states cannot be relabelled (no outgoing edge to FAILED_
   assert.ok(isLegalTransition("work_item", "FAILED_HOLD", "FAILED", "cleanup"));
 });
 
-test("expected artifact-owning WorkItem set is exact and excludes terminal states", () => {
-  const expected = new Set(["QUEUED", "RUNNING", "WAITING", "PAUSED_WORK", "FAILED_HOLD", "BLOCKED"]);
+test("expected artifact-owning WorkItem set is exact and excludes DEFERRED/terminal states", () => {
+  const expected = new Set(["QUEUED", "RUNNING", "WAITING", "AWAITING_DECISION", "PAUSED_WORK", "FAILED_HOLD"]);
   assert.deepEqual([...ARTIFACT_OWNING_WORK_ITEM_STATES].sort(), [...expected].sort());
   for (const s of ARTIFACT_OWNING_WORK_ITEM_STATES) {
     assert.ok(STATE_MACHINES.work_item.states.includes(s as never), `work_item '${s}' must be a state`);
@@ -143,18 +143,32 @@ test("baseline/manual enqueue admission: BASELINE_EXCLUDED leaves only via an en
   assert.ok(!isLegalTransition("issue", "NEW", "REJECTED", "triage_rejected"));
 });
 
-test("pause/block/unblock edges exist for WorkItem and issue-triage flows", () => {
+test("pause and issue-triage block edges remain valid while WorkItem uses explicit wait states", () => {
   // Work pause + resume.
   assert.ok(isLegalTransition("work_item", "RUNNING", "PAUSED_WORK", "pause_work"));
   assert.ok(isLegalTransition("work_item", "PAUSED_WORK", "QUEUED", "resume_work"));
-  // Work block (stores blocked_by) + dependency completion auto re-ready.
-  assert.ok(isLegalTransition("work_item", "RUNNING", "BLOCKED", "block"));
-  assert.ok(isLegalTransition("work_item", "BLOCKED", "READY", "unblock"));
+  // Human waiting is active/capacity-consuming and dependency waiting is explicit.
+  assert.ok(isLegalTransition("work_item", "RUNNING", "AWAITING_DECISION", "await_decision"));
+  assert.ok(isLegalTransition("work_item", "AWAITING_DECISION", "RUNNING", "decision_received"));
+  assert.ok(isLegalTransition("work_item", "RUNNING", "DEFERRED", "defer"));
+  assert.ok(isLegalTransition("work_item", "WAITING", "DEFERRED", "defer"));
+  assert.ok(isLegalTransition("work_item", "DEFERRED", "READY", "dependency_completed"));
+  assert.ok(!isKnownState("work_item", "BLOCKED"));
+  assert.ok(!isLegalTransition("work_item", "RUNNING", "BLOCKED", "block"));
   // Issue triage pause / resume and dependency unblock.
   assert.ok(isLegalTransition("issue", "TRIAGE_PENDING", "PAUSED_TRIAGE", "triage_paused"));
   assert.ok(isLegalTransition("issue", "PAUSED_TRIAGE", "TRIAGE_PENDING", "resume_triage"));
   assert.ok(isLegalTransition("issue", "TRIAGE_PENDING", "BLOCKED", "triage_blocked"));
   assert.ok(isLegalTransition("issue", "BLOCKED", "TRIAGE_PENDING", "unblock_triage"));
+  // Issue-level triage BLOCKED remains supported and distinct from WorkItem FSM.
+  assert.ok(isKnownState("issue", "BLOCKED"));
+});
+
+test("explicit WorkItem wait-state semantics are not timer/reconcile releases", () => {
+  assert.ok(!isLegalTransition("work_item", "DEFERRED", "READY", "elapsed"));
+  assert.ok(!isLegalTransition("work_item", "DEFERRED", "READY", "restart"));
+  assert.ok(!isLegalTransition("work_item", "DEFERRED", "READY", "reconcile"));
+  assert.ok(!isLegalTransition("work_item", "AWAITING_DECISION", "READY", "unblock"));
 });
 
 test("FAILED_HOLD preserves evidence: its only exit is FAILED via cleanup", () => {

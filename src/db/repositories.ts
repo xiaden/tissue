@@ -20,8 +20,10 @@
 // defined here because they are durable data operations scoped to P2.
 
 import type { TissueDb, SqlValue } from "./open.ts";
+import { randomUUID } from "node:crypto";
 import { runWrite, TissueDbError, nowIso } from "./open.ts";
 import type { TissueConfig } from "../config/types.ts";
+import type { ActorPresence, DeliveryClass, ProvenanceEnvelope, TrustDecision } from "../controller/trust.ts";
 
 // ---- Terminal issue states with no future attachment path (R10/R22) ---------
 // NULL-WorkItem inbox rows for these terminal dispositions are housekept.
@@ -327,6 +329,131 @@ export function updateTriageState(db: TissueDb, repoId: string, patch: TriageSta
   );
 }
 
+// ---- Trust envelope -----------------------------------------------------------
+
+export type EnvelopeSourceKind = string;
+export type EnvelopeQuarantine = Readonly<{
+  sourceKind: string;
+  objectId: string;
+  contentId: string | null;
+  observedVersion: string;
+  contentHash: string | null;
+  authoritativeAt: string;
+  actor: ProvenanceEnvelope["actor"];
+  decision: TrustDecision;
+  reason: string;
+  deliveryClass: DeliveryClass;
+}>;
+
+const ENVELOPE_KEYS = new Set(["repository", "sourceKind", "objectId", "contentId", "observedVersion", "contentHash", "authoritativeAt", "policyRevision", "actor", "decision", "reason", "deliveryClass"]);
+const ACTOR_KEYS = new Set(["present", "rawLogin", "normalizedLogin", "presence"]);
+const FORBIDDEN_QUARANTINE_KEYS = new Set(["body", "bodyPreview", "title", "digest", "quote", "derivedProse"]);
+
+function assertEnvelope(envelope: ProvenanceEnvelope): ProvenanceEnvelope {
+  if (!envelope || typeof envelope !== "object") throw new TissueDbError("envelope: value must be an object");
+  for (const [field, value] of Object.entries(envelope)) {
+    if (!ENVELOPE_KEYS.has(field)) throw new TissueDbError(`envelope: unknown key ${field}`);
+    if (field === "actor") continue;
+    if (value !== null && typeof value !== "string") throw new TissueDbError(`envelope.${field}: expected string or null`);
+  }
+  if (!envelope.repository || !envelope.sourceKind || !envelope.objectId || !envelope.observedVersion || !envelope.authoritativeAt || !envelope.policyRevision || !envelope.reason) {
+    throw new TissueDbError("envelope: required provenance is missing");
+  }
+  if (!["TRUSTED", "UNTRUSTED", "MISSING_ACTOR", "UNKNOWN_ACTOR", "MALFORMED_ACTOR", "CONFIG_UNUSABLE"].includes(envelope.decision)) throw new TissueDbError("envelope.decision: invalid value");
+  if (!["OBJECTIVE", "TRUSTED_PROSE", "DENIED_PROSE"].includes(envelope.deliveryClass)) throw new TissueDbError("envelope.deliveryClass: invalid value");
+  const actor = envelope.actor;
+  if (!actor || typeof actor !== "object" || Object.keys(actor).some((key) => !ACTOR_KEYS.has(key)) || typeof actor.present !== "boolean" || !["PRESENT", "MISSING", "UNKNOWN", "MALFORMED"].includes(actor.presence)) throw new TissueDbError("envelope.actor: invalid value");
+  if (actor.rawLogin !== null && typeof actor.rawLogin !== "string") throw new TissueDbError("envelope.actor.rawLogin: invalid value");
+  if (actor.normalizedLogin !== null && typeof actor.normalizedLogin !== "string") throw new TissueDbError("envelope.actor.normalizedLogin: invalid value");
+  return envelope;
+}
+
+type EnvelopeSqlValues = readonly [
+  string | null, string | null, string | null, string | null, string | null,
+  string | null, string | null, string | null, number | null, string | null,
+  string | null, string | null, string | null, string | null, string | null,
+];
+
+function envelopeValues(envelope: ProvenanceEnvelope | null | undefined): EnvelopeSqlValues {
+  if (!envelope) return [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null];
+  const e = assertEnvelope(envelope);
+  return [
+    e.repository, e.sourceKind, e.objectId, e.contentId, e.observedVersion,
+    e.contentHash, e.authoritativeAt, e.policyRevision, e.actor.present ? 1 : 0,
+    e.actor.presence, e.actor.rawLogin, e.actor.normalizedLogin, e.decision,
+    e.reason, e.deliveryClass,
+  ];
+}
+
+const ENVELOPE_ROW_FIELDS = [
+  "envelope_repository", "envelope_source_kind", "envelope_object_id", "envelope_content_id",
+  "envelope_observed_version", "envelope_content_hash", "envelope_authoritative_at",
+  "envelope_policy_revision", "envelope_actor_present", "envelope_actor_presence",
+  "envelope_actor_raw_login", "envelope_actor_normalized_login", "envelope_decision",
+  "envelope_reason", "envelope_delivery_class",
+] as const;
+
+function envelopeFromRow(row: Record<string, unknown>): ProvenanceEnvelope | null {
+  const values = ENVELOPE_ROW_FIELDS.map((field) => row[field]);
+  const requiredIndexes = [0, 1, 2, 4, 6, 7, 8, 9, 12, 13, 14];
+  const requiredValues = requiredIndexes.map((index) => values[index]);
+  if (requiredValues.every((value) => value == null)) return null;
+  if (requiredValues.some((value) => value == null)) {
+    throw new TissueDbError("envelope: partial persisted provenance");
+  }
+  const e: ProvenanceEnvelope = {
+    repository: values[0] as string,
+    sourceKind: values[1] as string,
+    objectId: values[2] as string,
+    contentId: values[3] as string,
+    observedVersion: values[4] as string,
+    contentHash: values[5] as string,
+    authoritativeAt: values[6] as string,
+    policyRevision: values[7] as string,
+    actor: {
+      present: Number(values[8]) === 1,
+      rawLogin: values[10] as string,
+      normalizedLogin: values[11] as string,
+      presence: values[9] as ActorPresence,
+    },
+    decision: values[12] as TrustDecision,
+    reason: values[13] as string,
+    deliveryClass: values[14] as DeliveryClass,
+  };
+  return assertEnvelope(e);
+}
+
+/**
+ * Validate and return a provenance envelope before persistence.
+ *
+ * Unknown keys, missing required provenance, invalid decision/delivery classes,
+ * and malformed actor observations throw `TissueDbError`.
+ */
+export function validateProvenanceEnvelope(envelope: ProvenanceEnvelope): ProvenanceEnvelope { return assertEnvelope(envelope); }
+
+/** Read the complete persisted envelope, or null when the row has no envelope. */
+export function envelopeForRow(row: IssueRow | PullRequestRow | InboxRow): ProvenanceEnvelope | null { return envelopeFromRow(row as unknown as Record<string, unknown>); }
+
+/** Return true when a row has no persisted provenance and is therefore legacy-unprovable. */
+export function isLegacyUnprovable(row: IssueRow | PullRequestRow | InboxRow): boolean { return envelopeForRow(row) === null; }
+
+function assertBodyFreeQuarantine(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  assertValidJsonString(value, "quarantine_json");
+  const parsed = JSON.parse(value) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TissueDbError("quarantine_json: expected object");
+  for (const key of Object.keys(parsed)) if (FORBIDDEN_QUARANTINE_KEYS.has(key)) throw new TissueDbError(`quarantine_json: forbidden field ${key}`);
+  return value;
+}
+
+export function assertEnvelopeCompatible(existing: ProvenanceEnvelope | null, incoming: ProvenanceEnvelope): void {
+  assertEnvelope(incoming);
+  if (!existing) return;
+  const fields: (keyof ProvenanceEnvelope)[] = ["repository", "sourceKind", "objectId", "contentId", "observedVersion", "contentHash", "authoritativeAt", "policyRevision", "decision", "reason", "deliveryClass"];
+  for (const field of fields) if (existing[field] !== incoming[field]) throw new TissueDbError(`provenance mismatch: ${field}`);
+  for (const field of ["present", "rawLogin", "normalizedLogin", "presence"] as const) if (existing.actor[field] !== incoming.actor[field]) throw new TissueDbError(`provenance mismatch: actor.${field}`);
+}
+
 // ---- Issues -------------------------------------------------------------------
 
 export interface IssueRow {
@@ -341,6 +468,22 @@ export interface IssueRow {
   updated_at: string;
   disposition_json: string | null;
   blocked_by: string | null;
+  envelope_repository: string | null;
+  envelope_source_kind: string | null;
+  envelope_object_id: string | null;
+  envelope_content_id: string | null;
+  envelope_observed_version: string | null;
+  envelope_content_hash: string | null;
+  envelope_authoritative_at: string | null;
+  envelope_policy_revision: string | null;
+  envelope_actor_present: number | null;
+  envelope_actor_presence: string | null;
+  envelope_actor_raw_login: string | null;
+  envelope_actor_normalized_login: string | null;
+  envelope_decision: string | null;
+  envelope_reason: string | null;
+  envelope_delivery_class: string | null;
+  quarantine_json: string | null;
 }
 
 export interface IssueInput {
@@ -355,16 +498,23 @@ export interface IssueInput {
   updated_at: string;
   disposition_json?: string | null;
   blocked_by?: string | null;
+  envelope?: ProvenanceEnvelope | null;
+  quarantine_json?: string | null;
 }
 
 /** Insert an issue; conflicts on (repo_id, number) are surfaced as errors. */
 export function insertIssue(db: TissueDb, input: IssueInput): IssueRow {
   if (input.body_json) assertValidJsonString(input.body_json, "body_json");
   if (input.disposition_json) assertValidJsonString(input.disposition_json, "disposition_json");
+  assertBodyFreeQuarantine(input.quarantine_json);
   db.sql.run(
     `INSERT INTO issues(id, repo_id, number, title, body_json, state, snapshot_hash,
-       first_seen_at, updated_at, disposition_json, blocked_by)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+       first_seen_at, updated_at, disposition_json, blocked_by,
+       envelope_repository, envelope_source_kind, envelope_object_id, envelope_content_id, envelope_observed_version,
+       envelope_content_hash, envelope_authoritative_at, envelope_policy_revision, envelope_actor_present,
+       envelope_actor_presence, envelope_actor_raw_login, envelope_actor_normalized_login, envelope_decision,
+       envelope_reason, envelope_delivery_class, quarantine_json)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     input.id,
     input.repo_id,
     input.number,
@@ -375,40 +525,50 @@ export function insertIssue(db: TissueDb, input: IssueInput): IssueRow {
     input.first_seen_at ?? nowIso(),
     input.updated_at,
     input.disposition_json ?? null,
-    input.blocked_by ?? null,
-  );
-  return getIssueById(db, input.id)!;
+     input.blocked_by ?? null,
+       ...envelopeValues(input.envelope).slice(0, 15), input.quarantine_json ?? null,
+    );
+   return getIssueById(db, input.id)!;
 }
 
-/**
- * Upsert an issue discovered by polling. Preserves the original first_seen_at
- * and the triage/terminal state for an existing row; refreshes the snapshot
- * columns (title/body/snapshot_hash/updated_at). Baseline exclusion is decided
- * by the caller (ingest) and passed as `state`.
- */
 export function upsertIssueFromSnapshot(db: TissueDb, input: IssueInput): IssueRow {
   if (input.body_json) assertValidJsonString(input.body_json, "body_json");
   if (input.disposition_json) assertValidJsonString(input.disposition_json, "disposition_json");
+  assertBodyFreeQuarantine(input.quarantine_json);
+  const existing = getIssueByRepoNumber(db, input.repo_id, input.number);
+  if (existing && input.envelope) assertEnvelopeCompatible(envelopeForRow(existing), input.envelope);
   db.sql.run(
     `INSERT INTO issues(id, repo_id, number, title, body_json, state, snapshot_hash,
-       first_seen_at, updated_at, disposition_json, blocked_by)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?)
-     ON CONFLICT(repo_id, number) DO UPDATE SET
-       title = excluded.title,
-       body_json = excluded.body_json,
-       snapshot_hash = excluded.snapshot_hash,
-       updated_at = excluded.updated_at`,
-    input.id,
-    input.repo_id,
-    input.number,
-    input.title,
-    input.body_json ?? null,
-    input.state,
-    input.snapshot_hash ?? null,
-    input.first_seen_at ?? nowIso(),
-    input.updated_at,
-    input.disposition_json ?? null,
-    input.blocked_by ?? null,
+       first_seen_at, updated_at, disposition_json, blocked_by,
+       envelope_repository, envelope_source_kind, envelope_object_id, envelope_content_id, envelope_observed_version,
+       envelope_content_hash, envelope_authoritative_at, envelope_policy_revision, envelope_actor_present,
+       envelope_actor_presence, envelope_actor_raw_login, envelope_actor_normalized_login, envelope_decision,
+       envelope_reason, envelope_delivery_class, quarantine_json)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(repo_id, number) DO UPDATE SET
+        title = excluded.title,
+        body_json = excluded.body_json,
+        snapshot_hash = excluded.snapshot_hash,
+        updated_at = excluded.updated_at,
+        envelope_repository = COALESCE(excluded.envelope_repository, issues.envelope_repository),
+        envelope_source_kind = COALESCE(excluded.envelope_source_kind, issues.envelope_source_kind),
+        envelope_object_id = COALESCE(excluded.envelope_object_id, issues.envelope_object_id),
+        envelope_content_id = COALESCE(excluded.envelope_content_id, issues.envelope_content_id),
+        envelope_observed_version = COALESCE(excluded.envelope_observed_version, issues.envelope_observed_version),
+        envelope_content_hash = COALESCE(excluded.envelope_content_hash, issues.envelope_content_hash),
+        envelope_authoritative_at = COALESCE(excluded.envelope_authoritative_at, issues.envelope_authoritative_at),
+        envelope_policy_revision = COALESCE(excluded.envelope_policy_revision, issues.envelope_policy_revision),
+        envelope_actor_present = COALESCE(excluded.envelope_actor_present, issues.envelope_actor_present),
+        envelope_actor_presence = COALESCE(excluded.envelope_actor_presence, issues.envelope_actor_presence),
+        envelope_actor_raw_login = COALESCE(excluded.envelope_actor_raw_login, issues.envelope_actor_raw_login),
+        envelope_actor_normalized_login = COALESCE(excluded.envelope_actor_normalized_login, issues.envelope_actor_normalized_login),
+        envelope_decision = COALESCE(excluded.envelope_decision, issues.envelope_decision),
+        envelope_reason = COALESCE(excluded.envelope_reason, issues.envelope_reason),
+        envelope_delivery_class = COALESCE(excluded.envelope_delivery_class, issues.envelope_delivery_class),
+        quarantine_json = COALESCE(excluded.quarantine_json, issues.quarantine_json)`,
+    input.id, input.repo_id, input.number, input.title, input.body_json ?? null,
+    input.state, input.snapshot_hash ?? null, input.first_seen_at ?? nowIso(), input.updated_at,
+    input.disposition_json ?? null, input.blocked_by ?? null, ...envelopeValues(input.envelope), input.quarantine_json ?? null,
   );
   const row = getIssueByRepoNumber(db, input.repo_id, input.number);
   if (!row) throw new TissueDbError(`issue ${input.repo_id}#${input.number} not found after upsert`);
@@ -489,7 +649,6 @@ export interface WorkItemRow {
   lease_until: string | null;
   attempts: number;
   priority: number;
-  blocked_by: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -505,15 +664,14 @@ export interface WorkItemInput {
   lease_until?: string | null;
   attempts?: number;
   priority?: number;
-  blocked_by?: string | null;
 }
 
 export function insertWorkItem(db: TissueDb, input: WorkItemInput): WorkItemRow {
   const at = nowIso();
   db.sql.run(
     `INSERT INTO work_items(id, repo_id, state, title, base_branch, head_branch,
-       lease_token, lease_until, attempts, priority, blocked_by, created_at, updated_at)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       lease_token, lease_until, attempts, priority, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
     input.id,
     input.repo_id,
     input.state,
@@ -524,7 +682,6 @@ export function insertWorkItem(db: TissueDb, input: WorkItemInput): WorkItemRow 
     input.lease_until ?? null,
     input.attempts ?? 0,
     input.priority ?? 0,
-    input.blocked_by ?? null,
     at,
     at,
   );
@@ -539,21 +696,113 @@ export function listWorkItemsByRepo(db: TissueDb, repoId: string): WorkItemRow[]
   return db.sql.all<WorkItemRow>("SELECT * FROM work_items WHERE repo_id = ? ORDER BY created_at", repoId);
 }
 
+export interface WorkItemStatePatch {
+  leaseToken?: string | null;
+  leaseUntil?: string | null;
+}
+
 export function setWorkItemState(
   db: TissueDb,
   id: string,
   state: string,
-  patch: { leaseToken?: string | null; leaseUntil?: string | null; blockedBy?: string | null } = {},
+  patch: WorkItemStatePatch = {},
 ): void {
-  db.sql.run(
-    `UPDATE work_items SET state = ?, lease_token = ?, lease_until = ?, blocked_by = ?,
-       updated_at = ? WHERE id = ?`,
-    state,
-    patch.leaseToken === undefined ? null : patch.leaseToken,
-    patch.leaseUntil === undefined ? null : patch.leaseUntil,
-    patch.blockedBy === undefined ? null : patch.blockedBy,
-    nowIso(),
+  const fields = ["state = ?"];
+  const values: SqlValue[] = [state];
+  if (patch.leaseToken !== undefined) {
+    fields.push("lease_token = ?");
+    values.push(patch.leaseToken);
+  }
+  if (patch.leaseUntil !== undefined) {
+    fields.push("lease_until = ?");
+    values.push(patch.leaseUntil);
+  }
+  fields.push("updated_at = ?");
+  values.push(nowIso(), id);
+  db.sql.run(`UPDATE work_items SET ${fields.join(", ")} WHERE id = ?`, ...values);
+}
+
+export type WorkItemDependencyTarget =
+  | { kind: "issue"; id: string }
+  | { kind: "work_item"; id: string };
+
+export interface WorkItemDependencyRow {
+  id: string;
+  dependent_work_item_id: string;
+  dependency_issue_id: string | null;
+  dependency_work_item_id: string | null;
+  state: "ACTIVE" | "SETTLED";
+  created_at: string;
+  settled_at: string | null;
+}
+
+function dependencyWhere(target: WorkItemDependencyTarget): { column: string; id: string } {
+  return target.kind === "issue"
+    ? { column: "dependency_issue_id", id: target.id }
+    : { column: "dependency_work_item_id", id: target.id };
+}
+
+function dependencyRow(db: TissueDb, id: string): WorkItemDependencyRow {
+  const row = db.sql.get<WorkItemDependencyRow>("SELECT * FROM work_item_dependencies WHERE id = ?", id);
+  if (!row) throw new TissueDbError(`dependency '${id}' was not found`);
+  return row;
+}
+
+export function addWorkItemDependency(
+  tx: TissueDb,
+  dependentWorkItemId: string,
+  dependency: WorkItemDependencyTarget,
+): WorkItemDependencyRow {
+  if (dependency.kind === "work_item" && dependency.id === dependentWorkItemId) {
+    throw new TissueDbError("a WorkItem cannot depend on itself");
+  }
+  if (!getWorkItem(tx, dependentWorkItemId)) throw new TissueDbError(`dependent WorkItem '${dependentWorkItemId}' was not found`);
+  const target = dependency.kind === "issue" ? getIssueById(tx, dependency.id) : getWorkItem(tx, dependency.id);
+  if (!target) throw new TissueDbError(`dependency '${dependency.id}' was not found`);
+
+  if (dependency.kind === "work_item") {
+    const seen = new Set<string>();
+    const visit = (id: string): void => {
+      if (id === dependentWorkItemId) throw new TissueDbError("WorkItem dependency cycle detected");
+      if (seen.has(id)) return;
+      seen.add(id);
+      const rows = tx.sql.all<{ dependency_work_item_id: string | null }>(
+        "SELECT dependency_work_item_id FROM work_item_dependencies WHERE dependent_work_item_id = ? AND state = 'ACTIVE' AND dependency_work_item_id IS NOT NULL",
+        id,
+      );
+      for (const row of rows) if (row.dependency_work_item_id) visit(row.dependency_work_item_id);
+    };
+    visit(dependency.id);
+  }
+
+  const id = `dep-${randomUUID()}`;
+  const column = dependency.kind === "issue" ? "dependency_issue_id" : "dependency_work_item_id";
+  tx.sql.run(
+    `INSERT INTO work_item_dependencies(id, dependent_work_item_id, ${column}, created_at) VALUES(?, ?, ?, ?)`,
     id,
+    dependentWorkItemId,
+    dependency.id,
+    nowIso(),
+  );
+  return dependencyRow(tx, id);
+}
+
+export function listDependentsForCompletedDependency(
+  tx: TissueDb,
+  dependency: WorkItemDependencyTarget,
+): WorkItemDependencyRow[] {
+  const { column, id } = dependencyWhere(dependency);
+  return tx.sql.all<WorkItemDependencyRow>(
+    `SELECT * FROM work_item_dependencies WHERE ${column} = ? AND state = 'ACTIVE' ORDER BY created_at ASC, id ASC`,
+    id,
+  );
+}
+
+export function settleWorkItemDependency(tx: TissueDb, relationId: string): void {
+  tx.sql.run(
+    "UPDATE work_item_dependencies SET state = 'SETTLED', settled_at = ? WHERE id = ? AND state = 'ACTIVE'",
+    nowIso(),
+    relationId,
   );
 }
 
@@ -751,25 +1000,24 @@ export interface PullRequestInput {
   head_sha?: string | null;
   state: string;
   origin?: string;
+  envelope?: ProvenanceEnvelope | null;
+  quarantine_json?: string | null;
 }
 
-/** Insert a PR row. ux_pr_one_active blocks a second ACTIVE PR for a work item. */
 export function insertPullRequest(db: TissueDb, input: PullRequestInput): void {
   const at = nowIso();
+  assertBodyFreeQuarantine(input.quarantine_json);
   db.sql.run(
     `INSERT INTO pull_requests(id, work_item_id, repo_id, number, head_ref, head_sha,
-       state, origin, created_at, updated_at)
-     VALUES(?,?,?,?,?,?,?,?,?,?)`,
-    input.id,
-    input.work_item_id,
-    input.repo_id,
-    input.number,
-    input.head_ref,
-    input.head_sha ?? null,
-    input.state,
-    input.origin ?? "expected",
-    at,
-    at,
+       state, origin, created_at, updated_at,
+       envelope_repository, envelope_source_kind, envelope_object_id, envelope_content_id, envelope_observed_version,
+       envelope_content_hash, envelope_authoritative_at, envelope_policy_revision, envelope_actor_present,
+       envelope_actor_presence, envelope_actor_raw_login, envelope_actor_normalized_login, envelope_decision,
+       envelope_reason, envelope_delivery_class, quarantine_json)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    input.id, input.work_item_id, input.repo_id, input.number, input.head_ref,
+    input.head_sha ?? null, input.state, input.origin ?? "expected", at, at,
+     ...envelopeValues(input.envelope).slice(0, 15), input.quarantine_json ?? null,
   );
 }
 
@@ -792,6 +1040,22 @@ export interface PullRequestRow {
   state: string;
   origin: string;
   snapshot_hash: string | null;
+  envelope_repository: string | null;
+  envelope_source_kind: string | null;
+  envelope_object_id: string | null;
+  envelope_content_id: string | null;
+  envelope_observed_version: string | null;
+  envelope_content_hash: string | null;
+  envelope_authoritative_at: string | null;
+  envelope_policy_revision: string | null;
+  envelope_actor_present: number | null;
+  envelope_actor_presence: string | null;
+  envelope_actor_raw_login: string | null;
+  envelope_actor_normalized_login: string | null;
+  envelope_decision: string | null;
+  envelope_reason: string | null;
+  envelope_delivery_class: string | null;
+  quarantine_json: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -824,33 +1088,43 @@ export function markPullRequestState(
   );
 }
 
-/**
- * Upsert a PR observed by polling. On conflict only the snapshot columns
- * (head_sha/state/snapshot_hash/updated_at) are refreshed; work_item_id and
- * origin are never rewritten by polling (adoption owns origin).
- */
 export function upsertPullRequestFromSnapshot(db: TissueDb, input: PullRequestInput & { snapshotHash?: string | null }): PullRequestRow {
   const at = nowIso();
+  assertBodyFreeQuarantine(input.quarantine_json);
+  const existing = getPullRequestByRepoNumber(db, input.repo_id, input.number);
+  if (existing && input.envelope) assertEnvelopeCompatible(envelopeForRow(existing), input.envelope);
   db.sql.run(
     `INSERT INTO pull_requests(id, work_item_id, repo_id, number, head_ref, head_sha,
-       state, origin, snapshot_hash, created_at, updated_at)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?)
+       state, origin, snapshot_hash, created_at, updated_at,
+       envelope_repository, envelope_source_kind, envelope_object_id, envelope_content_id, envelope_observed_version,
+       envelope_content_hash, envelope_authoritative_at, envelope_policy_revision, envelope_actor_present,
+       envelope_actor_presence, envelope_actor_raw_login, envelope_actor_normalized_login, envelope_decision,
+       envelope_reason, envelope_delivery_class, quarantine_json)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(repo_id, number) DO UPDATE SET
        head_sha = excluded.head_sha,
        state = excluded.state,
        snapshot_hash = excluded.snapshot_hash,
-       updated_at = excluded.updated_at`,
-    input.id,
-    input.work_item_id,
-    input.repo_id,
-    input.number,
-    input.head_ref,
-    input.head_sha ?? null,
-    input.state,
-    input.origin ?? "expected",
-    input.snapshotHash ?? null,
-    at,
-    at,
+       updated_at = excluded.updated_at,
+        envelope_repository = COALESCE(excluded.envelope_repository, pull_requests.envelope_repository),
+        envelope_source_kind = COALESCE(excluded.envelope_source_kind, pull_requests.envelope_source_kind),
+       envelope_object_id = COALESCE(excluded.envelope_object_id, pull_requests.envelope_object_id),
+       envelope_content_id = COALESCE(excluded.envelope_content_id, pull_requests.envelope_content_id),
+       envelope_observed_version = COALESCE(excluded.envelope_observed_version, pull_requests.envelope_observed_version),
+       envelope_content_hash = COALESCE(excluded.envelope_content_hash, pull_requests.envelope_content_hash),
+       envelope_authoritative_at = COALESCE(excluded.envelope_authoritative_at, pull_requests.envelope_authoritative_at),
+       envelope_policy_revision = COALESCE(excluded.envelope_policy_revision, pull_requests.envelope_policy_revision),
+       envelope_actor_present = COALESCE(excluded.envelope_actor_present, pull_requests.envelope_actor_present),
+       envelope_actor_presence = COALESCE(excluded.envelope_actor_presence, pull_requests.envelope_actor_presence),
+       envelope_actor_raw_login = COALESCE(excluded.envelope_actor_raw_login, pull_requests.envelope_actor_raw_login),
+       envelope_actor_normalized_login = COALESCE(excluded.envelope_actor_normalized_login, pull_requests.envelope_actor_normalized_login),
+       envelope_decision = COALESCE(excluded.envelope_decision, pull_requests.envelope_decision),
+       envelope_reason = COALESCE(excluded.envelope_reason, pull_requests.envelope_reason),
+       envelope_delivery_class = COALESCE(excluded.envelope_delivery_class, pull_requests.envelope_delivery_class),
+       quarantine_json = COALESCE(excluded.quarantine_json, pull_requests.quarantine_json)`,
+    input.id, input.work_item_id, input.repo_id, input.number, input.head_ref,
+    input.head_sha ?? null, input.state, input.origin ?? "expected", input.snapshotHash ?? null, at, at,
+    ...envelopeValues(input.envelope).slice(0, 15), input.quarantine_json ?? null,
   );
   const row = getPullRequestByRepoNumber(db, input.repo_id, input.number);
   if (!row) throw new TissueDbError(`PR ${input.repo_id}#${input.number} not found after upsert`);
@@ -874,6 +1148,22 @@ export interface InboxRow {
   terminal_reason: string | null;
   retention_deadline: string | null;
   housekept_at: string | null;
+  envelope_repository: string | null;
+  envelope_source_kind: string | null;
+  envelope_object_id: string | null;
+  envelope_content_id: string | null;
+  envelope_observed_version: string | null;
+  envelope_content_hash: string | null;
+  envelope_authoritative_at: string | null;
+  envelope_policy_revision: string | null;
+  envelope_actor_present: number | null;
+  envelope_actor_presence: string | null;
+  envelope_actor_raw_login: string | null;
+  envelope_actor_normalized_login: string | null;
+  envelope_decision: string | null;
+  envelope_reason: string | null;
+  envelope_delivery_class: string | null;
+  quarantine_json: string | null;
 }
 
 export interface InboxInput {
@@ -886,25 +1176,24 @@ export interface InboxInput {
   state?: string;
   /** Optional explicit created_at (snapshot time); defaults to now. */
   created_at?: string;
+  envelope?: ProvenanceEnvelope | null;
+  quarantine_json?: string | null;
 }
 
-/**
- * Append an inbox event. `event_key` is UNIQUE, so a duplicate polling event
- * throws (dedup is a real constraint, surfaced not swallowed). Returns the
- * globally-monotonic inbox.id (AUTOINCREMENT).
- */
 export function insertInboxEvent(db: TissueDb, input: InboxInput): number {
   assertValidJsonString(input.payload_json, "payload_json");
+  assertBodyFreeQuarantine(input.quarantine_json);
+  const existing = db.sql.get<InboxRow>("SELECT * FROM inbox WHERE event_key = ?", input.event_key);
+  if (existing && input.envelope) assertEnvelopeCompatible(envelopeForRow(existing), input.envelope);
   const res = db.sql.run(
-    `INSERT INTO inbox(work_item_id, issue_id, event_key, kind, payload_json, state, created_at)
-     VALUES(?,?,?,?,?,?,?)`,
-    input.work_item_id ?? null,
-    input.issue_id,
-    input.event_key,
-    input.kind,
-    input.payload_json,
-    input.state ?? "PENDING",
-    nowIso(),
+    `INSERT INTO inbox(work_item_id, issue_id, event_key, kind, payload_json, state, created_at,
+       envelope_repository, envelope_source_kind, envelope_object_id, envelope_content_id, envelope_observed_version,
+       envelope_content_hash, envelope_authoritative_at, envelope_policy_revision, envelope_actor_present,
+       envelope_actor_presence, envelope_actor_raw_login, envelope_actor_normalized_login, envelope_decision,
+       envelope_reason, envelope_delivery_class, quarantine_json)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    input.work_item_id ?? null, input.issue_id, input.event_key, input.kind, input.payload_json,
+    input.state ?? "PENDING", input.created_at ?? nowIso(), ...envelopeValues(input.envelope).slice(0, 15), input.quarantine_json ?? null,
   );
   return res.lastInsertRowid;
 }
@@ -1029,19 +1318,29 @@ export function insertInboxEventIfAbsent(
   input: InboxInput,
 ): { id: number; inserted: boolean } {
   if (input.payload_json) assertValidJsonString(input.payload_json, "payload_json");
+  assertBodyFreeQuarantine(input.quarantine_json);
+  const existing = db.sql.get<InboxRow>("SELECT * FROM inbox WHERE event_key = ?", input.event_key);
+  if (existing && input.envelope) assertEnvelopeCompatible(envelopeForRow(existing), input.envelope);
   const res = db.sql.run(
-    `INSERT OR IGNORE INTO inbox(work_item_id, issue_id, event_key, kind, payload_json, state, created_at)
-     VALUES(?,?,?,?,?,'PENDING',?)`,
+    `INSERT OR IGNORE INTO inbox(work_item_id, issue_id, event_key, kind, payload_json, state, created_at,
+       envelope_repository, envelope_source_kind, envelope_object_id, envelope_content_id, envelope_observed_version,
+       envelope_content_hash, envelope_authoritative_at, envelope_policy_revision, envelope_actor_present,
+       envelope_actor_presence, envelope_actor_raw_login, envelope_actor_normalized_login, envelope_decision,
+       envelope_reason, envelope_delivery_class, quarantine_json)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     input.work_item_id ?? null,
     input.issue_id,
     input.event_key,
     input.kind,
     input.payload_json ?? "{}",
+    "PENDING",
     input.created_at ?? nowIso(),
+    ...envelopeValues(input.envelope).slice(0, 15),
+    input.quarantine_json ?? null,
   );
   if (res.changes > 0) return { id: Number(res.lastInsertRowid), inserted: true };
-  const existing = db.sql.get<{ id: number }>("SELECT id FROM inbox WHERE event_key = ?", input.event_key);
-  return { id: existing?.id ?? -1, inserted: false };
+  const duplicate = db.sql.get<{ id: number }>("SELECT id FROM inbox WHERE event_key = ?", input.event_key);
+  return { id: duplicate?.id ?? -1, inserted: false };
 }
 
 // ---- Side effects (transactional outbox) -----------------------------------------
@@ -1526,24 +1825,24 @@ export function listActivePullRequests(db: TissueDb): PullRequestRow[] {
   );
 }
 
-/** INSERT OR IGNORE a PR row; false when number/id already exists (idempotent adopt). */
 export function insertPullRequestIfAbsent(db: TissueDb, input: PullRequestInput): boolean {
   const at = nowIso();
+  assertBodyFreeQuarantine(input.quarantine_json);
+  const existing = getPullRequestByRepoNumber(db, input.repo_id, input.number);
+  if (existing && input.envelope) assertEnvelopeCompatible(envelopeForRow(existing), input.envelope);
   const res = db.sql.run(
-    `INSERT OR IGNORE INTO pull_requests(id, work_item_id, repo_id, number, head_ref, head_sha, state, origin, created_at, updated_at)
-     VALUES(?,?,?,?,?,?,?,?,?,?)`,
-    input.id,
-    input.work_item_id,
-    input.repo_id,
-    input.number,
-    input.head_ref,
-    input.head_sha ?? null,
-    input.state,
-    input.origin ?? "expected",
-    at,
-    at,
-  );
-  return res.changes > 0;
+    `INSERT OR IGNORE INTO pull_requests(id, work_item_id, repo_id, number, head_ref, head_sha,
+       state, origin, created_at, updated_at,
+       envelope_repository, envelope_source_kind, envelope_object_id, envelope_content_id, envelope_observed_version,
+       envelope_content_hash, envelope_authoritative_at, envelope_policy_revision, envelope_actor_present,
+       envelope_actor_presence, envelope_actor_raw_login, envelope_actor_normalized_login, envelope_decision,
+       envelope_reason, envelope_delivery_class, quarantine_json)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    input.id, input.work_item_id, input.repo_id, input.number, input.head_ref,
+    input.head_sha ?? null, input.state, input.origin ?? "expected", at, at,
+     ...envelopeValues(input.envelope).slice(0, 15), input.quarantine_json ?? null,
+   );
+   return res.changes > 0;
 }
 
 export function listSessions(db: TissueDb): SessionRow[] {

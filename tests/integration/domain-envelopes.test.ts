@@ -19,6 +19,7 @@ import {
   updateIssueState,
   setWorkItemState,
   listTransitions,
+  addWorkItemDependency,
 } from "../../src/db/repositories.ts";
 import {
   applyEnvelope,
@@ -126,33 +127,27 @@ test("an envelope whose disposition is already reached is a no-op even under a f
   }
 });
 
-test("a duplicate envelope id is a no-op even when the current state would otherwise allow the edge", () => {
+test("a duplicate envelope id is a no-op while dependency remains deferred", () => {
   const { db, cleanup } = createTestDb();
   try {
     const repo = seedRepository(db);
+    insertWorkItem(db, { id: "wi-dep", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
     const wi = insertWorkItem(db, { id: "wi-block", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
     const env: AgentEnvelope = {
       kind: "resolution",
       envelope_id: "env-block-1",
       work_item_id: wi.id,
-      outcome: "blocked",
-      blocked_by: "wi-dep",
+      outcome: "deferred",
+      dependency: { kind: "work_item", id: "wi-dep" },
     };
-  assert.equal(runWrite(db, (tx) => applyEnvelope(tx, env)).status, "applied");
-  assert.equal(getWorkItem(db, wi.id)?.state, "BLOCKED");
+    assert.equal(runWrite(db, (tx) => applyEnvelope(tx, env)).status, "applied");
+    assert.equal(getWorkItem(db, wi.id)?.state, "DEFERRED");
 
-  // Dependency completes: atomically re-ready (BLOCKED -> READY).
-  runWrite(db, (tx) => {
-    setWorkItemState(tx, wi.id, "READY");
-    recordTransition(tx, { type: "work_item", id: wi.id }, "BLOCKED", "READY", "unblock", null, "controller.unblock");
-  });
-  assert.equal(getWorkItem(db, wi.id)?.state, "READY");
-
-    // Re-applying the SAME envelope id (envelope_id dedup, not current-state)
-    // is a no-op even though READY -> BLOCKED is a legal edge.
+    // DEFERRED remains dependency-waiting until Plan E's verified completion path.
+    // Re-applying the SAME envelope id is still a durable no-op.
     const again = runWrite(db, (tx) => applyEnvelope(tx, env));
     assert.equal(again.status, "noop_duplicate");
-    assert.equal(getWorkItem(db, wi.id)?.state, "READY", "state unchanged");
+    assert.equal(getWorkItem(db, wi.id)?.state, "DEFERRED", "state unchanged");
     const noops = listTransitions(db, "work_item", wi.id).filter((r) => r.event === "noop_duplicate_envelope");
     assert.equal(noops.length, 1);
   } finally {
@@ -273,7 +268,7 @@ test("resolution envelope completed applies RUNNING -> COMPLETED with one audit 
   }
 });
 
-test("resolution needs_changes resumes a WAITING item; resolution completed on COMPLETED is a no-op", () => {
+test("resolution needs_changes resumes a WAITING item; completion on COMPLETED is a no-op", () => {
   const { db, cleanup } = createTestDb();
   try {
     const repo = seedRepository(db);
@@ -302,7 +297,147 @@ test("resolution needs_changes resumes a WAITING item; resolution completed on C
   }
 });
 
-test("pause/block/unblock work-item flow is durable and audited", () => {
+test("resolution outcomes distinguish human decision from one durable dependency", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const issue = insertIssue(db, { id: "issue-dependency", repo_id: repo.id, number: 19, title: "dependency", state: "TRIAGE_PENDING", updated_at: "2026-09-10T00:00:00.000Z" });
+    const human = insertWorkItem(db, { id: "wi-human", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    const waiting = runWrite(db, (tx) => applyEnvelope(tx, {
+      kind: "resolution", envelope_id: "env-human", work_item_id: human.id, outcome: "awaiting_decision",
+    }));
+    assert.equal(waiting.status, "applied");
+    assert.equal(getWorkItem(db, human.id)?.state, "AWAITING_DECISION");
+
+    const deferred = insertWorkItem(db, { id: "wi-deferred", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    const result = runWrite(db, (tx) => applyEnvelope(tx, {
+      kind: "resolution", envelope_id: "env-defer", work_item_id: deferred.id, outcome: "deferred",
+      dependency: { kind: "issue", id: issue.id },
+    }));
+    assert.equal(result.status, "applied");
+    assert.equal(getWorkItem(db, deferred.id)?.state, "DEFERRED");
+    const relation = db.sql.get<{ dependency_issue_id: string | null; dependency_work_item_id: string | null }>(
+      "SELECT dependency_issue_id, dependency_work_item_id FROM work_item_dependencies WHERE dependent_work_item_id = ?", deferred.id,
+    );
+    assert.equal(relation?.dependency_issue_id, issue.id);
+    assert.equal(relation?.dependency_work_item_id, null);
+
+    assert.throws(() => runWrite(db, (tx) => applyEnvelope(tx, {
+      kind: "resolution", envelope_id: "env-missing", work_item_id: human.id, outcome: "deferred",
+    })), EnvelopeValidationError);
+    assert.throws(() => runWrite(db, (tx) => applyEnvelope(tx, {
+      kind: "resolution", envelope_id: "env-extra", work_item_id: human.id, outcome: "awaiting_decision",
+      dependency: { kind: "issue", id: issue.id },
+    })), EnvelopeValidationError);
+    assert.throws(() => runWrite(db, (tx) => applyEnvelope(tx, {
+      kind: "resolution", envelope_id: "env-blocked", work_item_id: human.id, outcome: "blocked" as never,
+    })), EnvelopeValidationError);
+  } finally {
+    cleanup();
+  }
+});
+
+test("deferred envelope rejects missing dependency targets without partial effects", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const missingIssueTarget = insertWorkItem(db, {
+      id: "wi-missing-issue",
+      repo_id: repo.id,
+      state: "RUNNING",
+      base_branch: "main",
+    });
+    const missingWorkItemTarget = insertWorkItem(db, {
+      id: "wi-missing-work-item",
+      repo_id: repo.id,
+      state: "RUNNING",
+      base_branch: "main",
+    });
+
+    assert.throws(
+      () => runWrite(db, (tx) => applyEnvelope(tx, {
+        kind: "resolution",
+        envelope_id: "env-missing-issue",
+        work_item_id: missingIssueTarget.id,
+        outcome: "deferred",
+        dependency: { kind: "issue", id: "issue-does-not-exist" },
+      })),
+      /dependency 'issue-does-not-exist' was not found/,
+    );
+    assert.throws(
+      () => runWrite(db, (tx) => applyEnvelope(tx, {
+        kind: "resolution",
+        envelope_id: "env-missing-work-item",
+        work_item_id: missingWorkItemTarget.id,
+        outcome: "deferred",
+        dependency: { kind: "work_item", id: "wi-does-not-exist" },
+      })),
+      /dependency 'wi-does-not-exist' was not found/,
+    );
+
+    assert.equal(getWorkItem(db, missingIssueTarget.id)?.state, "RUNNING");
+    assert.equal(getWorkItem(db, missingWorkItemTarget.id)?.state, "RUNNING");
+    assert.equal(
+      db.sql.get<{ c: number }>(
+        "SELECT COUNT(*) AS c FROM work_item_dependencies WHERE dependent_work_item_id IN (?, ?)",
+        missingIssueTarget.id,
+        missingWorkItemTarget.id,
+      )?.c,
+      0,
+      "rejected dependencies do not leave dependency rows",
+    );
+    assert.equal(listTransitions(db, "work_item", missingIssueTarget.id).length, 0);
+    assert.equal(listTransitions(db, "work_item", missingWorkItemTarget.id).length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("deferred envelope rejects a work-item dependency cycle without partial effects", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const first = insertWorkItem(db, { id: "wi-cycle-first", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    const second = insertWorkItem(db, { id: "wi-cycle-second", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+
+    runWrite(db, (tx) => addWorkItemDependency(tx, first.id, { kind: "work_item", id: second.id }));
+
+    assert.throws(
+      () => runWrite(db, (tx) => applyEnvelope(tx, {
+        kind: "resolution",
+        envelope_id: "env-cycle",
+        work_item_id: second.id,
+        outcome: "deferred",
+        dependency: { kind: "work_item", id: first.id },
+      })),
+      /WorkItem dependency cycle detected/,
+    );
+
+    assert.equal(getWorkItem(db, second.id)?.state, "RUNNING", "cycle rejection leaves state unchanged");
+    assert.equal(
+      db.sql.get<{ c: number }>(
+        "SELECT COUNT(*) AS c FROM work_item_dependencies WHERE dependent_work_item_id = ?",
+        second.id,
+      )?.c,
+      0,
+      "cycle rejection does not add a dependency row",
+    );
+    assert.equal(listTransitions(db, "work_item", second.id).length, 0, "cycle rejection does not append an audit transition");
+    assert.equal(
+      db.sql.get<{ c: number }>(
+        "SELECT COUNT(*) AS c FROM work_item_dependencies WHERE dependent_work_item_id = ? AND dependency_work_item_id = ?",
+        first.id,
+        second.id,
+      )?.c,
+      1,
+      "the pre-existing dependency remains intact",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("pause and resume work-item flow is durable and audited", () => {
   const { db, cleanup } = createTestDb();
   try {
     const repo = seedRepository(db);
@@ -320,21 +455,9 @@ test("pause/block/unblock work-item flow is durable and audited", () => {
     });
     assert.equal(getWorkItem(db, wi.id)?.state, "QUEUED");
 
-    // Block the queued item on a dependency, then unblock on completion.
-    runWrite(db, (tx) => {
-      setWorkItemState(tx, wi.id, "BLOCKED", { blockedBy: "wi-dep" });
-      recordTransition(tx, { type: "work_item", id: wi.id }, "QUEUED", "BLOCKED", "block", { blocked_by: "wi-dep" }, "controller.block");
-    });
-    assert.equal(getWorkItem(db, wi.id)?.state, "BLOCKED");
-    runWrite(db, (tx) => {
-      setWorkItemState(tx, wi.id, "READY");
-      recordTransition(tx, { type: "work_item", id: wi.id }, "BLOCKED", "READY", "unblock", null, "controller.unblock");
-    });
-    assert.equal(getWorkItem(db, wi.id)?.state, "READY");
-
     const rows = listTransitions(db, "work_item", wi.id);
     const events = rows.map((r) => r.event);
-    assert.deepEqual(events, ["pause_work", "resume_work", "block", "unblock"]);
+    assert.deepEqual(events, ["pause_work", "resume_work"]);
   } finally {
     cleanup();
   }

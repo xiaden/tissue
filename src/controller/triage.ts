@@ -26,6 +26,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { ProviderModel } from "../config/types.ts";
+import { decideCurrentGithubProse } from "./trust.ts";
 import type { TissueDb } from "../db/open.ts";
 import { runWrite } from "../db/open.ts";
 import {
@@ -102,7 +103,13 @@ function pendingCount(db: TissueDb, repoId: string): number {
 }
 
 /** A bounded per-issue triage digest (identifiers + truncated previews only). */
-export function buildTriageDigest(db: TissueDb, repo: RepositoryRow, issue: IssueRow): IssueTriageDigest {
+export function buildTriageDigest(
+  db: TissueDb,
+  repo: RepositoryRow,
+  issue: IssueRow,
+  configPath: string = process.env.TISSUE_CONFIG ?? "./tissue.yml",
+): IssueTriageDigest {
+  const proseTrusted = decideCurrentGithubProse(issue.envelope_actor_raw_login, configPath) === "TRUSTED";
   let body = "";
   if (issue.body_json) {
     try {
@@ -117,7 +124,7 @@ export function buildTriageDigest(db: TissueDb, repo: RepositoryRow, issue: Issu
     repo.id,
   )?.c ?? 0;
   const running = db.sql.get<{ c: number }>(
-    "SELECT COUNT(*) AS c FROM work_items WHERE repo_id = ? AND state = 'RUNNING'",
+    "SELECT COUNT(*) AS c FROM work_items WHERE repo_id = ? AND state IN ('RUNNING','WAITING','AWAITING_DECISION')",
     repo.id,
   )?.c ?? 0;
   const open = db.sql.get<{ c: number }>(
@@ -130,8 +137,8 @@ export function buildTriageDigest(db: TissueDb, repo: RepositoryRow, issue: Issu
     repoName: repo.name,
     repoId: repo.id,
     issueNumber: issue.number,
-    titlePreview: truncate(issue.title, TITLE_PREVIEW_MAX),
-    bodyPreview: truncate(body, BODY_PREVIEW_MAX),
+    titlePreview: proseTrusted ? truncate(issue.title, TITLE_PREVIEW_MAX) : "",
+    bodyPreview: proseTrusted ? truncate(body, BODY_PREVIEW_MAX) : "",
     createdAt: issue.first_seen_at,
     pendingCount: pendingCount(db, repo.id),
     repoCounts: { open, queued, running },
@@ -275,6 +282,8 @@ export interface TriageRunOptions {
   agent?: string;
   /** Configured triage provider/model identity; a concrete model is never auto-selected. */
   model?: ProviderModel;
+  /** Current configuration path; loaded afresh at digest serialization. */
+  configPath?: string;
 }
 
 /**
@@ -369,7 +378,7 @@ export function runTriageRepo(
         }
       }
       const freshIssue = getIssueById(db, issue.id) ?? issue;
-      const digest = buildTriageDigest(db, repo, freshIssue);
+      const digest = buildTriageDigest(db, repo, freshIssue, opts.configPath);
       const suggestion = await driver.promptTriage(sessionId, digest);
       return applySuggestion(db, repo, issue, suggestion);
     } catch (err) {

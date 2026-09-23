@@ -74,6 +74,13 @@ test("resident production assembly never owns an OpenCode serve", () => {
   assert.doesNotMatch(daemon, /spawn\(|child_process|"opencode"/i);
 });
 
+test("history inspection remains observation-only and does not authorize or rewrite prose", () => {
+  const driver = new OpenCodeDriver({ http: {} as OpenCodeHttp });
+  assert.equal(typeof driver.readHistory, "function");
+  assert.equal(typeof driver.observeCompletion, "function");
+  assert.equal(typeof driver.readResolutionResult, "function");
+});
+
 test("agent sessions never receive lifecycle-mutating Tissue tools (driver omits `tools`)", () => {
   const driver = new OpenCodeDriver({ http: {} as OpenCodeHttp });
   const body = (

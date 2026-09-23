@@ -57,6 +57,7 @@ import type {
 import type { ResolutionDriver, SessionStatus } from "./session-driver.ts";
 import { applyResolutionEnvelope, type ResolutionEnvelope } from "../domain/envelopes.ts";
 import { headSha } from "../integrations/git-client.ts";
+import { decideCurrentGithubProse } from "./trust.ts";
 
 /** Bounded noReply observation window (T8: W_turn = 120s). */
 export const W_TURN_MS = 120_000;
@@ -97,6 +98,8 @@ export interface DeliveryResult {
 }
 
 export interface RelayOptions {
+  /** Current configuration file used for retrieval-time prose decisions. */
+  configPath?: string;
   now?: Date;
   logger?: JsonLogger;
   /** Nonce factory (tests inject a deterministic value). */
@@ -123,9 +126,40 @@ function makeNonce(): string {
   return `dlv_${randomUUID().replace(/-/g, "")}`;
 }
 
-/** Bounded bundle digest: controller-owned ids/kinds/JSON only, never gh text. */
-export function buildBundleText(rows: readonly InboxRow[], nonce: string): string {
-  const lines = rows.map((r) => `- event ${r.id} [${r.kind}] ${r.payload_json}`);
+const DEFAULT_CONFIG_PATH = process.env.TISSUE_CONFIG ?? "./tissue.yml";
+
+type BundleProjection = Record<string, unknown>;
+
+/**
+ * Project one persisted inbox row without ever forwarding its arbitrary JSON.
+ * Objective fields are allowlisted; comment prose is independently gated by the
+ * current configuration and the author captured with the row.
+ */
+function projectInboxRow(row: InboxRow, configPath: string): BundleProjection {
+  let payload: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(row.payload_json);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>;
+  } catch {
+    // Malformed persisted payloads remain represented by their durable identity only.
+  }
+  const projection: BundleProjection = { id: row.id, kind: row.kind, issue_id: row.issue_id };
+  for (const key of ["target", "number", "comment_id", "pr_number", "review_id", "state", "mergeable", "merge_state_status", "snapshot_hash"] as const) {
+    const value = payload[key];
+    if (typeof value === "string" || typeof value === "number") projection[key] = value;
+  }
+  const rawAuthor = row.envelope_actor_raw_login;
+  if (rawAuthor !== null) projection.author = rawAuthor;
+  if (row.kind === "issue_comment" || row.kind === "pr_comment") {
+    const body = payload.body_preview;
+    if (typeof body === "string" && decideCurrentGithubProse(rawAuthor, configPath) === "TRUSTED") projection.body_preview = body;
+  }
+  return projection;
+}
+
+/** Bounded bundle digest: typed controller-owned projection, never whole payload JSON. */
+export function buildBundleText(rows: readonly InboxRow[], nonce: string, configPath = DEFAULT_CONFIG_PATH): string {
+  const lines = rows.map((row) => `- event ${JSON.stringify(projectInboxRow(row, configPath))}`);
   return [
     `tissue delivery nonce: ${nonce}`,
     "Apply the following durable Tissue inbox events in order. Do not mutate Tissue lifecycle state.",
@@ -170,6 +204,7 @@ export async function relayOldestInbox(
   const wTurnMs = opts.wTurnMs ?? W_TURN_MS;
   const wWedgeMs = opts.wWedgeMs ?? W_WEDGE_MS;
   const logger = opts.logger;
+  const configPath = opts.configPath ?? DEFAULT_CONFIG_PATH;
 
   const workItem = getWorkItem(db, workItemId);
   if (!workItem) return { status: "no_work_item", workItemId, inboxIds: [] };
@@ -178,8 +213,11 @@ export async function relayOldestInbox(
   if (!session) return { status: "no_session", workItemId, inboxIds: [] };
 
   // ---- 1. Resume an existing DELIVERING attempt (durable single-flight) --------
-  const delivering = listDeliveringInboxByWorkItem(db, workItemId);
+    const delivering = listDeliveringInboxByWorkItem(db, workItemId);
   if (delivering.length > 0) {
+    // Reconstruct the typed projection on every resume/recovery pass. This is a
+    // retrieval-time check; prior delivery state is never an authorization source.
+    buildBundleText(delivering, delivering[0]!.delivery_nonce ?? "", configPath);
     const nonce = delivering[0]!.delivery_nonce ?? "";
     const ids = delivering.map((r) => r.id);
     const startedAt =
@@ -209,6 +247,9 @@ export async function relayOldestInbox(
   // ---- 2. Claim the oldest PENDING bundle, but only when observed idle ---------
   const pending = listPendingInboxByWorkItem(db, workItemId);
   if (pending.length === 0) return { status: "no_pending", workItemId, inboxIds: [] };
+  // Freshly project before the claim gate, so selection cannot rely on stale
+  // ingest-time trust or a persisted policy decision.
+  buildBundleText(pending, "preclaim", configPath);
 
   const observation = await observeIdleAcrossSamples(driver, session.id, opts);
   if (observation === "missing") {
@@ -233,7 +274,7 @@ export async function relayOldestInbox(
 
   try {
     await driver.promptAsync(session.id, {
-      text: buildBundleText(pending, nonce),
+      text: buildBundleText(pending, nonce, configPath),
       nonce,
       // The dedicated resolution identity is mandatory: an omitted relay option
       // means tissue-resolve, never the resident OpenCode default agent.

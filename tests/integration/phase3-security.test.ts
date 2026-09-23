@@ -35,8 +35,27 @@ test("hostile GitHub text stays bounded data and control characters are sanitize
   const t = createTestDb();
   try {
     const repo = seedRepository(t.db);
-    const issue = seedIssue(t.db, repo.id, { title: hostile, body_json: JSON.stringify(hostile) });
-    const digest = buildTriageDigest(t.db, repo, issue);
+    const issue = seedIssue(t.db, repo.id, {
+      title: hostile,
+      body_json: JSON.stringify(hostile),
+      envelope: {
+        repository: repo.id,
+        sourceKind: "issue",
+        objectId: String(42),
+        contentId: null,
+        observedVersion: "v1",
+        contentHash: "hash",
+        authoritativeAt: "2026-09-09T00:00:00.000Z",
+        policyRevision: "fixture",
+        actor: { present: true, rawLogin: "TrustedUser", normalizedLogin: "trusteduser", presence: "PRESENT" },
+        decision: "TRUSTED",
+        reason: "fixture",
+        deliveryClass: "TRUSTED_PROSE",
+      },
+    } as never);
+    const configPath = join(mkdtempSync(join(tmpdir(), "tissue-triage-config-")), "tissue.yml");
+    writeFileSync(configPath, `repos:\n  - owner: xiaden\n    name: nomarr\n    localDir: /tmp/nomarr\nsecurity:\n  trustedGithubUsers:\n    - trusteduser\n`);
+    const digest = buildTriageDigest(t.db, repo, issue, configPath);
     assert.ok(digest.titlePreview.length <= 201);
     assert.ok(digest.bodyPreview.length <= 1001);
     assert.doesNotMatch(digest.bodyPreview, /[\u0000-\u001f\u007f]/);
@@ -46,7 +65,7 @@ test("hostile GitHub text stays bounded data and control characters are sanitize
 
 test("typed gh argv uses fixed JSON, controller branch, and no shell syntax", () => {
   const list = argvIssueList({ owner: "xiaden", name: "nomarr", state: "open", limit: 20 });
-  assert.deepEqual(list, ["issue", "list", "-R", "xiaden/nomarr", "--state", "open", "--limit", "20", "--json", "number,title,labels,updatedAt,state,createdAt"]);
+  assert.deepEqual(list, ["issue", "list", "-R", "xiaden/nomarr", "--state", "open", "--limit", "20", "--json", "number,title,author,labels,updatedAt,state,createdAt"]);
   assert.deepEqual(argvProtection({ owner: "xiaden", name: "nomarr", branch: "main" }), ["api", "repos/xiaden/nomarr/branches/main/protection"]);
   assert.deepEqual(argvIssueComment("xiaden", "nomarr", 4).slice(-2), ["--body-file", "-"]);
   assert.deepEqual(argvPrMerge("xiaden", "nomarr", 4, "squash").slice(-1), ["--squash"]);

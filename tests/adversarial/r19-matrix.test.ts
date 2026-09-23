@@ -31,7 +31,7 @@ import { classifySessionCensus, runReconcilePass, type ReconcileBoundary, type R
 import { cleanupWorktree, createWorktree, worktreeBranchFor } from "../../src/controller/worktrees.ts";
 import { runWrite } from "../../src/db/open.ts";
 import { recordTransition } from "../../src/domain/transitions.ts";
-import { applyEnvelope, type AgentEnvelope } from "../../src/domain/envelopes.ts";
+import { applyEnvelope, EnvelopeValidationError, type AgentEnvelope } from "../../src/domain/envelopes.ts";
 import type { TissueConfig } from "../../src/config/types.ts";
 import { CapturingSink, JsonLogger } from "../../src/logging/jsonl.ts";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -162,14 +162,18 @@ test("R19 pause/block/unblock, two-repo flood, and duplicate envelopes are durab
     runWrite(t.db, (tx) => {
       setWorkItemState(tx, wi.id, "PAUSED_WORK");
       recordTransition(tx, { type: "work_item", id: wi.id }, "RUNNING", "PAUSED_WORK", "pause_work", null, "test");
-      setWorkItemState(tx, wi.id, "BLOCKED", { blockedBy: "wi-dep" });
-      recordTransition(tx, { type: "work_item", id: wi.id }, "PAUSED_WORK", "BLOCKED", "block", { blocked_by: "wi-dep" }, "test");
-      setWorkItemState(tx, wi.id, "READY");
-      recordTransition(tx, { type: "work_item", id: wi.id }, "BLOCKED", "READY", "unblock", null, "test");
+      setWorkItemState(tx, wi.id, "QUEUED");
+      recordTransition(tx, { type: "work_item", id: wi.id }, "PAUSED_WORK", "QUEUED", "resume_work", null, "test");
+      setWorkItemState(tx, wi.id, "RUNNING");
+      recordTransition(tx, { type: "work_item", id: wi.id }, "QUEUED", "RUNNING", "claim", null, "test");
+      setWorkItemState(tx, wi.id, "AWAITING_DECISION");
+      recordTransition(tx, { type: "work_item", id: wi.id }, "RUNNING", "AWAITING_DECISION", "await_decision", null, "test");
+      setWorkItemState(tx, wi.id, "RUNNING");
+      recordTransition(tx, { type: "work_item", id: wi.id }, "AWAITING_DECISION", "RUNNING", "decision_received", null, "test");
     });
-    assert.equal(getWorkItem(t.db, wi.id)?.state, "READY");
+    assert.equal(getWorkItem(t.db, wi.id)?.state, "RUNNING");
     assert.equal(repoB.id, "xiaden/b");
-    assert.equal(listTransitions(t.db, "work_item", wi.id).length, 3);
+    assert.equal(listTransitions(t.db, "work_item", wi.id).length, 5);
   } finally { t.cleanup(); }
 });
 
@@ -233,6 +237,92 @@ test("R19 pessimistic OpenCode busy/missing session states never become completi
     t.cleanup();
     await server.close();
   }
+});
+
+test("R19 resolution envelopes keep awaiting decision distinct from dependency deferral and deduplicate durably", () => {
+  const t = createTestDb();
+  try {
+    const repo = seedRepository(t.db);
+    const dependency = insertIssue(t.db, {
+      id: "issue-r19-dependency",
+      repo_id: repo.id,
+      number: 1901,
+      title: "dependency",
+      state: "TRIAGE_PENDING",
+      updated_at: "2026-09-10T00:00:00.000Z",
+    });
+    const awaiting = insertWorkItem(t.db, { id: "wi-r19-awaiting", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    const deferred = insertWorkItem(t.db, { id: "wi-r19-deferred", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+
+    const awaitingResult = runWrite(t.db, (tx) => applyEnvelope(tx, {
+      kind: "resolution",
+      envelope_id: "env-r19-awaiting",
+      work_item_id: awaiting.id,
+      outcome: "awaiting_decision",
+      reason: "human decision required",
+    }));
+    assert.equal(awaitingResult.status, "applied");
+    assert.equal(getWorkItem(t.db, awaiting.id)?.state, "AWAITING_DECISION");
+    assert.equal(t.db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM work_item_dependencies WHERE dependent_work_item_id = ?", awaiting.id)?.c, 0);
+
+    const deferredEnvelope: AgentEnvelope = {
+      kind: "resolution",
+      envelope_id: "env-r19-deferred",
+      work_item_id: deferred.id,
+      outcome: "deferred",
+      dependency: { kind: "issue", id: dependency.id },
+    };
+    const deferredResult = runWrite(t.db, (tx) => applyEnvelope(tx, deferredEnvelope));
+    assert.equal(deferredResult.status, "applied");
+    assert.equal(getWorkItem(t.db, deferred.id)?.state, "DEFERRED");
+    const relation = t.db.sql.get<{ dependency_issue_id: string | null; dependency_work_item_id: string | null }>(
+      "SELECT dependency_issue_id, dependency_work_item_id FROM work_item_dependencies WHERE dependent_work_item_id = ?",
+      deferred.id,
+    );
+    assert.equal(relation?.dependency_issue_id, dependency.id);
+    assert.equal(relation?.dependency_work_item_id, null);
+
+    const duplicate = runWrite(t.db, (tx) => applyEnvelope(tx, deferredEnvelope));
+    assert.equal(duplicate.status, "noop_duplicate");
+    assert.equal(getWorkItem(t.db, deferred.id)?.state, "DEFERRED");
+    assert.equal(t.db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM work_item_dependencies WHERE dependent_work_item_id = ?", deferred.id)?.c, 1);
+    assert.equal(listTransitions(t.db, "work_item", deferred.id).filter((row) => row.event === "defer").length, 1);
+    assert.equal(listTransitions(t.db, "work_item", deferred.id).filter((row) => row.event === "noop_duplicate_envelope").length, 1);
+
+    for (const table of ["opencode_sessions", "worktrees", "pull_requests", "side_effects"]) {
+      assert.equal(t.db.sql.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c, 0, `${table} remains empty`);
+    }
+  } finally { t.cleanup(); }
+});
+
+test("R19 invalid resolution dependency contracts reject atomically without audit or relation effects", () => {
+  const t = createTestDb();
+  try {
+    const repo = seedRepository(t.db);
+    const wiMissing = insertWorkItem(t.db, { id: "wi-r19-missing", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    const wiExtra = insertWorkItem(t.db, { id: "wi-r19-extra", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+    const wiBlocked = insertWorkItem(t.db, { id: "wi-r19-blocked", repo_id: repo.id, state: "RUNNING", base_branch: "main" });
+
+    assert.throws(() => runWrite(t.db, (tx) => applyEnvelope(tx, {
+      kind: "resolution", envelope_id: "env-r19-missing", work_item_id: wiMissing.id, outcome: "deferred",
+    })), EnvelopeValidationError);
+    assert.throws(() => runWrite(t.db, (tx) => applyEnvelope(tx, {
+      kind: "resolution", envelope_id: "env-r19-extra", work_item_id: wiExtra.id, outcome: "awaiting_decision",
+      dependency: { kind: "issue", id: "issue-r19-unrelated" },
+    })), EnvelopeValidationError);
+    assert.throws(() => runWrite(t.db, (tx) => applyEnvelope(tx, {
+      kind: "resolution", envelope_id: "env-r19-legacy-blocked", work_item_id: wiBlocked.id, outcome: "blocked" as never,
+    })), EnvelopeValidationError);
+
+    for (const wi of [wiMissing, wiExtra, wiBlocked]) {
+      assert.equal(getWorkItem(t.db, wi.id)?.state, "RUNNING");
+      assert.equal(listTransitions(t.db, "work_item", wi.id).length, 0);
+      assert.equal(t.db.sql.get<{ c: number }>("SELECT COUNT(*) AS c FROM work_item_dependencies WHERE dependent_work_item_id = ?", wi.id)?.c, 0);
+    }
+    for (const table of ["opencode_sessions", "worktrees", "pull_requests", "side_effects"]) {
+      assert.equal(t.db.sql.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)?.c, 0, `${table} remains empty`);
+    }
+  } finally { t.cleanup(); }
 });
 
 test("R19 deleted resolution session: census is missing, reconcile holds FAILED_HOLD, session preserved", async () => {

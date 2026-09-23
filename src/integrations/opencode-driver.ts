@@ -496,7 +496,14 @@ export class OpenCodeDriver {
     await this.http.abortSession(sessionId);
   }
 
-  /** Read the ordered transcript for a session ({info, parts} entries). */
+  /**
+   * Read the ordered resident transcript for completion/recovery inspection.
+   *
+   * This is deliberately a raw observation boundary, not a prompt/context
+   * builder: callers may inspect controller messages that already passed their
+   * final prose filter, but this method never turns history into a new prompt
+   * and never repairs or authorizes GitHub-derived prose after persistence.
+   */
   async readHistory(sessionId: string): Promise<OcHistoryEntry[]> {
     return this.http.listMessages(sessionId);
   }
@@ -556,11 +563,16 @@ export class OpenCodeDriver {
     return { matched: false, reason: sawSummaryOrCompaction ? "only_summary_or_compaction" : "no_turn" };
   }
 
-  /** Parse the latest parent-linked assistant text as a bounded resolution envelope. */
+  /**
+   * Parse only the bounded parent-linked assistant result. User-message text
+   * (including any historical GitHub prose) is never copied into the result,
+   * diagnostic, or a subsequent prompt; history is re-read only as an
+   * observation needed to locate the validated assistant envelope.
+   */
   async readResolutionResult(sessionId: string, workItemId: string, deliveryNonce: string): Promise<ResolutionResult | null> {
-    const history = await this.readHistory(sessionId);
     const completion = await this.observeCompletion(sessionId, deliveryNonce);
     if (!completion.matched) return null;
+    const history = await this.readHistory(sessionId);
     const entry = history.find((item) => item.info.role === "assistant" && item.info.id === completion.assistantId);
     if (!entry) return null;
     const text = entry.parts.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n").trim();

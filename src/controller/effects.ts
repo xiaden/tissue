@@ -23,6 +23,8 @@ import {
   requeueSideEffect,
   setSideEffectState,
   setWorkItemState,
+  listDependentsForCompletedDependency,
+  settleWorkItemDependency,
   type SideEffectRow,
 } from "../db/repositories.ts";
 import { recordTransition } from "../domain/transitions.ts";
@@ -650,9 +652,7 @@ async function runMonitor(
     return { status: "adopted", effectId, kind: "monitor", attempt, prNumber, reason: "pr_not_found" };
   }
   if (pr.state === "MERGED") {
-    markDone(db, effectId);
-    markLocalPr(db, payload, prNumber, "MERGED");
-    completeMergedWorkItem(db, payload.work_item_id, prNumber);
+    completeMergedWorkItem(db, effectId, payload.work_item_id, prNumber);
     return { status: "adopted", effectId, kind: "monitor", attempt, prNumber, reason: "already_merged" };
   }
   if (pr.state === "CLOSED") {
@@ -690,9 +690,7 @@ async function runMerge(
     return { status: "adopted", effectId, kind: "merge", attempt, prNumber, reason: "pr_not_found" };
   }
   if (pr.state === "MERGED") {
-    markDone(db, effectId);
-    markLocalPr(db, payload, prNumber, "MERGED");
-    completeMergedWorkItem(db, payload.work_item_id, prNumber);
+    completeMergedWorkItem(db, effectId, payload.work_item_id, prNumber);
     return { status: "adopted", effectId, kind: "merge", attempt, prNumber, reason: "already_merged" };
   }
   if (pr.state === "CLOSED") {
@@ -759,9 +757,7 @@ async function runMerge(
   await transport.mergePr(payload.owner, payload.name, prNumber, method);
   const after = await transport.readPr(payload.owner, payload.name, prNumber);
   if (after?.state === "MERGED") {
-     markDone(db, effectId);
-     markLocalPr(db, payload, prNumber, "MERGED");
-      completeMergedWorkItem(db, payload.work_item_id, prNumber);
+    completeMergedWorkItem(db, effectId, payload.work_item_id, prNumber);
     return { status: "done", effectId, kind: "merge", attempt, prNumber };
   }
   markFailed(db, effectId, `merge not verified (state ${after?.state ?? "missing"})`);
@@ -797,10 +793,17 @@ function markLocalPr(db: TissueDb, payload: EffectPayload, prNumber: number, sta
   runWrite(db, (tx) => markPullRequestState(tx, payload.work_item_id, prNumber, state));
 }
 
-function completeMergedWorkItem(db: TissueDb, workItemId: string, prNumber: number): void {
+function completeMergedWorkItem(db: TissueDb, effectId: string, workItemId: string, prNumber: number): void {
   runWrite(db, (tx) => {
     const current = tx.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", workItemId)?.state;
     if (!current) return;
+
+    // The outbox completion, PR adoption, dependency settlement, and all audits
+    // commit together. A retry after any failure therefore observes either the
+    // prior completion or none of the release work.
+    setSideEffectState(tx, effectId, "DONE");
+    markPullRequestState(tx, workItemId, prNumber, "MERGED");
+
     let completionFrom = current;
     if (current === "WAITING") {
       recordTransition(tx, { type: "work_item", id: workItemId }, "WAITING", "RUNNING", "resume", { pr_number: prNumber, merge_verified: true }, "controller.effects");
@@ -810,6 +813,29 @@ function completeMergedWorkItem(db: TissueDb, workItemId: string, prNumber: numb
     if (isLegalTransition("work_item", completionFrom, "COMPLETED", "completed")) {
       recordTransition(tx, { type: "work_item", id: workItemId }, completionFrom, "COMPLETED", "completed", { pr_number: prNumber }, "controller.effects");
       setWorkItemState(tx, workItemId, "COMPLETED");
+    }
+
+    // Release only dependency-blocked work. Other active relations are settled
+    // without changing paused, invalid, or terminal dependents.
+    for (const relation of listDependentsForCompletedDependency(tx, { kind: "work_item", id: workItemId })) {
+      const dependent = tx.sql.get<{ state: string }>("SELECT state FROM work_items WHERE id = ?", relation.dependent_work_item_id);
+      if (!dependent) {
+        settleWorkItemDependency(tx, relation.id);
+        continue;
+      }
+      if (dependent.state === "DEFERRED") {
+        recordTransition(
+          tx,
+          { type: "work_item", id: relation.dependent_work_item_id },
+          "DEFERRED",
+          "READY",
+          "dependency_completed",
+          { dependency_work_item_id: workItemId, relation_id: relation.id },
+          "controller.effects",
+        );
+        setWorkItemState(tx, relation.dependent_work_item_id, "READY");
+      }
+      settleWorkItemDependency(tx, relation.id);
     }
   });
 }

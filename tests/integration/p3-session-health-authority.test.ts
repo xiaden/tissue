@@ -34,6 +34,7 @@ const REPO_ID = "xiaden/nomarr";
 const WI = "wi-xiaden-nomarr-7";
 
 const MINIMAL_CONFIG: TissueConfig = {
+  security: { trustedGithubUsers: ["trusted"] },
   pollIntervalSeconds: 60,
   maxConcurrentGlobal: 1,
   retentionDays: 30,

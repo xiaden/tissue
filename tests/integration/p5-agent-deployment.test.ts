@@ -273,7 +273,9 @@ test("D: enabled work always addresses the dedicated agents, even when config om
     // Config OMITS `agents` entirely: neither identity nor model is configured.
     const config = parseConfig(
       [
-        "pollIntervalSeconds: 300",
+         "security:",
+         "  trustedGithubUsers: [trusted]",
+         "pollIntervalSeconds: 300",
         "repos:",
         `  - owner: xiaden`,
         `    name: nomarr`,

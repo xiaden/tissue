@@ -22,13 +22,17 @@ The CLI is a thin adapter over the controller's shared operations. It does not c
 
 ## Status and safety
 
-`status` returns structured, redacted JSON. The `repositoryReadiness` entries include repository id, enablement, persisted capability, readiness, check time, and reasons. The `opencode` block includes a redacted endpoint and credential-free health fields. GitHub authentication and capability remain `not_probed` until `reconcile`; `status` does not perform that audit. The registry view reports directory, mount assertion, writability, real-mount status, override status, marker count, and markers that startup would prune.
+`status` returns structured, redacted JSON. The `capacity` block reports `globalLimit`, the active count, available slots, and state semantics: `RUNNING`, `WAITING`, and `AWAITING_DECISION` consume capacity; `DEFERRED` is dependency-waiting and exempt. The `repositoryReadiness` entries include repository id, enablement, persisted capability, readiness, check time, and reasons. The `opencode` block includes a redacted endpoint and credential-free health fields. GitHub authentication and capability remain `not_probed` until `reconcile`; `status` does not perform that audit. The registry view reports directory, mount assertion, writability, real-mount status, override status, marker count, and markers that startup would prune.
 
 Managed sessions use exactly two states: a present `ses_*` marker is `MANAGED`; an absent or unreadable marker is `UNMANAGED`. Startup requires a writable persisted registry and prunes markers with no durable session row. Marker contents are never read, and no readiness sentinel or third state exists.
 
 ## JSONL
 
 Each operational JSONL record contains a timestamp, level, operation id, event, and event-specific fields. Records may include repository id, work-item id, real OpenCode session id, phase, attempt, latency, result, and redaction status. Secret-like keys and credential-shaped values are masked before writing.
+
+`inspect` accepts an optional repository scope (`OWNER/REPO`) or work-item id. With no scope it returns all work items; with a repository scope it returns that repository and its work items; with a work-item scope it returns only that item. Each returned work item includes `capacity` (`consumes` for `AWAITING_DECISION`, `exempt` for `DEFERRED`, otherwise `not_applicable`) and its active `dependency`, when present, plus sessions, worktrees, and pull requests. The response also includes inbox counts, pull requests, check effects, and repository protection data when applicable.
+
+`history` accepts an optional work-item id. With a scope it returns the current `workItem` state, capacity treatment, and active durable dependency kind/id/state, alongside transitions for that entity in reverse id order. Without a scope it returns all current work items in `workItems` plus the latest 100 transitions. Both forms retain the latest 100 housekeeping actions in `housekeeping`.
 
 `state_transitions` is the durable state audit, `inbox` is the ordered delivery record, and `side_effects` is the transactional effect record. JSONL is telemetry, not a transcript or session store. `inspect` and `history` remain useful after merge because durable Issue, WorkItem, pull-request, audit, log, and session mappings are retained.
 

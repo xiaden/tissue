@@ -246,6 +246,7 @@ const DISPATCH_OPERATIONS = ["poll", "triage", "claim", "dispatch", "effect"] as
 
 function gateConfig(dir: string): TissueConfig {
   return {
+    security: { trustedGithubUsers: ["trusted"] },
     pollIntervalSeconds: 60, maxConcurrentGlobal: 3, retentionDays: 30, agents: {},
     repos: [{ owner: "acme", name: "widgets", remote: "https://github.com/acme/widgets.git", localDir: dir,
       enabled: true, pollIntervalSeconds: 60, maxConcurrentPerRepo: 1, baseBranch: "main", labels: [], autoMerge: false, priority: 0 }],

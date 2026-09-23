@@ -64,8 +64,15 @@ export interface RepositoryConfig {
   baselineBefore?: string;
 }
 
-/** Fully validated configuration. */
+/** Validated GitHub authors permitted to receive trusted human-prose treatment. */
+export interface TrustedGithubSecurityConfig {
+  /** ASCII GitHub logins; the strict loader rejects malformed entries. */
+  trustedGithubUsers: string[];
+}
+
+/** Fully validated Tissue YAML configuration, including optional trust policy. */
 export interface TissueConfig {
+  security?: TrustedGithubSecurityConfig;
   pollIntervalSeconds: number;
   maxConcurrentGlobal: number;
   /** History/audit retention window in days (R22). */

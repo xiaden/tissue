@@ -139,6 +139,8 @@ export interface ProductionAssemblyOptions {
    * resolve-and-pins entirely to private addresses — before credentials attach.
    */
   endpoint: string;
+  /** Current configuration file used for retrieval-time prose decisions. */
+  configPath?: string;
   /** Resident basic-auth credentials (TISSUE_OPENCODE_URL validation precedes attach). */
   credentials?: ResidentCredentials;
   /** Directory holding host-global tissue-triage.md / tissue-resolve.md. */
@@ -225,7 +227,6 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
 
     const http = transport.http;
    const gh = opts.gh ?? new GhClient();
-
   const triage = opts.config.agents.triage;
   // The dedicated identity is mandatory: an omitted config agent resolves to the
   // Tissue triage agent, never the resident OpenCode default agent.
@@ -246,12 +247,13 @@ export async function createProductionAssembly(opts: ProductionAssemblyOptions):
     transport: http,
     endpoint: transport.endpointLabel,
     agentDefinitions,
-    normalLoop: defaultNormalLoopIo(opts.config, opts.logger, {
-      gh,
-      triageDriver: driver,
-      resolutionDriver: driver,
-      ...(opts.now ? { now: opts.now } : {}),
-    }),
+     normalLoop: defaultNormalLoopIo(opts.config, opts.logger, {
+       gh,
+       triageDriver: driver,
+       resolutionDriver: driver,
+        ...(opts.now ? { now: opts.now } : {}),
+        ...(opts.configPath !== undefined ? { configPath: opts.configPath } : {}),
+       }),
     reconcile: () => runReconcilePass({
       config: opts.config,
       logger: opts.logger.op("reconcile"),
@@ -312,11 +314,12 @@ export async function runProductionDaemon(seams: ProductionDaemonSeams = {}): Pr
 
     const createAssembly = seams.createAssembly ?? createProductionAssembly;
     const assembly = await createAssembly({
-      config,
-      logger,
-      db,
-      stateDir,
-      endpoint: process.env.TISSUE_OPENCODE_URL ?? "",
+       config,
+       logger,
+       db,
+       stateDir,
+       configPath,
+       endpoint: process.env.TISSUE_OPENCODE_URL ?? "",
       credentials: {
         ...(process.env.OPENCODE_SERVER_USERNAME !== undefined ? { username: process.env.OPENCODE_SERVER_USERNAME } : {}),
         ...(process.env.OPENCODE_SERVER_PASSWORD !== undefined ? { password: process.env.OPENCODE_SERVER_PASSWORD } : {}),

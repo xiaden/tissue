@@ -20,6 +20,8 @@ import {
 } from "../../src/config/types.ts";
 
 const VALID = `
+security:
+  trustedGithubUsers: [Alice, bob]
 pollIntervalSeconds: 240
 maxConcurrentGlobal: 2
 retentionDays: 30
@@ -43,6 +45,7 @@ repos:
 
 test("parses a fully-specified valid config with expected structure", () => {
   const cfg = parseConfig(VALID, "valid.yml");
+  assert.deepEqual(cfg.security?.trustedGithubUsers, ["Alice", "bob"]);
   assert.equal(cfg.pollIntervalSeconds, 240);
   assert.equal(cfg.maxConcurrentGlobal, 2);
   assert.equal(cfg.retentionDays, 30);
@@ -129,6 +132,14 @@ test("defaults both dedicated Tissue agent identities and rejects a divergent ag
   const explicit = parseConfig("agents:\n  triage:\n    agent: tissue-triage\n    model: anthropic/claude-3-5-sonnet\nrepos: []\n", "agents-explicit.yml");
   assert.equal(explicit.agents.triage?.agent, "tissue-triage");
   assert.equal(explicit.agents.triage?.model, "anthropic/claude-3-5-sonnet");
+});
+
+test("accepts only the canonical global trusted-user policy and rejects nested unknown keys", () => {
+  const cfg = parseConfig("security:\n  trustedGithubUsers: [Alice]\nrepos: []\n", "security.yml");
+  assert.deepEqual(cfg.security?.trustedGithubUsers, ["Alice"]);
+  assert.throws(() => parseConfig("security:\n  trustedGithubUsers: [bad user]\nrepos: []\n"), ConfigError);
+  assert.throws(() => parseConfig("security:\n  trustedGithubUsers: []\n  rules: []\nrepos: []\n"), ConfigError);
+  assert.throws(() => parseConfig("security:\n  trustedGithubUsers: [Alice, ' bob']\nrepos: []\n"), ConfigError);
 });
 
 test("rejects a top-level policy-DSL key", () => {

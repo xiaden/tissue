@@ -241,7 +241,7 @@ export async function runCaptured(
 // ---- typed argv builders ---------------------------------------------------------
 
 /** Fixed JSON field sets are enumerated, never free-form. */
-export const JSON_ISSUE_FIELDS = "number,title,labels,updatedAt,state,createdAt";
+export const JSON_ISSUE_FIELDS = "number,title,author,labels,updatedAt,state,createdAt";
 export const JSON_REPO_META_FIELDS = "default_branch,has_issues,permissions";
 export const JSON_RATE_FIELDS = "rate";
 
@@ -350,13 +350,13 @@ export function argvIssueReopen(owner: string, name: string, number: number): re
 // fixed field so a foreign fork on the same controller branch can be told apart
 // from the writable push-owner head and is never adopted as the controller PR.
 export const JSON_PR_LIST_FIELDS =
-  "number,state,headRefName,headRefOid,headRepositoryOwner,headRepository,updatedAt,mergeable,mergeStateStatus,isDraft,url";
+  "number,state,author,headRefName,headRefOid,headRepositoryOwner,headRepository,updatedAt,mergeable,mergeStateStatus,isDraft,url";
 export const JSON_PR_VIEW_FIELDS =
-  "number,state,headRefName,headRefOid,headRepositoryOwner,headRepository,mergeable,mergeStateStatus,isDraft,reviewDecision,url";
+  "number,state,author,headRefName,headRefOid,headRepositoryOwner,headRepository,updatedAt,mergeable,mergeStateStatus,isDraft,reviewDecision,url";
 export const JSON_COMMENT_FIELDS = "comments";
 export const JSON_ISSUE_BODY_FIELDS = "body";
 export const JSON_PR_CHECKS_FIELDS = "number,statusCheckRollup";
-export const JSON_PR_REVIEWS_FIELDS = "number,reviews";
+export const JSON_PR_REVIEWS_FIELDS = "number,reviews"; // reviews include id,author,state,submittedAt in the supported projection
 
 export interface PrListQuery {
   owner: string;

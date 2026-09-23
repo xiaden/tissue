@@ -96,6 +96,7 @@ async function declareGithubRemote(cwd: string, bare: string, slug: string, remo
 
 function productionConfig(repo: RepositoryConfig): TissueConfig {
   return {
+    security: { trustedGithubUsers: ["trusted"] },
     pollIntervalSeconds: 300,
     maxConcurrentGlobal: 3,
     retentionDays: 90,

@@ -24,6 +24,7 @@ import {
   listInboxByWorkItem,
   insertSideEffect,
   appendTransition,
+  addWorkItemDependency,
 } from "../../src/db/repositories.ts";
 import { createTestDb, seedRepository, seedIssue } from "../helpers/db.ts";
 
@@ -40,6 +41,60 @@ const TABLES = [
   "side_effects",
   "controller_leases",
 ];
+
+test("migrated schema contains dependency relation and version ledger", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    assert.equal(db.sql.get<{ version: number }>("SELECT MAX(version) AS version FROM schema_migrations")?.version, 2);
+    const table = db.sql.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_item_dependencies'");
+    assert.match(table?.sql ?? "", /CHECK \(\(dependency_issue_id IS NOT NULL\) != \(dependency_work_item_id IS NOT NULL\)\)/);
+    const columns = db.sql.all<{ name: string }>("PRAGMA table_info('work_items')").map((row) => row.name);
+    assert.ok(!columns.includes("blocked_by"), "WorkItem blocked_by is not an active column contract");
+  } finally {
+    cleanup();
+  }
+});
+
+test("dependency schema enforces exactly one target and exposes lookup indexes", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    insertWorkItem(db, { id: "wi-schema-dependent", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+    insertWorkItem(db, { id: "wi-schema-target", repo_id: repo.id, state: "COMPLETED", base_branch: "main" });
+
+    assert.throws(
+      () => db.sql.run(
+        "INSERT INTO work_item_dependencies(id, dependent_work_item_id, dependency_issue_id, dependency_work_item_id, created_at) VALUES(?,?,?,?,?)",
+        "dep-both-null",
+        "wi-schema-dependent",
+        null,
+        null,
+        "2026-09-09T00:00:00.000Z",
+      ),
+      /CHECK/i,
+    );
+    assert.throws(
+      () => db.sql.run(
+        "INSERT INTO work_item_dependencies(id, dependent_work_item_id, dependency_issue_id, dependency_work_item_id, created_at) VALUES(?,?,?,?,?)",
+        "dep-both-set",
+        "wi-schema-dependent",
+        "wi-schema-target",
+        "wi-schema-target",
+        "2026-09-09T00:00:00.000Z",
+      ),
+      /CHECK/i,
+    );
+
+    const indexes = new Set(
+      db.sql.all<{ name: string }>("PRAGMA index_list('work_item_dependencies')").map((row) => row.name),
+    );
+    assert.ok(indexes.has("ix_work_item_dependencies_issue"));
+    assert.ok(indexes.has("ix_work_item_dependencies_work_item"));
+    assert.ok(indexes.has("ix_work_item_dependencies_dependents"));
+  } finally {
+    cleanup();
+  }
+});
 
 test("migrated schema contains all 11 conceptual tables", () => {
   const { db, cleanup } = createTestDb();
@@ -195,6 +250,25 @@ test("JSON boundary columns reject malformed JSON but accept valid strings", () 
       TissueDbError,
     );
     insertInboxEvent(db, { issue_id: ok.id, event_key: "good-payload", kind: "x", payload_json: "{}" });
+  } finally {
+    cleanup();
+  }
+});
+
+test("dependency foreign keys, target identity, uniqueness, and self/cycle rejection are enforced", () => {
+  const { db, cleanup } = createTestDb();
+  try {
+    const repo = seedRepository(db);
+    const issue = seedIssue(db, repo.id, { state: "READY" });
+    insertWorkItem(db, { id: "wi-dependent", repo_id: repo.id, state: "DEFERRED", base_branch: "main" });
+    insertWorkItem(db, { id: "wi-target", repo_id: repo.id, state: "COMPLETED", base_branch: "main" });
+    const issueRelation = addWorkItemDependency(db, "wi-dependent", { kind: "issue", id: issue.id });
+    assert.equal(issueRelation.dependency_issue_id, issue.id);
+    assert.throws(() => addWorkItemDependency(db, "wi-dependent", { kind: "issue", id: issue.id }), /UNIQUE/i);
+    assert.throws(() => addWorkItemDependency(db, "wi-dependent", { kind: "work_item", id: "wi-dependent" }), /itself/i);
+    addWorkItemDependency(db, "wi-target", { kind: "work_item", id: "wi-dependent" });
+    assert.throws(() => addWorkItemDependency(db, "wi-dependent", { kind: "work_item", id: "wi-target" }), /cycle/i);
+    assert.throws(() => db.sql.run("INSERT INTO work_item_dependencies(id, dependent_work_item_id, dependency_issue_id, dependency_work_item_id, created_at) VALUES(?,?,?,?,?)", "bad", "missing", issue.id, null, new Date().toISOString()), /FOREIGN KEY/i);
   } finally {
     cleanup();
   }

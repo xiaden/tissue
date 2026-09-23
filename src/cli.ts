@@ -149,11 +149,12 @@ const hDaemon: Handler = async (ctx) => {
     const endpoint = process.env.TISSUE_OPENCODE_URL ?? "";
     const logger = ctx.logger.op("daemon");
     const assembly = await createProductionAssembly({
-      config,
-      logger,
-      db,
-      stateDir,
-      endpoint,
+       config,
+       logger,
+       db,
+       stateDir,
+       configPath: ctx.configPath,
+       endpoint,
       credentials: {
         ...(process.env.OPENCODE_SERVER_USERNAME !== undefined ? { username: process.env.OPENCODE_SERVER_USERNAME } : {}),
         ...(process.env.OPENCODE_SERVER_PASSWORD !== undefined ? { password: process.env.OPENCODE_SERVER_PASSWORD } : {}),

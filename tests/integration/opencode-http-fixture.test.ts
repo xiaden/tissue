@@ -6,6 +6,9 @@ import { readFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { writeFileSync } from "node:fs";
+import { createTestDb, seedIssue, seedRepository } from "../helpers/db.ts";
+import { buildTriageDigest } from "../../src/controller/triage.ts";
 import { OpenCodeHttp, OpenCodeHttpError } from "../../src/integrations/opencode-http.ts";
 import { OpenCodeDriver } from "../../src/integrations/opencode-driver.ts";
 
@@ -61,6 +64,53 @@ test("pinned baseline bytes and consumed operations remain exact", () => {
   assert.equal(operations.length, 10);
   const document = JSON.parse(spec) as { paths: Record<string, Record<string, unknown>> };
   for (const operation of operations) assert.ok(document.paths[operation.path]?.[operation.method.toLowerCase()], `${operation.method} ${operation.path} missing from pinned OpenAPI`);
+});
+
+test("real OpenCodeDriver triage prompt carries only the filtered projection", async () => {
+  const { child, baseUrl } = await startFixture();
+  const registryDir = mkdtempSync(join(tmpdir(), "tissue-fixture-triage-registry-"));
+  const configPath = join(registryDir, "tissue.yml");
+  writeFileSync(configPath, "security:\n  trustedGithubUsers: [TrustedUser]\n");
+  const database = createTestDb();
+  const repo = seedRepository(database.db);
+  const issue = seedIssue(database.db, repo.id, {
+    id: "fixture-issue",
+    number: 7,
+    title: "denied-title",
+    body_json: JSON.stringify("denied-body"),
+    envelope: {
+      repository: repo.id,
+      sourceKind: "issue",
+      objectId: "7",
+      contentId: null,
+      observedVersion: "v1",
+      contentHash: "hash",
+      authoritativeAt: "2026-09-09T00:00:00.000Z",
+      policyRevision: "fixture",
+      actor: { present: true, rawLogin: "Mallory", normalizedLogin: "mallory", presence: "PRESENT" },
+      decision: "TRUSTED",
+      reason: "fixture",
+      deliveryClass: "TRUSTED_PROSE",
+    },
+  });
+  const http = new OpenCodeHttp({ baseUrl, timeoutMs: 2_000 });
+  const driver = new OpenCodeDriver({ http, registryDir });
+  try {
+    const ref = await driver.createRealSession("triage", directory, { repoId: "fixture/repo", directory, kind: "triage" });
+    const digest = buildTriageDigest(database.db, repo, issue, configPath);
+    await driver.promptTriage(ref.sessionId, digest);
+    const user = (await driver.readHistory(ref.sessionId)).find((entry) => entry.info.role === "user");
+    const text = user?.parts.filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join(" ") ?? "";
+    assert.match(text, new RegExp(`issue_id=${issue.id}`));
+    assert.match(text, /title=\n/);
+    assert.match(text, /body=\n/);
+    assert.match(text, /number=7/);
+    assert.doesNotMatch(text, /denied-title|denied-body/);
+  } finally {
+    if (child?.exitCode === null) await stopFixture(child);
+    database.cleanup();
+    rmSync(registryDir, { recursive: true, force: true });
+  }
 });
 
 test("fixture is not compatibility or plugin-loading evidence", () => {

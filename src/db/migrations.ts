@@ -10,10 +10,11 @@
 // DDL is transactional in SQLite, so tables created earlier in a failed batch
 // disappear on rollback. Migrations never touch OpenCode's database.
 //
-// Tissue is unreleased: there is exactly ONE production migration, `initial_schema`,
-// which creates the final current schema inline. There are no forward migrations,
-// compatibility shims, legacy columns, or upgrade paths — the canonical initial
-// schema is changed directly until first release.
+// Tissue is unreleased: the numbered, idempotent migration set currently contains
+// `initial_schema` (version 1) and `work_item_dependencies` (version 2). The
+// canonical schema is still pre-release and has no released-schema compatibility
+// shims or upgrade-path promises; future schema changes must be added as numbered
+// migrations rather than rewriting this history.
 
 import type { Sql, SqlValue, TissueDb } from "./open.ts";
 import { runWrite, nowIso } from "./open.ts";
@@ -35,6 +36,9 @@ export interface MigrationResult {
 }
 
 // ---- initial_schema: the complete current Tissue schema -----------------------
+// Plan A envelope columns are folded into this unreleased initial migration. The
+// repository has no released upgrade boundary, so a second ALTER migration would
+// invent an upgrade path and is intentionally not used.
 // Reproduced from the authoritative DD schema contract (entities + FKs), including
 // repository target/push/config-managed/capability columns and requested-vs-observed
 // session metadata. Every entity uses a TEXT primary key supplied by the controller;
@@ -87,11 +91,27 @@ const INITIAL_SCHEMA = [
     snapshot_hash TEXT,
     first_seen_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    disposition_json TEXT,
-    blocked_by TEXT,
-    UNIQUE(repo_id, number)
-  );`,
-  `CREATE TABLE IF NOT EXISTS work_items(
+     disposition_json TEXT,
+      blocked_by TEXT,
+      envelope_repository TEXT,
+      envelope_source_kind TEXT,
+      envelope_object_id TEXT,
+     envelope_content_id TEXT,
+     envelope_observed_version TEXT,
+     envelope_content_hash TEXT,
+     envelope_authoritative_at TEXT,
+     envelope_policy_revision TEXT,
+     envelope_actor_present INTEGER,
+     envelope_actor_presence TEXT,
+     envelope_actor_raw_login TEXT,
+     envelope_actor_normalized_login TEXT,
+     envelope_decision TEXT,
+     envelope_reason TEXT,
+     envelope_delivery_class TEXT,
+     quarantine_json TEXT,
+     UNIQUE(repo_id, number)
+    );`,
+   `CREATE TABLE IF NOT EXISTS work_items(
     id TEXT PRIMARY KEY,
     repo_id TEXT NOT NULL REFERENCES repositories(id),
     state TEXT NOT NULL,
@@ -100,10 +120,9 @@ const INITIAL_SCHEMA = [
     head_branch TEXT UNIQUE,
     lease_token TEXT,
     lease_until TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    priority INTEGER NOT NULL DEFAULT 0,
-    blocked_by TEXT,
-    created_at TEXT NOT NULL,
+     attempts INTEGER NOT NULL DEFAULT 0,
+     priority INTEGER NOT NULL DEFAULT 0,
+     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );`,
   `CREATE TABLE IF NOT EXISTS issue_work_items(
@@ -151,10 +170,26 @@ const INITIAL_SCHEMA = [
     origin TEXT NOT NULL DEFAULT 'expected',
     snapshot_hash TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(repo_id, number)
-  );`,
-  `CREATE TABLE IF NOT EXISTS inbox(
+     updated_at TEXT NOT NULL,
+      envelope_repository TEXT,
+      envelope_source_kind TEXT,
+      envelope_object_id TEXT,
+     envelope_content_id TEXT,
+     envelope_observed_version TEXT,
+     envelope_content_hash TEXT,
+     envelope_authoritative_at TEXT,
+     envelope_policy_revision TEXT,
+     envelope_actor_present INTEGER,
+     envelope_actor_presence TEXT,
+     envelope_actor_raw_login TEXT,
+     envelope_actor_normalized_login TEXT,
+     envelope_decision TEXT,
+     envelope_reason TEXT,
+     envelope_delivery_class TEXT,
+     quarantine_json TEXT,
+     UNIQUE(repo_id, number)
+    );`,
+   `CREATE TABLE IF NOT EXISTS inbox(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     work_item_id TEXT,
     issue_id TEXT NOT NULL REFERENCES issues(id),
@@ -168,9 +203,25 @@ const INITIAL_SCHEMA = [
     terminal_action TEXT,
     terminal_reason TEXT,
     retention_deadline TEXT,
-    housekept_at TEXT
-  );`,
-  `CREATE TABLE IF NOT EXISTS state_transitions(
+     housekept_at TEXT,
+      envelope_repository TEXT,
+      envelope_source_kind TEXT,
+     envelope_object_id TEXT,
+     envelope_content_id TEXT,
+     envelope_observed_version TEXT,
+     envelope_content_hash TEXT,
+     envelope_authoritative_at TEXT,
+     envelope_policy_revision TEXT,
+     envelope_actor_present INTEGER,
+     envelope_actor_presence TEXT,
+     envelope_actor_raw_login TEXT,
+     envelope_actor_normalized_login TEXT,
+     envelope_decision TEXT,
+     envelope_reason TEXT,
+     envelope_delivery_class TEXT,
+     quarantine_json TEXT
+    );`,
+   `CREATE TABLE IF NOT EXISTS state_transitions(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
     entity_id TEXT NOT NULL,
@@ -219,8 +270,31 @@ const INITIAL_SCHEMA = [
   `CREATE INDEX IF NOT EXISTS ix_side_effects_due ON side_effects(state, next_attempt_at);`,
 ];
 
+const DEPENDENCY_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS work_item_dependencies(
+     id TEXT PRIMARY KEY,
+     dependent_work_item_id TEXT NOT NULL REFERENCES work_items(id),
+     dependency_issue_id TEXT REFERENCES issues(id),
+     dependency_work_item_id TEXT REFERENCES work_items(id),
+     state TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(state IN ('ACTIVE', 'SETTLED')),
+     created_at TEXT NOT NULL,
+     settled_at TEXT,
+     CHECK ((dependency_issue_id IS NOT NULL) != (dependency_work_item_id IS NOT NULL)),
+     CHECK (settled_at IS NULL OR state = 'SETTLED'),
+     UNIQUE(dependent_work_item_id, dependency_issue_id),
+     UNIQUE(dependent_work_item_id, dependency_work_item_id)
+   );`,
+  `CREATE INDEX IF NOT EXISTS ix_work_item_dependencies_issue
+     ON work_item_dependencies(dependency_issue_id, state, created_at, id);`,
+  `CREATE INDEX IF NOT EXISTS ix_work_item_dependencies_work_item
+     ON work_item_dependencies(dependency_work_item_id, state, created_at, id);`,
+  `CREATE INDEX IF NOT EXISTS ix_work_item_dependencies_dependents
+     ON work_item_dependencies(dependent_work_item_id, state, created_at, id);`,
+];
+
 export const MIGRATIONS: readonly MigrationDef[] = [
   { version: 1, name: "initial_schema", statements: INITIAL_SCHEMA },
+  { version: 2, name: "work_item_dependencies", statements: DEPENDENCY_SCHEMA },
 ];
 
 /** Highest schema version this build knows how to reach. */
