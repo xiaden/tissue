@@ -38,21 +38,8 @@ test("hostile GitHub text stays bounded data and control characters are sanitize
     const issue = seedIssue(t.db, repo.id, {
       title: hostile,
       body_json: JSON.stringify(hostile),
-      envelope: {
-        repository: repo.id,
-        sourceKind: "issue",
-        objectId: String(42),
-        contentId: null,
-        observedVersion: "v1",
-        contentHash: "hash",
-        authoritativeAt: "2026-09-09T00:00:00.000Z",
-        policyRevision: "fixture",
-        actor: { present: true, rawLogin: "TrustedUser", normalizedLogin: "trusteduser", presence: "PRESENT" },
-        decision: "TRUSTED",
-        reason: "fixture",
-        deliveryClass: "TRUSTED_PROSE",
-      },
-    } as never);
+      actorRawLogin: "TrustedUser",
+    });
     const configPath = join(mkdtempSync(join(tmpdir(), "tissue-triage-config-")), "tissue.yml");
     writeFileSync(configPath, `repos:\n  - owner: xiaden\n    name: nomarr\n    localDir: /tmp/nomarr\nsecurity:\n  trustedGithubUsers:\n    - trusteduser\n`);
     const digest = buildTriageDigest(t.db, repo, issue, configPath);

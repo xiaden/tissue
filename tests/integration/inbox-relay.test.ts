@@ -31,7 +31,7 @@ import {
 } from "../../src/db/repositories.ts";
 import { runWrite } from "../../src/db/open.ts";
 import { relayOldestInbox } from "../../src/controller/inbox-relay.ts";
-import { decideCurrentGithubProse, type ProvenanceEnvelope } from "../../src/controller/trust.ts";
+import { decideCurrentGithubProse } from "../../src/controller/trust.ts";
 import { startPessimisticServer, type PessimisticOpenCodeServer } from "../helpers/pessimistic-opencode-server.ts";
 import { createTestDb, seedIssue, seedRepository } from "../helpers/db.ts";
 import { createTempRepo } from "../helpers/git.ts";
@@ -121,23 +121,6 @@ function writeConfig(path: string, users: readonly string[]): void {
   ].join("\n"));
 }
 
-function envelope(rawLogin: string, sourceKind: "issue_comment" | "pr_comment" = "issue_comment"): ProvenanceEnvelope {
-  return {
-    repository: "xiaden/nomarr",
-    sourceKind,
-    objectId: rawLogin,
-    contentId: rawLogin,
-    observedVersion: "v1",
-    contentHash: "hash",
-    authoritativeAt: new Date().toISOString(),
-    policyRevision: "unavailable",
-    actor: { present: true, rawLogin, normalizedLogin: rawLogin.toLowerCase(), presence: "PRESENT" },
-    decision: "UNTRUSTED",
-    reason: "UNTRUSTED",
-    deliveryClass: "DENIED_PROSE",
-  };
-}
-
 function seedEvent(h: Harness, key: string): number {
   return insertInboxEvent(h.db, {
     work_item_id: h.workItemId,
@@ -154,7 +137,7 @@ function seedComment(
   author: string,
   body: string,
   kind: "issue_comment" | "pr_comment" = "issue_comment",
-  envelopeAuthor: string | null = author,
+  actorRawLogin: string | null = author,
 ): number {
   return insertInboxEvent(h.db, {
     work_item_id: h.workItemId,
@@ -170,7 +153,7 @@ function seedComment(
       body_preview: body,
       hostile_extra: "must-not-forward",
     }),
-    envelope: envelopeAuthor === null ? null : envelope(envelopeAuthor, kind),
+    actorRawLogin,
   });
 }
 
@@ -451,8 +434,8 @@ test("real relay filters trusted, denied, and mixed-author prose while preservin
     const first = await relayOldestInbox(h.db, h.workItemId, h.driver, relayOpts(h));
     assert.equal(first.status, "observing");
     const trustedRow = listInboxByWorkItem(h.db, h.workItemId).find((row) => row.id === trusted);
-    assert.equal(trustedRow?.envelope_actor_raw_login, "Maintainer");
-    assert.equal(decideCurrentGithubProse(trustedRow?.envelope_actor_raw_login, h.configPath), "TRUSTED");
+    assert.equal(trustedRow?.actor_raw_login, "Maintainer");
+    assert.equal(decideCurrentGithubProse(trustedRow?.actor_raw_login, h.configPath), "TRUSTED");
     const prompt = JSON.stringify(h.server.getRec(h.sessionId)?.messages ?? []);
     assert.match(prompt, /trusted prose/);
     assert.doesNotMatch(prompt, /UNTRUSTED_SECRET/);

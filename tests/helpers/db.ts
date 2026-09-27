@@ -64,7 +64,7 @@ let issueSeq = 0;
 export function seedIssue(
   db: TissueDb,
   repoId: string,
-  overrides: Partial<IssueRow> & { number?: number; title?: string; state?: string; envelope?: import("../../src/controller/trust.ts").ProvenanceEnvelope | null } = {},
+  overrides: Partial<IssueRow> & { number?: number; title?: string; state?: string; actorRawLogin?: string | null } = {},
 ): IssueRow {
   issueSeq += 1;
   const number = overrides.number ?? issueSeq;

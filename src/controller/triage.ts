@@ -109,7 +109,7 @@ export function buildTriageDigest(
   issue: IssueRow,
   configPath: string = process.env.TISSUE_CONFIG ?? "./tissue.yml",
 ): IssueTriageDigest {
-  const proseTrusted = decideCurrentGithubProse(issue.envelope_actor_raw_login, configPath) === "TRUSTED";
+  const proseTrusted = decideCurrentGithubProse(issue.actor_raw_login, configPath) === "TRUSTED";
   let body = "";
   if (issue.body_json) {
     try {

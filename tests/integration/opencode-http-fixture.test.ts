@@ -78,20 +78,7 @@ test("real OpenCodeDriver triage prompt carries only the filtered projection", a
     number: 7,
     title: "denied-title",
     body_json: JSON.stringify("denied-body"),
-    envelope: {
-      repository: repo.id,
-      sourceKind: "issue",
-      objectId: "7",
-      contentId: null,
-      observedVersion: "v1",
-      contentHash: "hash",
-      authoritativeAt: "2026-09-09T00:00:00.000Z",
-      policyRevision: "fixture",
-      actor: { present: true, rawLogin: "Mallory", normalizedLogin: "mallory", presence: "PRESENT" },
-      decision: "TRUSTED",
-      reason: "fixture",
-      deliveryClass: "TRUSTED_PROSE",
-    },
+    actorRawLogin: "Mallory",
   });
   const http = new OpenCodeHttp({ baseUrl, timeoutMs: 2_000 });
   const driver = new OpenCodeDriver({ http, registryDir });

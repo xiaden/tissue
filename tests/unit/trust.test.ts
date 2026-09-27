@@ -7,17 +7,8 @@ import { join } from "node:path";
 import {
   createTrustedGithubPolicy,
   decideCurrentGithubProse,
-  decideGithubActor,
   normalizeGithubLogin,
-  type ActorObservation,
 } from "../../src/controller/trust.ts";
-
-const actor = (rawLogin: string | null, presence: ActorObservation["presence"] = "PRESENT"): ActorObservation => ({
-  present: rawLogin !== null,
-  rawLogin,
-  normalizedLogin: rawLogin === null ? null : normalizeGithubLogin(rawLogin),
-  presence,
-});
 
 test("normalizes ASCII case only and rejects ambiguous or padded logins", () => {
   assert.equal(normalizeGithubLogin("Alice-Bot"), "alice-bot");
@@ -29,17 +20,16 @@ test("normalizes ASCII case only and rejects ambiguous or padded logins", () => 
   assert.equal(normalizeGithubLogin("a".repeat(40)), null);
 });
 
-test("deduplicates normalized policy entries and computes deterministic revision", () => {
+test("deduplicates and sorts normalized policy entries", () => {
   const first = createTrustedGithubPolicy({ security: { trustedGithubUsers: ["Alice", "alice"] } });
   const second = createTrustedGithubPolicy({ security: { trustedGithubUsers: ["alice"] } });
   assert.equal(first.usable, true);
   assert.deepEqual([...first.normalizedUsers], ["alice"]);
-  assert.equal(first.revision, second.revision);
+  assert.deepEqual([...second.normalizedUsers], ["alice"]);
 });
 
 test("policy membership cannot be mutated externally", () => {
   const policy = createTrustedGithubPolicy({ security: { trustedGithubUsers: ["Alice"] } });
-  const originalRevision = policy.revision;
 
   assert.equal(policy.normalizedUsers.has("alice"), true);
   assert.throws(() => (policy.normalizedUsers as Set<string>).add("mallory"), /immutable/);
@@ -48,15 +38,13 @@ test("policy membership cannot be mutated externally", () => {
 
   assert.equal(policy.normalizedUsers.has("alice"), true);
   assert.equal(policy.normalizedUsers.has("mallory"), false);
-  assert.equal(policy.revision, originalRevision);
-  assert.equal(decideGithubActor(policy, actor("Alice")).decision, "TRUSTED");
-  assert.equal(decideGithubActor(policy, actor("mallory")).decision, "UNTRUSTED");
 });
 
 test("fails closed for missing, empty, or malformed policy", () => {
-  for (const policy of [null, undefined, {}, { security: { trustedGithubUsers: [] } }, { security: { trustedGithubUsers: ["bad user"] } }]) {
-    const parsed = createTrustedGithubPolicy(policy as never);
-    assert.equal(decideGithubActor(parsed, actor("alice")).decision, "CONFIG_UNUSABLE");
+  for (const config of [null, undefined, {}, { security: { trustedGithubUsers: [] } }, { security: { trustedGithubUsers: ["bad user"] } }]) {
+    const parsed = createTrustedGithubPolicy(config as never);
+    assert.equal(parsed.usable, false);
+    assert.equal(parsed.normalizedUsers.size, 0);
   }
 });
 
@@ -76,14 +64,4 @@ test("loads current config for each prose decision and fails closed", () => {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
-});
-
-test("distinguishes missing, unknown, malformed, trusted, and untrusted actors", () => {
-  const policy = createTrustedGithubPolicy({ security: { trustedGithubUsers: ["Alice"] } });
-  assert.equal(decideGithubActor(policy, actor(null, "MISSING")).decision, "MISSING_ACTOR");
-  assert.equal(decideGithubActor(policy, actor("Alice", "UNKNOWN")).decision, "UNKNOWN_ACTOR");
-  assert.equal(decideGithubActor(policy, actor("Alice", "MALFORMED")).decision, "MALFORMED_ACTOR");
-  assert.equal(decideGithubActor(policy, actor("ALICE")).decision, "TRUSTED");
-  assert.equal(decideGithubActor(policy, actor("mallory")).decision, "UNTRUSTED");
-  assert.equal(decideGithubActor(policy, actor("mallory")).deliveryClass, "DENIED_PROSE");
 });

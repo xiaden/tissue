@@ -148,7 +148,7 @@ function projectInboxRow(row: InboxRow, configPath: string): BundleProjection {
     const value = payload[key];
     if (typeof value === "string" || typeof value === "number") projection[key] = value;
   }
-  const rawAuthor = row.envelope_actor_raw_login;
+  const rawAuthor = row.actor_raw_login;
   if (rawAuthor !== null) projection.author = rawAuthor;
   if (row.kind === "issue_comment" || row.kind === "pr_comment") {
     const body = payload.body_preview;

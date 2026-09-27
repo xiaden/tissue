@@ -30,7 +30,6 @@ import {
 } from "../db/repositories.ts";
 import type { GhCommentSnapshot, GhSnapshot } from "./poll.ts";
 import { admitIssue, parseConfiguredLabels } from "./intake.ts";
-import { decideGithubActor, normalizeGithubLogin, type ActorObservation, type ProvenanceEnvelope, type TrustedGithubPolicy } from "./trust.ts";
 
 export interface SideEffectIntent {
   id: string;
@@ -42,8 +41,6 @@ export interface SideEffectIntent {
 export interface IngestOptions {
   /** Outbox intents to commit atomically with the snapshot (replay-idempotent). */
   sideEffects?: readonly SideEffectIntent[];
-  /** Canonical controller policy; absent only for legacy objective-only callers. */
-  policy?: TrustedGithubPolicy;
 }
 
 export interface IngestResult {
@@ -93,46 +90,6 @@ function mapPrState(ghState: string): string {
 function isBaseline(createdAt: string, baselineAt: string | null): boolean {
   if (baselineAt === null || createdAt.length === 0) return false;
   return createdAt < baselineAt;
-}
-
-function trustedProse(envelope: ProvenanceEnvelope): boolean {
-  return envelope.decision === "TRUSTED" && envelope.deliveryClass === "TRUSTED_PROSE";
-}
-
-function observationEnvelope(
-  repoId: string,
-  sourceKind: string,
-  objectId: string,
-  observedVersion: string,
-  authoritativeAt: string,
-  actorProjection: { rawLogin: string | null; presence: "PRESENT" | "MISSING" | "MALFORMED" } | undefined,
-  policy: TrustedGithubPolicy | undefined,
-  contentId: string | null = null,
-  contentHash: string | null = null,
-  legacyVersion = false,
-): ProvenanceEnvelope {
-  const rawLogin = actorProjection?.rawLogin ?? null;
-  const presence = actorProjection?.presence ?? "MISSING";
-  const normalizedLogin = normalizeGithubLogin(rawLogin);
-  const actor: ActorObservation = {
-    present: rawLogin !== null,
-    rawLogin,
-    normalizedLogin,
-    presence: presence === "PRESENT" && normalizedLogin !== null ? "PRESENT" : presence,
-  };
-  const decision = decideGithubActor(policy ?? null, actor);
-  return {
-    repository: repoId,
-    sourceKind,
-    objectId,
-    contentId,
-    observedVersion: legacyVersion ? "legacy" : observedVersion,
-    contentHash: legacyVersion ? null : contentHash,
-    authoritativeAt,
-    policyRevision: policy?.revision ?? "unavailable",
-    actor,
-    ...decision,
-  };
 }
 
 /**
@@ -193,7 +150,7 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
           state: "NEW",
           snapshot_hash: issue.snapshotHash,
            updated_at: issue.updatedAt,
-           envelope: observationEnvelope(snapshot.repoId, "issue", String(issue.number), issue.updatedAt, issue.updatedAt, issue.author, opts.policy, String(issue.number), issue.snapshotHash, true),
+           actorRawLogin: issue.author?.rawLogin ?? null,
          });
         result.issuesChanged += 1;
       }
@@ -230,7 +187,7 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
           state: "BASELINE_EXCLUDED",
           snapshot_hash: issue.snapshotHash,
            updated_at: issue.updatedAt,
-           envelope: observationEnvelope(snapshot.repoId, "issue", String(issue.number), issue.updatedAt, issue.updatedAt, issue.author, opts.policy, String(issue.number), issue.snapshotHash, true),
+           actorRawLogin: issue.author?.rawLogin ?? null,
          });
         if (decision.reason === "label_mismatch") result.issuesExcludedLabel += 1;
         else result.issuesExcludedBaseline += 1;
@@ -247,7 +204,7 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
         state: "NEW",
         snapshot_hash: issue.snapshotHash,
            updated_at: issue.updatedAt,
-           envelope: observationEnvelope(snapshot.repoId, "issue", String(issue.number), issue.updatedAt, issue.updatedAt, issue.author, opts.policy, String(issue.number), issue.snapshotHash, true),
+           actorRawLogin: issue.author?.rawLogin ?? null,
          });
       // Discovery: NEW -> TRIAGE_PENDING (scheduled by the triage pump).
       recordTransition(
@@ -287,7 +244,7 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
           state: "BASELINE_EXCLUDED",
           snapshot_hash: issue.snapshotHash,
            updated_at: issue.updatedAt,
-           envelope: observationEnvelope(snapshot.repoId, "issue", String(issue.number), issue.updatedAt, issue.updatedAt, issue.author, opts.policy, String(issue.number), issue.snapshotHash, true),
+           actorRawLogin: issue.author?.rawLogin ?? null,
          });
         result.issuesChanged += 1;
       }
@@ -300,7 +257,7 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
         state: existing.state,
         snapshot_hash: issue.snapshotHash,
            updated_at: issue.updatedAt,
-           envelope: observationEnvelope(snapshot.repoId, "issue", String(issue.number), issue.updatedAt, issue.updatedAt, issue.author, opts.policy, String(issue.number), issue.snapshotHash, true),
+           actorRawLogin: issue.author?.rawLogin ?? null,
          });
       result.issuesChanged += 1;
       record({
@@ -337,9 +294,8 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
     // a foreign fork riding the same controller branch: it is rogue/drift and is
     // NEVER adopted as the controller's PR, but its evidence is retained.
     if (isForeignHead(pr, repoRow)) {
-       const prEnvelope = observationEnvelope(snapshot.repoId, "pull_request", String(pr.number), pr.updatedAt, pr.updatedAt, pr.author, opts.policy, String(pr.number), prSnapshotHash(pr));
-       upsertPullRequestFromSnapshot(tx, {
-         id: prIdFor(snapshot.repoId, pr.number),
+      upsertPullRequestFromSnapshot(tx, {
+        id: prIdFor(snapshot.repoId, pr.number),
         work_item_id: workItem.id,
         repo_id: snapshot.repoId,
         number: pr.number,
@@ -347,18 +303,16 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
         head_sha: pr.headRefOid,
         state: "ROGUE",
         origin: "rogue",
-         snapshotHash: prSnapshotHash(pr),
-         envelope: prEnvelope,
-       });
+        snapshotHash: prSnapshotHash(pr),
+      });
       result.prsRogue += 1;
       continue;
     }
     const issueId = linkedIssueId(tx, workItem.id);
     linkedPrs.set(pr.number, { workItemId: workItem.id, issueId });
     result.prsLinked += 1;
-       const prEnvelope = observationEnvelope(snapshot.repoId, "pull_request", String(pr.number), pr.updatedAt, pr.updatedAt, pr.author, opts.policy, String(pr.number), prSnapshotHash(pr));
-       upsertPullRequestFromSnapshot(tx, {
-         id: prIdFor(snapshot.repoId, pr.number),
+    upsertPullRequestFromSnapshot(tx, {
+      id: prIdFor(snapshot.repoId, pr.number),
       work_item_id: workItem.id,
       repo_id: snapshot.repoId,
       number: pr.number,
@@ -366,9 +320,8 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
       head_sha: pr.headRefOid,
       state: mapPrState(pr.state),
       origin: "expected",
-         snapshotHash: prSnapshotHash(pr),
-         envelope: prEnvelope,
-       });
+      snapshotHash: prSnapshotHash(pr),
+    });
     if (issueId) {
       record({
         work_item_id: workItem.id,
@@ -442,60 +395,23 @@ export function ingestSnapshot(tx: TissueDb, snapshot: GhSnapshot, opts: IngestO
     const link = commentLink(tx, snapshot.repoId, comment, linkedPrs);
     if (!link || !link.issueId) continue;
     result.commentsSeen += 1;
-    const rawLogin = comment.rawAuthor ?? comment.author ?? null;
-    const presence = comment.authorPresence ?? (rawLogin === null ? "MISSING" : "PRESENT");
-    const normalizedLogin = normalizeGithubLogin(rawLogin);
-    const actor: ActorObservation = {
-      present: rawLogin !== null,
-      rawLogin,
-      normalizedLogin,
-      presence: presence === "MISSING" ? "MISSING" : presence === "MALFORMED" || normalizedLogin === null ? "MALFORMED" : "PRESENT",
-    };
-    const decision = decideGithubActor(opts.policy ?? null, actor);
-    const envelope: ProvenanceEnvelope = {
-      repository: snapshot.repoId,
-      sourceKind: `${comment.target}_comment`,
-      objectId: String(comment.number),
-      contentId: comment.commentId,
-      observedVersion: comment.bodyHash,
-      contentHash: comment.bodyHash,
-      authoritativeAt: comment.createdAt || snapshot.collectedAt,
-      policyRevision: opts.policy?.revision ?? "unavailable",
-      actor,
-      ...decision,
-    };
-    const trusted = decision.decision === "TRUSTED";
+    // Prose is persisted unconditionally and bounded (author + body preview). The
+    // trust decision is made at the agent-visible retrieval boundary from the
+    // current configuration (`decideCurrentGithubProse`), never settled at ingest.
     record({
       work_item_id: link.workItemId,
       issue_id: link.issueId,
       event_key: `comment:${snapshot.repoId}:${comment.target}:${comment.number}:${comment.commentId}:${comment.bodyHash}`,
       kind: comment.target === "issue" ? "issue_comment" : "pr_comment",
-      payload_json: JSON.stringify(trusted ? {
+      payload_json: JSON.stringify({
         target: comment.target,
         number: comment.number,
         comment_id: comment.commentId,
         author: comment.author,
         body_preview: comment.bodyPreview,
-      } : {
-        target: comment.target,
-        number: comment.number,
-        comment_id: comment.commentId,
-        denied: true,
       }),
       created_at: snapshot.collectedAt,
-      envelope,
-      quarantine_json: trusted ? null : JSON.stringify({
-        sourceKind: envelope.sourceKind,
-        objectId: envelope.objectId,
-        contentId: envelope.contentId,
-        observedVersion: envelope.observedVersion,
-        contentHash: envelope.contentHash,
-        authoritativeAt: envelope.authoritativeAt,
-        actor: envelope.actor,
-        decision: envelope.decision,
-        reason: envelope.reason,
-        deliveryClass: envelope.deliveryClass,
-      }),
+      actorRawLogin: comment.rawAuthor ?? comment.author ?? null,
     });
   }
 

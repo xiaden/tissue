@@ -13,7 +13,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { createTestDb, seedRepository, seedIssue, type TestDb } from "../helpers/db.ts";
-import type { ProvenanceEnvelope } from "../../src/controller/trust.ts";
 import { ScriptedTriageDriver, readySuggestion, duplicateSuggestion } from "../helpers/session-driver.ts";
 import {
   getIssueById,
@@ -271,28 +270,6 @@ test("triage digest counts AWAITING_DECISION as active and DEFERRED as capacity-
   }
 });
 
-function provenance(rawLogin: string | null): ProvenanceEnvelope {
-  return {
-    repository: "xiaden/nomarr",
-    sourceKind: "issue",
-    objectId: "11",
-    contentId: null,
-    observedVersion: "v1",
-    contentHash: "hash",
-    authoritativeAt: "2026-09-09T00:00:00.000Z",
-    policyRevision: "fixture",
-    actor: {
-      present: rawLogin !== null,
-      rawLogin,
-      normalizedLogin: rawLogin?.toLowerCase() ?? null,
-      presence: rawLogin === null ? "MISSING" : "PRESENT",
-    },
-    decision: "TRUSTED",
-    reason: "fixture",
-    deliveryClass: "TRUSTED_PROSE",
-  };
-}
-
 test("triage digest filters trusted, untrusted, and missing author prose while preserving objective fields", () => {
   const directory = mkdtempSync(join(tmpdir(), "tissue-triage-provenance-"));
   const configPath = join(directory, "tissue.yml");
@@ -300,9 +277,9 @@ test("triage digest filters trusted, untrusted, and missing author prose while p
   const { db, cleanup } = createTestDb();
   try {
     const repo = seedRepository(db);
-    const trusted = seedIssue(db, repo.id, { number: 21, title: "trusted-title", body_json: JSON.stringify("trusted-body"), envelope: provenance("TrustedUser") });
-    const denied = seedIssue(db, repo.id, { number: 22, title: "denied-title", body_json: JSON.stringify("denied-body"), envelope: provenance("Mallory") });
-    const missing = seedIssue(db, repo.id, { number: 23, title: "missing-title", body_json: JSON.stringify("missing-body"), envelope: null });
+    const trusted = seedIssue(db, repo.id, { number: 21, title: "trusted-title", body_json: JSON.stringify("trusted-body"), actorRawLogin: "TrustedUser" });
+    const denied = seedIssue(db, repo.id, { number: 22, title: "denied-title", body_json: JSON.stringify("denied-body"), actorRawLogin: "Mallory" });
+    const missing = seedIssue(db, repo.id, { number: 23, title: "missing-title", body_json: JSON.stringify("missing-body") });
 
     const trustedDigest = buildTriageDigest(db, repo, trusted, configPath);
     const deniedDigest = buildTriageDigest(db, repo, denied, configPath);
@@ -331,7 +308,7 @@ test("triage digest re-evaluates changed config after ingestion without repollin
   try {
     writeFileSync(configPath, "security:\n  trustedGithubUsers: [TrustedUser]\n");
     const repo = seedRepository(db);
-    const issue = seedIssue(db, repo.id, { number: 24, title: "config-sensitive-title", body_json: JSON.stringify("config-sensitive-body"), envelope: provenance("TrustedUser") });
+    const issue = seedIssue(db, repo.id, { number: 24, title: "config-sensitive-title", body_json: JSON.stringify("config-sensitive-body"), actorRawLogin: "TrustedUser" });
     const delivered = buildTriageDigest(db, repo, issue, configPath);
     assert.equal(delivered.titlePreview, "config-sensitive-title");
     assert.equal(delivered.bodyPreview, "config-sensitive-body");

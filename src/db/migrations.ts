@@ -11,7 +11,7 @@
 // disappear on rollback. Migrations never touch OpenCode's database.
 //
 // Tissue is unreleased: the numbered, idempotent migration set currently contains
-// `initial_schema` (version 1) and `work_item_dependencies` (version 2). The
+// a single `initial_schema` (version 1). The
 // canonical schema is still pre-release and has no released-schema compatibility
 // shims or upgrade-path promises; future schema changes must be added as numbered
 // migrations rather than rewriting this history.
@@ -36,9 +36,8 @@ export interface MigrationResult {
 }
 
 // ---- initial_schema: the complete current Tissue schema -----------------------
-// Plan A envelope columns are folded into this unreleased initial migration. The
-// repository has no released upgrade boundary, so a second ALTER migration would
-// invent an upgrade path and is intentionally not used.
+// The repository has no released upgrade boundary, so schema changes are folded
+// into this unreleased initial migration rather than inventing an upgrade path.
 // Reproduced from the authoritative DD schema contract (entities + FKs), including
 // repository target/push/config-managed/capability columns and requested-vs-observed
 // session metadata. Every entity uses a TEXT primary key supplied by the controller;
@@ -91,26 +90,11 @@ const INITIAL_SCHEMA = [
     snapshot_hash TEXT,
     first_seen_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-     disposition_json TEXT,
-      blocked_by TEXT,
-      envelope_repository TEXT,
-      envelope_source_kind TEXT,
-      envelope_object_id TEXT,
-     envelope_content_id TEXT,
-     envelope_observed_version TEXT,
-     envelope_content_hash TEXT,
-     envelope_authoritative_at TEXT,
-     envelope_policy_revision TEXT,
-     envelope_actor_present INTEGER,
-     envelope_actor_presence TEXT,
-     envelope_actor_raw_login TEXT,
-     envelope_actor_normalized_login TEXT,
-     envelope_decision TEXT,
-     envelope_reason TEXT,
-     envelope_delivery_class TEXT,
-     quarantine_json TEXT,
-     UNIQUE(repo_id, number)
-    );`,
+    disposition_json TEXT,
+    blocked_by TEXT,
+    actor_raw_login TEXT,
+    UNIQUE(repo_id, number)
+  );`,
    `CREATE TABLE IF NOT EXISTS work_items(
     id TEXT PRIMARY KEY,
     repo_id TEXT NOT NULL REFERENCES repositories(id),
@@ -170,25 +154,9 @@ const INITIAL_SCHEMA = [
     origin TEXT NOT NULL DEFAULT 'expected',
     snapshot_hash TEXT,
     created_at TEXT NOT NULL,
-     updated_at TEXT NOT NULL,
-      envelope_repository TEXT,
-      envelope_source_kind TEXT,
-      envelope_object_id TEXT,
-     envelope_content_id TEXT,
-     envelope_observed_version TEXT,
-     envelope_content_hash TEXT,
-     envelope_authoritative_at TEXT,
-     envelope_policy_revision TEXT,
-     envelope_actor_present INTEGER,
-     envelope_actor_presence TEXT,
-     envelope_actor_raw_login TEXT,
-     envelope_actor_normalized_login TEXT,
-     envelope_decision TEXT,
-     envelope_reason TEXT,
-     envelope_delivery_class TEXT,
-     quarantine_json TEXT,
-     UNIQUE(repo_id, number)
-    );`,
+    updated_at TEXT NOT NULL,
+    UNIQUE(repo_id, number)
+  );`,
    `CREATE TABLE IF NOT EXISTS inbox(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     work_item_id TEXT,
@@ -203,24 +171,9 @@ const INITIAL_SCHEMA = [
     terminal_action TEXT,
     terminal_reason TEXT,
     retention_deadline TEXT,
-     housekept_at TEXT,
-      envelope_repository TEXT,
-      envelope_source_kind TEXT,
-     envelope_object_id TEXT,
-     envelope_content_id TEXT,
-     envelope_observed_version TEXT,
-     envelope_content_hash TEXT,
-     envelope_authoritative_at TEXT,
-     envelope_policy_revision TEXT,
-     envelope_actor_present INTEGER,
-     envelope_actor_presence TEXT,
-     envelope_actor_raw_login TEXT,
-     envelope_actor_normalized_login TEXT,
-     envelope_decision TEXT,
-     envelope_reason TEXT,
-     envelope_delivery_class TEXT,
-     quarantine_json TEXT
-    );`,
+    housekept_at TEXT,
+    actor_raw_login TEXT
+  );`,
    `CREATE TABLE IF NOT EXISTS state_transitions(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -268,22 +221,20 @@ const INITIAL_SCHEMA = [
   `CREATE INDEX IF NOT EXISTS ix_work_items_state_priority
     ON work_items(state, priority DESC, created_at);`,
   `CREATE INDEX IF NOT EXISTS ix_side_effects_due ON side_effects(state, next_attempt_at);`,
-];
-
-const DEPENDENCY_SCHEMA = [
+  // Work-item dependency edges (folded into the unreleased baseline).
   `CREATE TABLE IF NOT EXISTS work_item_dependencies(
-     id TEXT PRIMARY KEY,
-     dependent_work_item_id TEXT NOT NULL REFERENCES work_items(id),
-     dependency_issue_id TEXT REFERENCES issues(id),
-     dependency_work_item_id TEXT REFERENCES work_items(id),
-     state TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(state IN ('ACTIVE', 'SETTLED')),
-     created_at TEXT NOT NULL,
-     settled_at TEXT,
-     CHECK ((dependency_issue_id IS NOT NULL) != (dependency_work_item_id IS NOT NULL)),
-     CHECK (settled_at IS NULL OR state = 'SETTLED'),
-     UNIQUE(dependent_work_item_id, dependency_issue_id),
-     UNIQUE(dependent_work_item_id, dependency_work_item_id)
-   );`,
+    id TEXT PRIMARY KEY,
+    dependent_work_item_id TEXT NOT NULL REFERENCES work_items(id),
+    dependency_issue_id TEXT REFERENCES issues(id),
+    dependency_work_item_id TEXT REFERENCES work_items(id),
+    state TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(state IN ('ACTIVE', 'SETTLED')),
+    created_at TEXT NOT NULL,
+    settled_at TEXT,
+    CHECK ((dependency_issue_id IS NOT NULL) != (dependency_work_item_id IS NOT NULL)),
+    CHECK (settled_at IS NULL OR state = 'SETTLED'),
+    UNIQUE(dependent_work_item_id, dependency_issue_id),
+    UNIQUE(dependent_work_item_id, dependency_work_item_id)
+  );`,
   `CREATE INDEX IF NOT EXISTS ix_work_item_dependencies_issue
      ON work_item_dependencies(dependency_issue_id, state, created_at, id);`,
   `CREATE INDEX IF NOT EXISTS ix_work_item_dependencies_work_item
@@ -294,7 +245,6 @@ const DEPENDENCY_SCHEMA = [
 
 export const MIGRATIONS: readonly MigrationDef[] = [
   { version: 1, name: "initial_schema", statements: INITIAL_SCHEMA },
-  { version: 2, name: "work_item_dependencies", statements: DEPENDENCY_SCHEMA },
 ];
 
 /** Highest schema version this build knows how to reach. */

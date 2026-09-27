@@ -45,7 +45,7 @@ const TABLES = [
 test("migrated schema contains dependency relation and version ledger", () => {
   const { db, cleanup } = createTestDb();
   try {
-    assert.equal(db.sql.get<{ version: number }>("SELECT MAX(version) AS version FROM schema_migrations")?.version, 2);
+    assert.equal(db.sql.get<{ version: number }>("SELECT MAX(version) AS version FROM schema_migrations")?.version, 1);
     const table = db.sql.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type='table' AND name='work_item_dependencies'");
     assert.match(table?.sql ?? "", /CHECK \(\(dependency_issue_id IS NOT NULL\) != \(dependency_work_item_id IS NOT NULL\)\)/);
     const columns = db.sql.all<{ name: string }>("PRAGMA table_info('work_items')").map((row) => row.name);
