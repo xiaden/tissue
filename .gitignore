@@ -9,6 +9,9 @@ coverage/
 # Tissue runtime durable state and telemetry logs (never committed).
 # OpenCode/controller state, SQLite DB, WAL files, and logs are excluded.
 .tissue/
+
+# Local OpenCode configuration and deployment-specific skills are private.
+.opencode/
 *.db
 *.db-wal
 *.db-shm
